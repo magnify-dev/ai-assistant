@@ -48,6 +48,7 @@ tools:
   enabled: true
   max_rounds: 8
   git_commit_attempts: 3
+  git_sync_attempts: 3
   workspace: "C:/Users/marce/Documents"
   github_org: "magnify-dev"
   git_roots:

@@ -502,6 +502,11 @@ def _wants_git_commit(text: str) -> bool:
     return bool(re.search(r"\b(commit|committing)\b", lowered))
 
 
+def _wants_git_sync(text: str) -> bool:
+    lowered = text.lower()
+    return bool(re.search(r"\b(sync|push|upload)\b", lowered))
+
+
 def _git_stageable_paths(status_text: str) -> list[str]:
     ignored_prefixes = (
         "logs/",
@@ -523,7 +528,7 @@ def _git_stageable_paths(status_text: str) -> list[str]:
             continue
 
         status_code = line[:2]
-        raw_path = line[3:].strip()
+        raw_path = line[2:].strip()
         if " -> " in raw_path:
             raw_path = raw_path.split(" -> ", 1)[1].strip()
         path = raw_path.strip('"').replace("\\", "/")
@@ -627,6 +632,7 @@ def _git_commit_with_retries(
             continue
 
         verify = _run_git_tool(cfg, command_id, project, ["status", "--short"])
+        sync_result = _git_sync_with_retries(cfg, command_id, project)
         audit_event(
             cfg,
             "git_commit_success",
@@ -635,8 +641,11 @@ def _git_commit_with_retries(
             attempt=attempt,
             commit_message=commit_message,
             verify_status=verify,
+            sync_result=sync_result,
         )
-        return "Committed the changes."
+        if sync_result.startswith("Synced"):
+            return "Committed and synced."
+        return f"Committed, but sync failed. {sync_result}"
 
     audit_event(
         cfg,
@@ -649,9 +658,68 @@ def _git_commit_with_retries(
     return f"I couldn't commit after {attempts} attempts. {last_error}"
 
 
+def _git_sync_with_retries(cfg: dict, command_id: str | None, project: str) -> str:
+    attempts = max(1, int(cfg.get("tools", {}).get("git_sync_attempts", 3)))
+    last_error = ""
+
+    branch = _run_git_tool(cfg, command_id, project, ["branch", "--show-current"])
+    if branch.startswith("Exit ") or not branch.strip() or "(no output)" in branch:
+        branch = "HEAD"
+    else:
+        branch = branch.strip().splitlines()[0]
+
+    upstream = _run_git_tool(cfg, command_id, project, ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
+    has_upstream = not upstream.startswith("Exit ") and "(no output)" not in upstream
+
+    for attempt in range(1, attempts + 1):
+        audit_event(
+            cfg,
+            "git_sync_attempt",
+            command_id=command_id,
+            project=project,
+            attempt=attempt,
+            max_attempts=attempts,
+            branch=branch,
+            has_upstream=has_upstream,
+        )
+
+        args = ["push"] if has_upstream else ["push", "-u", "origin", branch]
+        push = _run_git_tool(cfg, command_id, project, args)
+        if push.startswith("Exit "):
+            last_error = push[:300]
+            if "no upstream branch" in push.lower():
+                has_upstream = False
+                continue
+            if "fetch first" in push.lower() or "non-fast-forward" in push.lower():
+                fetch = _run_git_tool(cfg, command_id, project, ["fetch", "origin"])
+                last_error = f"push rejected; fetch result: {fetch[:220]}"
+                continue
+            continue
+
+        audit_event(
+            cfg,
+            "git_sync_success",
+            command_id=command_id,
+            project=project,
+            attempt=attempt,
+            result=push,
+        )
+        return "Synced to GitHub."
+
+    audit_event(
+        cfg,
+        "git_sync_failed",
+        command_id=command_id,
+        project=project,
+        attempts=attempts,
+        error=last_error,
+    )
+    return f"I couldn't sync after {attempts} attempts. {last_error}"
+
+
 def _handle_local_command(text: str, cfg: dict, command_id: str | None = None) -> str | None:
     lowered = text.lower()
-    git_words = ("git", "uncommitted", "committed", "commit", "status", "changes")
+    git_words = ("git", "uncommitted", "committed", "commit", "status", "changes", "sync", "push", "upload")
     if not any(word in lowered for word in git_words):
         return None
     if "commitment" in lowered:
@@ -666,6 +734,9 @@ def _handle_local_command(text: str, cfg: dict, command_id: str | None = None) -
     status = execute_tool("git_status", {"project_path": project})
     audit_event(cfg, "tool_result", command_id=command_id, name="git_status", result=status)
     wants_commit = _wants_git_commit(text)
+    wants_sync = _wants_git_sync(text)
+    if wants_sync and not wants_commit:
+        return _git_sync_with_retries(cfg, command_id, project)
     if not wants_commit:
         if "Status check failed:" in status:
             return "I couldn't read Git status."
