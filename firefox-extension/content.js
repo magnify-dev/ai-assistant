@@ -66,12 +66,15 @@
     const label = elementLabel(el);
     const haystack = `${label} ${aria} ${title} ${role} ${href} ${String(el.className || "")}`.toLowerCase();
     let kind = role || tag;
-    if (href.includes("/watch") || href.includes("watch?v=")) kind = "video-link";
+    if (String(el.className || "").includes("ytp-play-button") || String(el.className || "").includes("ytp-large-play-button")) {
+      kind = "play-button";
+    } else if (href.includes("/watch") || href.includes("watch?v=")) kind = "video-link";
     else if (href.includes("playlist") || href.includes("list=")) kind = "playlist-link";
     else if (tag === "button" || role === "button") kind = "button";
     let action = "";
-    if (haystack.includes("pause")) action = "pause";
-    else if (haystack.includes("play")) action = "play";
+    if (kind === "play-button") action = "play";
+    else if (/\bpause\b/i.test(haystack) && !/\bplay\b/i.test(haystack)) action = "pause";
+    else if (/\bplay\b/i.test(haystack) && !/playlist/i.test(href)) action = "play";
     return {
       index,
       kind,
@@ -105,8 +108,73 @@
       }
     }
 
+    for (const row of document.querySelectorAll(
+      "ytd-grid-playlist-renderer, ytd-playlist-renderer"
+    )) {
+      if (!isVisible(row)) continue;
+      const link = row.querySelector("a[href*='list='], a[href*='/playlist']");
+      if (!link || !isVisible(link)) continue;
+      const titleEl = row.querySelector(
+        "#video-title, #title, yt-formatted-string#title, a#video-title, h3 a, #text"
+      );
+      const itemText = (
+        textOf(titleEl) || attr(link, "aria-label") || attr(link, "title") || ""
+      ).trim().replace(/\s+/g, " ");
+      if (!itemText) continue;
+      const href = link.href || "";
+      const key = `playlist-link|${itemText}|${href}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      candidates.push({
+        el: link,
+        data: {
+          index: candidates.length,
+          kind: "playlist-link",
+          action: "open",
+          text: itemText,
+          href,
+          aria: attr(link, "aria-label"),
+          title: attr(link, "title"),
+          role: attr(link, "role") || "link",
+          ordinal: 0
+        }
+      });
+    }
+
+    for (const link of document.querySelectorAll("a[href*='list=']")) {
+      if (!isVisible(link)) continue;
+      const href = link.href || "";
+      if (!/list=PL/i.test(href)) continue;
+      if (/\/watch/i.test(href.split("?")[0])) continue;
+      const row = link.closest("ytd-grid-playlist-renderer, ytd-playlist-renderer, ytd-playlist-thumbnail");
+      const titleEl = row
+        ? row.querySelector("#video-title, #title, yt-formatted-string#title, h3, span")
+        : null;
+      const itemText = (
+        textOf(titleEl) || textOf(link) || attr(link, "aria-label") || attr(link, "title") || ""
+      ).trim().replace(/\s+/g, " ");
+      if (!itemText || itemText.length > 120) continue;
+      const key = `playlist-link|${itemText}|${href}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      candidates.push({
+        el: link,
+        data: {
+          index: candidates.length,
+          kind: "playlist-link",
+          action: "open",
+          text: itemText,
+          href,
+          aria: attr(link, "aria-label"),
+          title: attr(link, "title"),
+          role: attr(link, "role") || "link",
+          ordinal: 0
+        }
+      });
+    }
+
     const video = document.querySelector("video");
-    if (video) {
+    if (video && /\/watch|\/shorts/i.test(location.pathname)) {
       candidates.unshift({
         el: video,
         data: {
@@ -138,34 +206,55 @@
   }
 
   async function playVideo(video) {
-    const playButtons = [
+    const playSelectors = [
       ".ytp-large-play-button",
       ".ytp-play-button",
+      ".ytp-cued-thumbnail-overlay-image",
+      "#movie_player .ytp-large-play-button",
+      "button.ytp-play-button",
       "button[aria-label*='Play']",
       "button[title*='Play']"
     ];
-    for (const selector of playButtons) {
-      const button = Array.from(document.querySelectorAll(selector))
-        .find((el) => isVisible(el) && !`${attr(el, "aria-label")} ${attr(el, "title")}`.toLowerCase().includes("pause"));
-      if (button) {
-        activate(button);
-        await sleep(600);
+    for (const selector of playSelectors) {
+      const buttons = Array.from(document.querySelectorAll(selector)).filter(isVisible);
+      for (const button of buttons) {
+        const label = `${attr(button, "aria-label")} ${attr(button, "title")}`.toLowerCase();
+        if (label.includes("pause") && !label.includes("play")) continue;
+        button.scrollIntoView({ block: "center", inline: "center" });
+        button.click();
+        await sleep(700);
         if (!video.paused && !video.ended) return `OK: ${selector}`;
       }
     }
 
-    activate(video);
-    await sleep(600);
-    if (!video.paused && !video.ended) return "OK: video click";
-
-    video.muted = false;
-    const playResult = video.play();
-    if (playResult && typeof playResult.then === "function") {
-      await playResult;
+    const player = document.querySelector("#movie_player") || document.querySelector(".html5-video-player");
+    if (player && isVisible(player)) {
+      player.scrollIntoView({ block: "center", inline: "center" });
+      player.click();
+      await sleep(700);
+      if (!video.paused && !video.ended) return "OK: player click";
     }
-    await sleep(600);
-    if (!video.paused && !video.ended) return "OK: video.play()";
-    throw new Error("Play did not start: video is still paused");
+
+    if (video.paused || video.ended) {
+      try {
+        video.muted = true;
+        const playResult = video.play();
+        if (playResult && typeof playResult.then === "function") {
+          await playResult;
+        }
+        await sleep(300);
+        video.muted = false;
+        await sleep(400);
+        if (!video.paused && !video.ended) return "OK: muted autoplay";
+      } catch (_err) {
+        // blocked without user gesture
+      }
+    }
+
+    if (video.paused || video.ended) {
+      throw new Error("Play blocked: click the YouTube play button once in Firefox, then ask again");
+    }
+    return "OK: already playing";
   }
 
   function matchKey(text) {
@@ -177,7 +266,7 @@
     const cKey = matchKey(candidate);
     if (!qKey || !cKey) return 0;
     if (qKey === cKey) return 1;
-    if (qKey.includes(cKey) || cKey.includes(qKey)) return 0.92;
+    if (qKey.includes(cKey) || cKey.includes(qKey)) return 0.94;
     const queryWords = new Set(words(query));
     const candidateWords = new Set(words(candidate));
     let overlap = 0;
@@ -217,10 +306,12 @@
       }
       score += 0.35 * (overlap / Math.max(1, new Set([...queryWords, ...candidateWords]).size));
       if (playIntent) {
+        if (item.kind === "play-button") score += 2.5;
         if (item.action === "play") score += 1.5;
-        if (haystack.toLowerCase().includes("play")) score += 0.5;
-        if (item.kind === "video-player") score += 0.7;
+        if (/\bplay\b/i.test(haystack) && !/playlist/i.test(item.href || "")) score += 0.5;
+        if (item.kind === "video-player") score += 0.35;
         if (item.kind === "video-link") score += 0.35;
+        if (item.kind === "playlist-link") score -= 2.0;
       }
       if (videoIntent && ["video-link", "video-player"].includes(item.kind)) score += 0.7;
       if (wantedOrdinal && item.ordinal) score += item.ordinal === wantedOrdinal ? 2 : -0.25;
@@ -316,7 +407,7 @@
           return;
         }
         const label = target.data.text || target.data.aria || target.data.title || target.data.href || target.data.kind;
-        if (target.data.kind === "video-player") {
+        if (target.data.kind === "video-player" || target.data.kind === "play-button") {
           const message = await playVideo(target.el);
           await postCommandResult({ id: command.id, ok: true, message, label });
           setTimeout(() => sendContext(true), 1000);

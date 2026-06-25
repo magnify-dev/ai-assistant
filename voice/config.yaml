@@ -1,6 +1,7 @@
 ollama:
   url: "http://127.0.0.1:11434"
-  model: "qwen2.5-coder:14b"
+  model: "qwen2.5:14b"
+  resolve_targets: true
   system_prompt: |
     You are Jarvis, a local voice assistant on Windows with tools.
     CRITICAL RULES:
@@ -75,7 +76,7 @@ whisper:
   language: "en"
 
 vision:
-  model: "gemma3:4b"
+  # Optional separate vision model (e.g. gemma3:4b). Leave unset to stay on ollama.model only.
   max_screenshot_width: 1280
 
 browser:
@@ -86,6 +87,9 @@ browser:
   foxmcp_server_dir: "../vendor/foxmcp"
   foxmcp_websocket_port: 8765
   foxmcp_mcp_port: 3000
+  auto_connect_firefox: true
+  foxmcp_startup_wait_sec: 8
+  foxmcp_connect_timeout_sec: 45
 
 tts:
   engine: "edge-tts"
