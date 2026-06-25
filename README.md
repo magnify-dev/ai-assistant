@@ -31,14 +31,31 @@ Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
 .\start-all.bat
 ```
 
-4. Optional — auto-start at login: `.\install-startup.bat`
+4. Optional — open the control panel: double-click `jarvis-ui.bat`
+5. Optional — auto-start at login: click **Install Startup** in the control panel, or run `.\install-startup.bat`
+
+## Control Panel
+
+Double-click `jarvis-ui.bat` to open the Jarvis Control Panel.
+
+Use it to:
+
+- start/stop Jarvis
+- start Jarvis inside the UI and see the same live voice output you used to see in the terminal
+- install startup at Windows login
+- list and preview voices
+- apply a selected voice to `voice/config.yaml`
+- open logs/config/Web UI
+
+For startup, this project uses a Windows Scheduled Task (`JarvisLocalAI`). That is usually better than a classic Windows service for this assistant because Jarvis needs user-session access to your microphone, speakers, windows, Cursor, browser, and desktop tools.
 
 ## Voice usage
 
 1. Say **"hey jarvis"** and wait for the beep.
-2. Ask your question — no wake word needed for follow-ups.
-3. After **20 seconds** of silence, Jarvis goes back to sleep (wake word required again).
-4. Say **"go to sleep"** or **"stop listening"** to end the conversation early.
+2. Speak freely. Jarvis buffers speech until you say **"please"**.
+3. End each command with **"please"** to send it, e.g. "open Cursor please".
+4. Say **"go to sleep please"** or **"stop listening please"** to return to wake-word mode.
+5. After **60 seconds** of idle time, Jarvis goes back to sleep automatically.
 
 ## Voice (TTS)
 
@@ -64,6 +81,26 @@ Other good voices to try:
 
 List all voices: `voice\.venv\Scripts\edge-tts.exe --list-voices`
 
+Preview voices:
+
+```powershell
+cd C:\Users\marce\ai-assistant\voice
+
+# List English voices
+.\.venv\Scripts\python.exe preview_voices.py --filter en --list
+
+# Listen to one voice
+.\.venv\Scripts\python.exe preview_voices.py --voice en-GB-RyanNeural
+
+# Listen to the first 10 matching voices
+.\.venv\Scripts\python.exe preview_voices.py --filter en-GB --preview-first 10
+
+# Save MP3 samples you can replay later
+.\.venv\Scripts\python.exe preview_voices.py --filter en-US --preview-first 10 --save-dir ..\logs\voice-samples
+```
+
+To use a selected voice, set `tts.edge_voice` in `voice/config.yaml`, then restart Jarvis.
+
 For fully offline TTS, set `engine: "pyttsx3"` (robotic but local).
 
 ## Config
@@ -73,13 +110,16 @@ Edit `voice/config.yaml`:
 | Setting | Purpose |
 |---|---|
 | `wake_word.conversation_idle_sec` | Seconds of silence before sleep (default 20) |
+| `listening.command_phrases` | Words that send the buffered command (default `please`) |
+| `listening.conversation_idle_sec` | Idle seconds before always-on mode sleeps |
 | `ollama.model` | LLM model name |
 | `whisper.model` | STT size (`base`, `small`, `medium`) |
 | `tools.workspace` | Folder for file tools |
 
 ## Logs
 
-`logs/voice-assistant.log`
+- `logs/voice-assistant.log` — normal runtime log
+- `logs/voice-commands.jsonl` — structured debug audit of transcripts, buffered commands, sent commands, tool calls/results, replies, sleep, and errors
 
 ## GitHub
 

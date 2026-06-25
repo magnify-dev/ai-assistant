@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import ctypes
 import os
+import re
 import subprocess
 import time
+import urllib.parse
+import urllib.request
 from ctypes import wintypes
 from pathlib import Path
 
 WORKSPACE = Path(os.environ.get("JARVIS_WORKSPACE", Path.home() / "Documents")).resolve()
 GITHUB_ORG = os.environ.get("JARVIS_GITHUB_ORG", "magnify-dev")
+KNOWN_PATHS: dict[str, str] = {}
 GIT_ROOTS = [
     Path(p).resolve()
     for p in os.environ.get(
@@ -18,6 +22,17 @@ GIT_ROOTS = [
         f"{Path.home() / 'Documents'};{Path.home() / 'ai-assistant'}",
     ).split(";")
     if p.strip()
+]
+GIT_EXE_CANDIDATES = [
+    Path(os.environ.get("JARVIS_GIT_EXE", "")),
+    Path(r"C:\Program Files\Git\cmd\git.exe"),
+    Path(r"C:\Program Files\Git\bin\git.exe"),
+    Path.home() / "AppData/Local/Programs/Git/cmd/git.exe",
+]
+GH_EXE_CANDIDATES = [
+    Path(os.environ.get("JARVIS_GH_EXE", "")),
+    Path(r"C:\Program Files\GitHub CLI\gh.exe"),
+    Path.home() / "AppData/Local/GitHubCLI/gh.exe",
 ]
 
 # Snapshot taken when the wake word fires (before Jarvis records or runs tools).
@@ -57,8 +72,30 @@ TOOL_DEFINITIONS = [
     {
         "type": "function",
         "function": {
+            "name": "open_folder_in_cursor",
+            "description": (
+                "Open a folder in the Cursor code editor. "
+                "Use when the user asks to open a project or folder in Cursor."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "folder_path": {
+                        "type": "string",
+                        "description": (
+                            "Folder path, e.g. C:/Users/marce/ai-assistant or ai-assistant"
+                        ),
+                    },
+                },
+                "required": ["folder_path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "open_application",
-            "description": "Open a Windows application, file, or URL.",
+            "description": "Open a Windows application, file, or URL (not folders — use open_folder_in_cursor for those).",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -68,6 +105,58 @@ TOOL_DEFINITIONS = [
                     }
                 },
                 "required": ["target"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "Search the web in the default browser.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query to open in the browser",
+                    }
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "open_url",
+            "description": "Open a URL in the default browser.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "HTTP or HTTPS URL to open",
+                    }
+                },
+                "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fetch_url",
+            "description": "Fetch a public web page and return readable text for summarizing.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "HTTP or HTTPS URL to read",
+                    },
+                    "max_chars": {"type": "integer", "default": 6000},
+                },
+                "required": ["url"],
             },
         },
     },
@@ -130,6 +219,32 @@ TOOL_DEFINITIONS = [
                     },
                 },
                 "required": ["project_path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "git_command",
+            "description": (
+                "Run a safe git command in an allowed project folder. "
+                "Use for status, diff, log, add, commit, pull, push, branch, and remote checks. "
+                "Dangerous args like force push, hard reset, clean -fdx, and branch delete are blocked."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "project_path": {
+                        "type": "string",
+                        "description": "Project folder path",
+                    },
+                    "args": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Git arguments without the leading 'git', e.g. ['status', '--short']",
+                    },
+                },
+                "required": ["project_path", "args"],
             },
         },
     },
@@ -338,10 +453,35 @@ def _resolve_git_project(path_str: str) -> Path:
 def _shell_env() -> dict[str, str]:
     env = os.environ.copy()
     extra = r"C:\Program Files\Git\cmd;C:\Program Files\GitHub CLI"
-    path = env.get("Path", "")
+    path_key = "Path" if "Path" in env else "PATH"
+    path = env.get(path_key, "")
     if "Git\\cmd" not in path:
-        env["Path"] = path + ";" + extra
+        env[path_key] = path + ";" + extra
     return env
+
+
+def _first_existing(candidates: list[Path]) -> str | None:
+    for candidate in candidates:
+        raw = str(candidate)
+        if not raw or raw == ".":
+            continue
+        if candidate.exists() and candidate.is_file():
+            return str(candidate)
+    return None
+
+
+def _resolve_command(args: list[str]) -> list[str]:
+    if not args:
+        return args
+    if args[0].lower() == "git":
+        git_exe = _first_existing(GIT_EXE_CANDIDATES)
+        if git_exe:
+            return [git_exe, *args[1:]]
+    if args[0].lower() == "gh":
+        gh_exe = _first_existing(GH_EXE_CANDIDATES)
+        if gh_exe:
+            return [gh_exe, *args[1:]]
+    return args
 
 
 def _run_cmd(
@@ -355,7 +495,7 @@ def _run_cmd(
             return 1, f"Blocked dangerous git command: {blocked}"
 
     proc = subprocess.run(
-        args,
+        _resolve_command(args),
         capture_output=True,
         text=True,
         timeout=timeout,
@@ -375,14 +515,20 @@ def _git_status(project_path: str) -> str:
     code, branch = _run_cmd(["git", "branch", "--show-current"], root, timeout=30)
     if code == 0:
         parts.append(f"Branch: {branch}")
+    else:
+        parts.append(f"Branch check failed: {branch}")
 
     code, remote = _run_cmd(["git", "remote", "get-url", "origin"], root, timeout=30)
     if code == 0:
         parts.append(f"Remote: {remote}")
+    else:
+        parts.append(f"Remote check failed: {remote}")
 
     code, status = _run_cmd(["git", "status", "--short"], root, timeout=30)
     if code == 0:
         parts.append("Changes:\n" + (status if status else "(clean working tree)"))
+    else:
+        parts.append(f"Status check failed: {status}")
 
     return "\n".join(parts)
 
@@ -449,7 +595,79 @@ def _github_publish_project(
     return f"Pushed latest code to {repo_url}"
 
 
-def _run_powershell(command: str, timeout: int = 30) -> str:
+def _resolve_folder_path(path_str: str) -> Path:
+    raw = path_str.strip().strip('"').strip("'")
+    key = raw.lower().replace("\\", "/").rstrip("/")
+    key_slug = key.replace(" ", "-").split("/")[-1]
+
+    if key in {k.lower() for k in KNOWN_PATHS}:
+        for name, value in KNOWN_PATHS.items():
+            if name.lower() == key:
+                return Path(value).resolve()
+
+    if key_slug in {k.lower() for k in KNOWN_PATHS}:
+        for name, value in KNOWN_PATHS.items():
+            if name.lower() == key_slug:
+                return Path(value).resolve()
+
+    candidate = Path(raw).expanduser()
+    if not candidate.is_absolute():
+        candidate = (WORKSPACE / raw).resolve()
+    else:
+        candidate = candidate.resolve()
+    return candidate
+
+
+def _cursor_exe() -> Path | None:
+    candidates = [
+        Path.home() / "AppData/Local/Programs/cursor/Cursor.exe",
+        Path(os.environ.get("LOCALAPPDATA", "")) / "Programs/cursor/Cursor.exe",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _open_folder_in_cursor(folder_path: str) -> str:
+    path = _resolve_folder_path(folder_path)
+    if not path.is_dir():
+        return f"Folder not found: {path}"
+
+    cursor_exe = _cursor_exe()
+    if cursor_exe:
+        proc = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                f'Start-Process "{cursor_exe}" -ArgumentList "{path}"',
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=_shell_env(),
+        )
+        if proc.returncode == 0:
+            return f"Opened {path} in Cursor"
+        err = (proc.stderr or proc.stdout or "").strip()
+        return f"Could not open Cursor for {path}: {err or 'unknown error'}"
+
+    proc = subprocess.run(
+        ["cursor", str(path)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        shell=True,
+        env=_shell_env(),
+    )
+    if proc.returncode == 0:
+        return f"Opened {path} in Cursor"
+    return f"Could not open Cursor for {path}"
+
+
+def _run_powershell(command: str, timeout: int = 120) -> str:
     lowered = command.lower()
     for blocked in BLOCKED_COMMAND_FRAGMENTS:
         if blocked in lowered:
@@ -460,6 +678,7 @@ def _run_powershell(command: str, timeout: int = 30) -> str:
         text=True,
         timeout=timeout,
         cwd=str(WORKSPACE),
+        env=_shell_env(),
     )
     out = (proc.stdout or "").strip()
     err = (proc.stderr or "").strip()
@@ -468,19 +687,82 @@ def _run_powershell(command: str, timeout: int = 30) -> str:
     return out or "OK"
 
 
+def _validate_url(url: str) -> str:
+    raw = url.strip()
+    parsed = urllib.parse.urlparse(raw)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("URL must start with http:// or https://")
+    return raw
+
+
+def _open_url(url: str) -> str:
+    safe_url = _validate_url(url)
+    return _run_powershell(f"Start-Process '{safe_url}'")
+
+
+def _web_search(query: str) -> str:
+    query = query.strip()
+    if not query:
+        return "Search query was empty"
+    url = "https://www.google.com/search?q=" + urllib.parse.quote_plus(query)
+    result = _open_url(url)
+    return f"Opened web search for: {query}" if result == "OK" else result
+
+
+def _fetch_url(url: str, max_chars: int = 6000) -> str:
+    safe_url = _validate_url(url)
+    req = urllib.request.Request(
+        safe_url,
+        headers={"User-Agent": "JarvisVoiceAssistant/1.0"},
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        content_type = resp.headers.get("content-type", "")
+        if "text" not in content_type and "html" not in content_type and "json" not in content_type:
+            return f"Unsupported content type: {content_type or 'unknown'}"
+        raw = resp.read(min(max_chars * 4, 200_000)).decode("utf-8", errors="replace")
+
+    text = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", raw)
+    text = re.sub(r"(?s)<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:max_chars] or "(empty page)"
+
+
+def _git_command(project_path: str, args: list[str]) -> str:
+    if not args:
+        return "No git arguments provided"
+    if any(not isinstance(arg, str) or not arg.strip() for arg in args):
+        return "Git args must be non-empty strings"
+    root = _resolve_git_project(project_path)
+    code, out = _run_cmd(["git", *args], root, timeout=180)
+    if code != 0:
+        return f"Exit {code}\n{out}"
+    return out
+
+
 def execute_tool(name: str, arguments: dict) -> str:
     try:
         if name == "get_active_window":
             return get_active_window_title()
         if name == "run_powershell":
             return _run_powershell(arguments["command"])
+        if name == "open_folder_in_cursor":
+            return _open_folder_in_cursor(arguments["folder_path"])
         if name == "open_application":
             target = arguments["target"]
             if target.lower() in {"cursor", "cursor ide"}:
                 return _run_powershell("Start-Process cursor")
+            path = Path(target.strip().strip('"')).expanduser()
+            if path.is_dir():
+                return _open_folder_in_cursor(str(path))
             if target.startswith("http://") or target.startswith("https://"):
-                return _run_powershell(f"Start-Process '{target}'")
+                return _open_url(target)
             return _run_powershell(f"Start-Process '{target}'")
+        if name == "web_search":
+            return _web_search(arguments["query"])
+        if name == "open_url":
+            return _open_url(arguments["url"])
+        if name == "fetch_url":
+            return _fetch_url(arguments["url"], int(arguments.get("max_chars", 6000)))
         if name == "read_file":
             path = _safe_path(arguments["path"])
             if not path.is_file():
@@ -502,6 +784,8 @@ def execute_tool(name: str, arguments: dict) -> str:
             return "\n".join(lines) or "(empty)"
         if name == "git_status":
             return _git_status(arguments["project_path"])
+        if name == "git_command":
+            return _git_command(arguments["project_path"], arguments["args"])
         if name == "github_publish_project":
             return _github_publish_project(
                 arguments["project_path"],

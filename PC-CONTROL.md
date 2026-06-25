@@ -15,18 +15,23 @@
 
 After saying **"Hey Jarvis"**, try:
 
-- "Open Cursor"
-- "Open Notepad"
-- "List files in my Documents folder"
-- "Create a file called hello.txt with the text hello world"
-- "Run PowerShell to show today's date"
-- "What processes are using the most CPU?"
+- "Open Cursor please"
+- "Open Notepad please"
+- "List files in my Documents folder please"
+- "Create a file called hello.txt with the text hello world please"
+- "Run PowerShell to show today's date please"
+- "What processes are using the most CPU please"
+- "Search the web for Cursor MCP docs please"
+- "Go to sleep please"
 
 Jarvis uses **qwen2.5-coder:14b** with tools:
 - `run_powershell` — run safe commands
 - `open_application` — launch apps/URLs
+- `open_url` / `web_search` / `fetch_url` — browse and read web pages
 - `read_file` / `write_file` — files under Documents
 - `list_directory` — browse Documents
+- `git_status` / `git_command` — safe Git status, diff, log, commit, push, etc.
+- `open_folder_in_cursor` — open projects in Cursor
 
 ---
 
