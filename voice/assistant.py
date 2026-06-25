@@ -553,6 +553,12 @@ def main() -> None:
     workspace = cfg.get("tools", {}).get("workspace")
     if workspace:
         os.environ["JARVIS_WORKSPACE"] = workspace
+    github_org = cfg.get("tools", {}).get("github_org")
+    if github_org:
+        os.environ["JARVIS_GITHUB_ORG"] = github_org
+    git_roots = cfg.get("tools", {}).get("git_roots")
+    if git_roots:
+        os.environ["JARVIS_GIT_ROOTS"] = ";".join(git_roots)
     setup_logging(cfg)
     wait_for_ollama(cfg["ollama"]["url"])
     preload_model(cfg["ollama"]["url"], cfg["ollama"]["model"])

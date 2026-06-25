@@ -9,6 +9,9 @@ ollama:
     - After tools run, answer in plain spoken English (1-3 short sentences).
     - For "what file am I looking at in Cursor", use get_active_window first.
     - Cursor titles look like "filename.py - folder - Cursor". The first part is the file name.
+    - For GitHub requests, use github_publish_project to create a magnify-dev repo and push code.
+    - Use git_status first if unsure whether a folder is already on GitHub.
+    - Default GitHub org is magnify-dev. ai-assistant project path is C:/Users/marce/ai-assistant.
     - Never close or kill Cursor unless the user explicitly asks to quit Cursor.
     - "Stop listening" means stop the assistant, not close apps.
 
@@ -21,8 +24,12 @@ wake_word:
 
 tools:
   enabled: true
-  max_rounds: 5
+  max_rounds: 8
   workspace: "C:/Users/marce/Documents"
+  github_org: "magnify-dev"
+  git_roots:
+    - "C:/Users/marce/ai-assistant"
+    - "C:/Users/marce/Documents"
 
 speech:
   sample_rate: 16000

@@ -10,6 +10,15 @@ from ctypes import wintypes
 from pathlib import Path
 
 WORKSPACE = Path(os.environ.get("JARVIS_WORKSPACE", Path.home() / "Documents")).resolve()
+GITHUB_ORG = os.environ.get("JARVIS_GITHUB_ORG", "magnify-dev")
+GIT_ROOTS = [
+    Path(p).resolve()
+    for p in os.environ.get(
+        "JARVIS_GIT_ROOTS",
+        f"{Path.home() / 'Documents'};{Path.home() / 'ai-assistant'}",
+    ).split(";")
+    if p.strip()
+]
 
 # Snapshot taken when the wake word fires (before Jarvis records or runs tools).
 _context_window: dict | None = None
@@ -105,6 +114,63 @@ TOOL_DEFINITIONS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "git_status",
+            "description": (
+                "Check git status for a project folder: branch, uncommitted changes, remote URL."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "project_path": {
+                        "type": "string",
+                        "description": "Project folder path (e.g. C:/Users/marce/ai-assistant)",
+                    },
+                },
+                "required": ["project_path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "github_publish_project",
+            "description": (
+                "Create a GitHub repo under magnify-dev (if it does not exist), "
+                "commit all changes, and push to GitHub. Use when the user asks to "
+                "put a project on GitHub or push code."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "project_path": {
+                        "type": "string",
+                        "description": "Local project folder to publish",
+                    },
+                    "repo_name": {
+                        "type": "string",
+                        "description": "GitHub repository name (e.g. ai-assistant)",
+                    },
+                    "commit_message": {
+                        "type": "string",
+                        "description": "Commit message for any uncommitted changes",
+                    },
+                    "visibility": {
+                        "type": "string",
+                        "enum": ["public", "private"],
+                        "description": "Repo visibility when creating (default public)",
+                    },
+                    "org": {
+                        "type": "string",
+                        "description": "GitHub organization (default magnify-dev)",
+                    },
+                },
+                "required": ["project_path", "repo_name", "commit_message"],
+            },
+        },
+    },
 ]
 
 BLOCKED_COMMAND_FRAGMENTS = [
@@ -118,6 +184,15 @@ BLOCKED_COMMAND_FRAGMENTS = [
     "stop-process -name 'cursor'",
     'stop-process -name "cursor"',
     "stop-process cursor",
+]
+
+BLOCKED_GIT_ARGS = [
+    "--force",
+    "push --force",
+    "reset --hard",
+    "clean -fdx",
+    "filter-branch",
+    "branch -D",
 ]
 
 def _pid_to_exe(pid: int) -> str:
@@ -243,6 +318,137 @@ def _safe_path(relative: str) -> Path:
     return target
 
 
+def _resolve_git_project(path_str: str) -> Path:
+    raw = path_str.strip().strip('"').strip("'")
+    candidate = Path(raw).expanduser()
+    if not candidate.is_absolute():
+        candidate = (WORKSPACE / raw).resolve()
+    else:
+        candidate = candidate.resolve()
+
+    for root in GIT_ROOTS:
+        root_str = str(root)
+        if str(candidate) == root_str or str(candidate).startswith(root_str + os.sep):
+            return candidate
+
+    allowed = ", ".join(str(r) for r in GIT_ROOTS)
+    raise PermissionError(f"Project path must be under: {allowed}")
+
+
+def _shell_env() -> dict[str, str]:
+    env = os.environ.copy()
+    extra = r"C:\Program Files\Git\cmd;C:\Program Files\GitHub CLI"
+    path = env.get("Path", "")
+    if "Git\\cmd" not in path:
+        env["Path"] = path + ";" + extra
+    return env
+
+
+def _run_cmd(
+    args: list[str],
+    cwd: Path,
+    timeout: int = 120,
+) -> tuple[int, str]:
+    joined = " ".join(args).lower()
+    for blocked in BLOCKED_GIT_ARGS:
+        if blocked in joined:
+            return 1, f"Blocked dangerous git command: {blocked}"
+
+    proc = subprocess.run(
+        args,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        cwd=str(cwd),
+        env=_shell_env(),
+    )
+    out = ((proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else "")).strip()
+    return proc.returncode, out or "(no output)"
+
+
+def _git_status(project_path: str) -> str:
+    root = _resolve_git_project(project_path)
+    if not (root / ".git").exists():
+        return f"Not a git repo yet: {root}"
+
+    parts: list[str] = [f"Project: {root}"]
+    code, branch = _run_cmd(["git", "branch", "--show-current"], root, timeout=30)
+    if code == 0:
+        parts.append(f"Branch: {branch}")
+
+    code, remote = _run_cmd(["git", "remote", "get-url", "origin"], root, timeout=30)
+    if code == 0:
+        parts.append(f"Remote: {remote}")
+
+    code, status = _run_cmd(["git", "status", "--short"], root, timeout=30)
+    if code == 0:
+        parts.append("Changes:\n" + (status if status else "(clean working tree)"))
+
+    return "\n".join(parts)
+
+
+def _github_publish_project(
+    project_path: str,
+    repo_name: str,
+    commit_message: str,
+    visibility: str = "public",
+    org: str | None = None,
+) -> str:
+    root = _resolve_git_project(project_path)
+    if not root.is_dir():
+        return f"Not a directory: {root}"
+
+    org_name = (org or GITHUB_ORG).strip()
+    repo_name = repo_name.strip().lower().replace(" ", "-")
+    vis_flag = "--private" if visibility == "private" else "--public"
+    full_name = f"{org_name}/{repo_name}"
+    repo_url = f"https://github.com/{full_name}"
+
+    if not (root / ".git").exists():
+        code, out = _run_cmd(["git", "init", "-b", "main"], root)
+        if code != 0:
+            return f"git init failed:\n{out}"
+
+    code, out = _run_cmd(["git", "add", "-A"], root)
+    if code != 0:
+        return f"git add failed:\n{out}"
+
+    code, status = _run_cmd(["git", "status", "--porcelain"], root)
+    if code != 0:
+        return f"git status failed:\n{status}"
+
+    if status.strip():
+        code, out = _run_cmd(["git", "commit", "-m", commit_message], root)
+        if code != 0:
+            return f"git commit failed:\n{out}"
+
+    code, remote = _run_cmd(["git", "remote", "get-url", "origin"], root)
+    if code != 0:
+        code, out = _run_cmd(
+            [
+                "gh",
+                "repo",
+                "create",
+                full_name,
+                vis_flag,
+                "--source=.",
+                "--remote=origin",
+                "--push",
+            ],
+            root,
+            timeout=180,
+        )
+        if code != 0:
+            return f"github create/push failed:\n{out}"
+        return f"Created and pushed {repo_url}"
+
+    code, out = _run_cmd(["git", "push", "-u", "origin", "HEAD"], root, timeout=180)
+    if code != 0:
+        return f"git push failed:\n{out}"
+
+    return f"Pushed latest code to {repo_url}"
+
+
 def _run_powershell(command: str, timeout: int = 30) -> str:
     lowered = command.lower()
     for blocked in BLOCKED_COMMAND_FRAGMENTS:
@@ -294,6 +500,16 @@ def execute_tool(name: str, arguments: dict) -> str:
             entries = sorted(path.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
             lines = [f"{'[dir]' if e.is_dir() else '[file]'} {e.name}" for e in entries[:100]]
             return "\n".join(lines) or "(empty)"
+        if name == "git_status":
+            return _git_status(arguments["project_path"])
+        if name == "github_publish_project":
+            return _github_publish_project(
+                arguments["project_path"],
+                arguments["repo_name"],
+                arguments["commit_message"],
+                arguments.get("visibility", "public"),
+                arguments.get("org"),
+            )
         return f"Unknown tool: {name}"
     except Exception as exc:
         return f"Tool error: {exc}"
