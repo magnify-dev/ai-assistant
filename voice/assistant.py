@@ -16,6 +16,7 @@ import threading
 import time
 import uuid
 import wave
+import ctypes
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -24,7 +25,14 @@ import requests
 import sounddevice as sd
 import yaml
 
-from tools import TOOL_DEFINITIONS, capture_active_window_context, execute_tool, tools_enabled
+from tools import (
+    TOOL_DEFINITIONS,
+    capture_active_window_context,
+    execute_tool,
+    start_browser_bridge,
+    start_configured_browser_control,
+    tools_enabled,
+)
 
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
@@ -34,6 +42,7 @@ CONFIG_PATH = ROOT / "config.yaml"
 _whisper_model = None
 _tts_engine = None
 _lock_handle = None
+_mutex_handle = None
 _tts_stop = threading.Event()
 _audit_lock = threading.Lock()
 _last_git_project: str | None = None
@@ -261,6 +270,25 @@ def _extract_command(text: str, phrases: list[str], buffer: str, accumulate: boo
     return None, ""
 
 
+def _looks_like_command(text: str) -> bool:
+    """Drop flushed background fragments that are not actionable Jarvis requests."""
+    lowered = text.lower().strip(" .!?,-")
+    if not lowered:
+        return False
+    if len(re.findall(r"[a-z0-9]+", lowered)) < 2:
+        return False
+
+    intent_patterns = (
+        r"\b(can|could|would|will|should)\s+you\b",
+        r"\b(is|are|am|do|does|did|has|have|can|could|would|will|should)\b",
+        r"\b(open|go|navigate|show|take|click|press|select|choose|read|see|list|tell|search|find)\b",
+        r"\b(commit|sync|push|git|status|changes)\b",
+        r"\b(browser|firefox|youtube|playlist|video|playing|song|music|page|tab|cursor|folder|file|app|application)\b",
+        r"\bwhat\b|\bwhich\b|\bwhere\b|\bwho\b|\bwhen\b|\bhow\b",
+    )
+    return any(re.search(pattern, lowered) for pattern in intent_patterns)
+
+
 def interrupt_speech() -> None:
     _tts_stop.set()
     try:
@@ -273,13 +301,20 @@ def interrupt_speech() -> None:
 
 
 def acquire_single_instance_lock() -> None:
-    global _lock_handle
+    global _lock_handle, _mutex_handle
+    kernel32 = ctypes.windll.kernel32
+    kernel32.CreateMutexW.restype = ctypes.c_void_p
+    _mutex_handle = kernel32.CreateMutexW(None, False, "Local\\JarvisVoiceAssistant")
+    if _mutex_handle and kernel32.GetLastError() == 183:
+        print("Another Jarvis voice assistant is already running. Exiting.", flush=True)
+        sys.exit(0)
+
     lock_path = ROOT / ".assistant.lock"
     _lock_handle = open(lock_path, "w", encoding="utf-8")
     try:
         msvcrt.locking(_lock_handle.fileno(), msvcrt.LK_NBLCK, 1)
     except OSError:
-        print("Another Jarvis voice assistant is already running. Exiting.")
+        print("Another Jarvis voice assistant is already running. Exiting.", flush=True)
         sys.exit(0)
     _lock_handle.write(str(os.getpid()))
     _lock_handle.flush()
@@ -748,6 +783,268 @@ def _handle_local_command(text: str, cfg: dict, command_id: str | None = None) -
     return _git_commit_with_retries(text, cfg, command_id, project)
 
 
+def _handle_context_action(text: str, cfg: dict, command_id: str | None = None) -> str | None:
+    lowered = text.lower().strip(" .!?")
+    if not lowered:
+        return None
+    git_words = ("git", "uncommitted", "committed", "commit", "sync", "push", "upload")
+    if any(word in lowered for word in git_words):
+        return None
+    if re.match(r"^(what|which|where|who|when|how|is|are|am|do|does|did|has|have)\b", lowered):
+        return None
+    actionish = bool(
+        re.search(r"\b(open|go|navigate|show|take|click|press|select|choose|play|start|launch|switch|focus)\b", lowered)
+        or re.search(r"\b(first|1st|second|2nd|third|3rd|fourth|4th|fifth|5th)\b.*\b(song|track|video|result|item)\b", lowered)
+    )
+    if not actionish:
+        return None
+
+    audit_event(cfg, "tool_call", command_id=command_id, name="act_on_context", arguments={"command": text})
+    result = execute_tool("act_on_context", {"command": text})
+    audit_event(cfg, "tool_result", command_id=command_id, name="act_on_context", result=result)
+    if result == "OK":
+        return "Done."
+    if "couldn't confidently map" in result.lower():
+        return None
+    return result
+
+
+def _handle_browser_command(text: str, cfg: dict, command_id: str | None = None) -> str | None:
+    lowered = text.lower()
+    previous_text = str(_last_action.get("text", "")).lower()
+    previous_reply = str(_last_action.get("reply", "")).lower()
+    youtube_context = "youtube" in lowered or "youtube" in previous_text or "youtube" in previous_reply
+    playlist_intent = bool(re.search(r"\bplaylists?\b", lowered))
+    read_intent = bool(re.search(r"\b(see|read|which|what|list|contents)\b", lowered))
+    open_intent = bool(re.search(r"\b(open|go|navigate|show|take)\b", lowered))
+    click_intent = bool(re.search(r"\b(click|press|select|choose)\b", lowered))
+    browser_context_intent = bool(
+        re.search(r"\b(browser|firefox|page|tab|website|site|link|button|video|playing|song|music)\b", lowered)
+        or "what do you see" in lowered
+    )
+    browser_control_intent = bool(
+        re.search(r"\b(control|use|start|launch)\b.*\b(browser|firefox|web)\b", lowered)
+        or "firefox bridge" in lowered
+    )
+    browser_question_intent = bool(
+        browser_context_intent
+        and re.search(r"\b(is|are|am|do|does|did|has|have|can|could|would|will|should)\b", lowered)
+    )
+
+    def browser_error(result: str) -> str:
+        lowered_result = result.lower()
+        if "no visible video found" in lowered_result:
+            return "I couldn't find a visible video to play."
+        if "no visible play button or video found" in lowered_result:
+            return "I couldn't find a play button or video."
+        if "no visible element matched" in lowered_result:
+            return "I couldn't find that on the page."
+        if "foxmcp tool error" in lowered_result:
+            return "Browser control had a tool error."
+        if "script result from tab" in lowered_result:
+            return "The browser action did not complete."
+        return result[:140]
+
+    def browser_target(verbs: tuple[str, ...], source_text: str | None = None) -> str:
+        source = source_text or text
+        command = re.sub(r"\bplease\b", " ", source, flags=re.IGNORECASE).strip(" .!?")
+        match = re.search(r"\b(" + "|".join(re.escape(verb) for verb in verbs) + r")\b", command, re.IGNORECASE)
+        if not match:
+            return ""
+        target = command[match.end() :].strip(" .!?")
+        target = re.split(
+            r"\b(?:and|then)\s+(?:press|click|hit)?\s*play\b",
+            target,
+            maxsplit=1,
+            flags=re.IGNORECASE,
+        )[0].strip(" .!?")
+        target = re.sub(
+            r"^(on|in|inside|the|current|this|firefox|browser|page|tab|link|button|to)\b\s*",
+            "",
+            target,
+            flags=re.IGNORECASE,
+        ).strip(" .!?")
+        name_match = re.search(r"(.+?)\s+(?:is|as)\s+the\s+name\b", target, flags=re.IGNORECASE)
+        if name_match:
+            target = name_match.group(1)
+        target = re.split(r"\s*,\s*|\s+\b(?:playlist|link|button)\b", target, maxsplit=1, flags=re.IGNORECASE)[0]
+        target = re.sub(r"^(the|a|an)\b\s*", "", target, flags=re.IGNORECASE).strip(" .!?")
+        return target
+
+    def browser_steps(command_text: str) -> list[dict[str, str]]:
+        parts = [
+            part.strip(" .!?")
+            for part in re.split(r"\b(?:and then|then|and)\b", command_text, flags=re.IGNORECASE)
+            if part.strip(" .!?")
+        ]
+        if not parts:
+            parts = [command_text.strip(" .!?")]
+
+        steps: list[dict[str, str]] = []
+        for part in parts:
+            part_lower = part.lower()
+            part_click = bool(re.search(r"\b(click|press|select|choose)\b", part_lower))
+            part_open = bool(re.search(r"\b(open|go|navigate|show|take)\b", part_lower))
+            if re.search(r"\b(?:press|click|hit)?\s*play\b", part_lower):
+                if re.search(r"\b(first|1st)\b", part_lower) and re.search(r"\b(video|song|track)\b", part_lower):
+                    steps.append({"action": "click", "query": "play first video"})
+                else:
+                    steps.append({"action": "click", "query": "play"})
+                continue
+            if part_click:
+                query = browser_target(("click", "press", "select", "choose"), part)
+                if query:
+                    steps.append({"action": "click", "query": query})
+                continue
+            if "youtube" in part_lower and part_open:
+                steps.append({"action": "navigate", "url": "https://www.youtube.com"})
+                continue
+            if "playlist" in part_lower and (part_open or youtube_context):
+                steps.append({"action": "navigate", "url": "https://www.youtube.com/feed/playlists"})
+                continue
+            url_match = re.search(r"https?://\S+", part)
+            if part_open and url_match:
+                steps.append({"action": "navigate", "url": url_match.group(0).rstrip(" .!?")})
+                continue
+        return steps
+
+    planned_steps = browser_steps(text)
+    if planned_steps:
+        audit_event(cfg, "browser_plan", command_id=command_id, text=text, steps=planned_steps)
+        completed: list[str] = []
+        for idx, step in enumerate(planned_steps, start=1):
+            if idx > 1:
+                time.sleep(2)
+            if step["action"] == "navigate":
+                audit_event(cfg, "tool_call", command_id=command_id, name="navigate_browser_context", arguments={"url": step["url"]})
+                result = execute_tool("navigate_browser_context", {"url": step["url"]})
+                audit_event(cfg, "tool_result", command_id=command_id, name="navigate_browser_context", result=result)
+                if result != "OK":
+                    return f"I completed {len(completed)} step{'s' if len(completed) != 1 else ''}, then got stuck. {browser_error(result)}"
+                completed.append("navigated")
+            elif step["action"] == "click":
+                audit_event(cfg, "tool_call", command_id=command_id, name="click_browser_context", arguments={"query": step["query"]})
+                result = execute_tool("click_browser_context", {"query": step["query"]})
+                audit_event(cfg, "tool_result", command_id=command_id, name="click_browser_context", result=result)
+                if result != "OK":
+                    return f"I completed {len(completed)} step{'s' if len(completed) != 1 else ''}, then got stuck. {browser_error(result)}"
+                completed.append(f"clicked {step['query']}")
+        return "Done."
+
+    if click_intent:
+        query = browser_target(("click", "press", "select", "choose"))
+        if query:
+            audit_event(cfg, "local_command", command_id=command_id, kind="browser_context_click", text=text, query=query)
+            audit_event(cfg, "tool_call", command_id=command_id, name="click_browser_context", arguments={"query": query})
+            result = execute_tool("click_browser_context", {"query": query})
+            audit_event(cfg, "tool_result", command_id=command_id, name="click_browser_context", result=result)
+            if result == "OK":
+                return f"Clicked {query}."
+            return browser_error(result)
+
+    if playlist_intent and open_intent and not read_intent:
+        context_result = None
+        # If the user names a specific playlist, try the real Firefox DOM links first.
+        generic_playlist_page = bool(re.search(r"\b(my playlists?|my playlist|playlists? page)\b", lowered))
+        if not generic_playlist_page:
+            query = re.sub(r"\b(open|go|navigate|show|take|to|my|playlist|playlists)\b", " ", lowered)
+            query = re.sub(r"\s+", " ", query).strip(" .!?")
+            if query:
+                audit_event(cfg, "tool_call", command_id=command_id, name="open_browser_context_link", arguments={"query": query})
+                context_result = execute_tool("open_browser_context_link", {"query": query})
+                audit_event(cfg, "tool_result", command_id=command_id, name="open_browser_context_link", result=context_result)
+                if context_result.startswith("Opened "):
+                    return "Opened that playlist."
+
+        url = "https://www.youtube.com/feed/playlists"
+        audit_event(cfg, "local_command", command_id=command_id, kind="browser", url=url, text=text)
+        audit_event(cfg, "tool_call", command_id=command_id, name="navigate_browser_context", arguments={"url": url})
+        result = execute_tool("navigate_browser_context", {"url": url})
+        audit_event(cfg, "tool_result", command_id=command_id, name="navigate_browser_context", result=result)
+        if result == "OK":
+            return "Opened your YouTube playlists."
+        return f"I couldn't open your YouTube playlists. {browser_error(result)}"
+
+    if playlist_intent and read_intent:
+        question = "List the visible YouTube playlist names from Firefox."
+        audit_event(cfg, "local_command", command_id=command_id, kind="browser_context_read", text=text, question=question)
+        audit_event(cfg, "tool_call", command_id=command_id, name="read_browser_context", arguments={"question": question})
+        result = execute_tool("read_browser_context", {"question": question})
+        audit_event(cfg, "tool_result", command_id=command_id, name="read_browser_context", result=result)
+        if not result or "no firefox page context" in result.lower():
+            return "I can't read Firefox yet. Load the Jarvis extension into your normal Firefox first."
+        return result
+
+    if playlist_intent and youtube_context:
+        url = "https://www.youtube.com/feed/playlists"
+        audit_event(cfg, "local_command", command_id=command_id, kind="browser", url=url, text=text)
+        audit_event(cfg, "tool_call", command_id=command_id, name="navigate_browser_context", arguments={"url": url})
+        result = execute_tool("navigate_browser_context", {"url": url})
+        audit_event(cfg, "tool_result", command_id=command_id, name="navigate_browser_context", result=result)
+        if result == "OK":
+            return "Opened your YouTube playlists."
+        return f"I couldn't open your YouTube playlists. {browser_error(result)}"
+
+    if "youtube" in lowered and open_intent:
+        url = "https://www.youtube.com"
+        audit_event(cfg, "local_command", command_id=command_id, kind="browser", url=url, text=text)
+        audit_event(cfg, "tool_call", command_id=command_id, name="navigate_browser_context", arguments={"url": url})
+        result = execute_tool("navigate_browser_context", {"url": url})
+        audit_event(cfg, "tool_result", command_id=command_id, name="navigate_browser_context", result=result)
+        if result == "OK":
+            return "Opened YouTube."
+        return f"I couldn't open YouTube. {browser_error(result)}"
+
+    if browser_control_intent:
+        audit_event(cfg, "local_command", command_id=command_id, kind="browser_context_start", text=text)
+        audit_event(cfg, "tool_call", command_id=command_id, name="setup_firefox_bridge", arguments={})
+        result = execute_tool("setup_firefox_bridge", {})
+        audit_event(cfg, "tool_result", command_id=command_id, name="setup_firefox_bridge", result=result)
+        if result.startswith("Opened "):
+            return "I opened the Firefox extension setup. Load the Jarvis extension into your normal Firefox."
+        return result[:220]
+
+    if read_intent and browser_context_intent:
+        question = text.strip()
+        audit_event(cfg, "local_command", command_id=command_id, kind="browser_context_read", text=text, question=question)
+        audit_event(cfg, "tool_call", command_id=command_id, name="read_browser_context", arguments={"question": question})
+        result = execute_tool("read_browser_context", {"question": question})
+        audit_event(cfg, "tool_result", command_id=command_id, name="read_browser_context", result=result)
+        return result
+
+    if browser_question_intent:
+        question = text.strip()
+        audit_event(cfg, "local_command", command_id=command_id, kind="browser_context_question", text=text, question=question)
+        audit_event(cfg, "tool_call", command_id=command_id, name="read_browser_context", arguments={"question": question})
+        result = execute_tool("read_browser_context", {"question": question})
+        audit_event(cfg, "tool_result", command_id=command_id, name="read_browser_context", result=result)
+        return result
+
+    url_match = re.search(r"https?://\S+", text)
+    if open_intent and url_match:
+        url = url_match.group(0).rstrip(" .!?")
+        audit_event(cfg, "local_command", command_id=command_id, kind="browser_context_navigate", text=text, url=url)
+        audit_event(cfg, "tool_call", command_id=command_id, name="navigate_browser_context", arguments={"url": url})
+        result = execute_tool("navigate_browser_context", {"url": url})
+        audit_event(cfg, "tool_result", command_id=command_id, name="navigate_browser_context", result=result)
+        if result == "OK":
+            return "Navigated Firefox."
+        return browser_error(result)
+
+    if open_intent and browser_context_intent:
+        query = browser_target(("open", "go", "navigate", "show", "take"))
+        if query:
+            audit_event(cfg, "local_command", command_id=command_id, kind="browser_context_open_link", text=text, query=query)
+            audit_event(cfg, "tool_call", command_id=command_id, name="open_browser_context_link", arguments={"query": query})
+            result = execute_tool("open_browser_context_link", {"query": query})
+            audit_event(cfg, "tool_result", command_id=command_id, name="open_browser_context_link", result=result)
+            if result.startswith(("Clicked ", "Opened ")):
+                return f"Opened {query}."
+            return browser_error(result)
+
+    return None
+
+
 def _is_followup_check(text: str) -> bool:
     lowered = text.lower().strip(" .!?")
     return lowered in {
@@ -801,6 +1098,8 @@ def _claims_action_without_tool(text: str) -> bool:
     claim_phrases = (
         "i checked",
         "i tried",
+        "i navigated",
+        "navigated to",
         "using cursor",
         "using cursor's",
         "i opened",
@@ -842,6 +1141,10 @@ def load_config() -> dict:
 def setup_logging(cfg: dict) -> None:
     log_file = (ROOT / cfg["logging"]["file"]).resolve()
     log_file.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
     logging.basicConfig(
         level=getattr(logging, cfg["logging"].get("level", "INFO")),
         format="%(asctime)s [%(levelname)s] %(message)s",
@@ -861,6 +1164,8 @@ def resolve_path(value: str) -> Path:
 
 def wait_for_ollama(url: str, timeout_sec: int = 120) -> None:
     deadline = time.time() + timeout_sec
+    next_log = 0.0
+    logging.info("Waiting for Ollama at %s", url)
     while time.time() < deadline:
         try:
             resp = requests.get(f"{url}/api/tags", timeout=3)
@@ -869,6 +1174,9 @@ def wait_for_ollama(url: str, timeout_sec: int = 120) -> None:
                 return
         except requests.RequestException:
             pass
+        if time.time() >= next_log:
+            logging.info("Still waiting for Ollama at %s", url)
+            next_log = time.time() + 10
         time.sleep(2)
     raise RuntimeError(f"Ollama not reachable at {url} after {timeout_sec}s")
 
@@ -1047,6 +1355,24 @@ def chat_ollama(text: str, cfg: dict, history: list[dict], command_id: str | Non
         audit_event(cfg, "assistant_reply", command_id=command_id, source="local", text=followup_reply)
         _remember_action(text, followup_reply, "local_followup", [])
         return followup_reply
+
+    context_reply = _handle_context_action(text, cfg, command_id=command_id) if use_tools else None
+    if context_reply:
+        history.append({"role": "user", "content": text})
+        history.append({"role": "assistant", "content": context_reply})
+        logging.info("Reply: %s", context_reply)
+        audit_event(cfg, "assistant_reply", command_id=command_id, source="local", text=context_reply)
+        _remember_action(text, context_reply, "local", ["act_on_context"])
+        return context_reply
+
+    browser_reply = _handle_browser_command(text, cfg, command_id=command_id) if use_tools else None
+    if browser_reply:
+        history.append({"role": "user", "content": text})
+        history.append({"role": "assistant", "content": browser_reply})
+        logging.info("Reply: %s", browser_reply)
+        audit_event(cfg, "assistant_reply", command_id=command_id, source="local", text=browser_reply)
+        _remember_action(text, browser_reply, "local", ["browser_context"])
+        return browser_reply
 
     local_reply = _handle_local_command(text, cfg, command_id=command_id) if use_tools else None
     if local_reply:
@@ -1316,6 +1642,10 @@ def run_always_on_session(
                     audit_event(cfg, "sleep_command", text=command, mode="always_on_command")
                     _go_to_sleep(cfg, state, history)
                     continue
+                if not _looks_like_command(command):
+                    logging.info("Ignored non-command speech: %s", command)
+                    audit_event(cfg, "ignored_non_command", text=command, trigger_text=text)
+                    continue
                 command_id = uuid.uuid4().hex[:12]
                 logging.info("Command ready: %s", command)
                 audit_event(
@@ -1327,7 +1657,7 @@ def run_always_on_session(
                     trigger_text=text,
                 )
                 command_queue.put({"id": command_id, "text": command})
-            elif text and accumulate:
+            elif text and accumulate and new_buffer:
                 logging.info("Buffered — say '%s' when done: %s", phrases[0], new_buffer)
                 audit_event(
                     cfg,
@@ -1533,11 +1863,38 @@ def run_wake_word_loop(cfg: dict) -> None:
 
 
 def main() -> None:
+    print("Jarvis starting...", flush=True)
     acquire_single_instance_lock()
+    print("Loading config...", flush=True)
     cfg = load_config()
+    setup_logging(cfg)
+    logging.info("Jarvis startup beginning")
     workspace = cfg.get("tools", {}).get("workspace")
     if workspace:
         os.environ["JARVIS_WORKSPACE"] = workspace
+    os.environ["JARVIS_OLLAMA_URL"] = cfg["ollama"]["url"]
+    vision_cfg = cfg.get("vision", {})
+    if vision_cfg.get("model"):
+        os.environ["JARVIS_VISION_MODEL"] = str(vision_cfg["model"])
+    if vision_cfg.get("max_screenshot_width"):
+        os.environ["JARVIS_VISION_MAX_WIDTH"] = str(vision_cfg["max_screenshot_width"])
+    browser_cfg = cfg.get("browser", {})
+    if browser_cfg.get("debug_port"):
+        os.environ["JARVIS_BROWSER_DEBUG_PORT"] = str(browser_cfg["debug_port"])
+    if browser_cfg.get("profile_dir"):
+        profile_dir = resolve_path(str(browser_cfg["profile_dir"]))
+        os.environ["JARVIS_BROWSER_PROFILE_DIR"] = str(profile_dir)
+    os.environ["JARVIS_BROWSER_PROVIDER"] = str(browser_cfg.get("provider", "foxmcp"))
+    if browser_cfg.get("foxmcp_server_dir"):
+        os.environ["JARVIS_FOXMCP_SERVER_DIR"] = str(resolve_path(str(browser_cfg["foxmcp_server_dir"])))
+    if browser_cfg.get("foxmcp_websocket_port"):
+        os.environ["JARVIS_FOXMCP_WEBSOCKET_PORT"] = str(browser_cfg["foxmcp_websocket_port"])
+    if browser_cfg.get("foxmcp_mcp_port"):
+        os.environ["JARVIS_FOXMCP_MCP_PORT"] = str(browser_cfg["foxmcp_mcp_port"])
+    if browser_cfg.get("provider") == "jarvis_extension":
+        start_browser_bridge(int(browser_cfg.get("bridge_port", 8766)))
+    browser_status = start_configured_browser_control()
+    logging.info("Browser control startup: %s", browser_status)
     github_org = cfg.get("tools", {}).get("github_org")
     if github_org:
         os.environ["JARVIS_GITHUB_ORG"] = github_org
@@ -1549,7 +1906,6 @@ def main() -> None:
         import tools as tools_module
 
         tools_module.KNOWN_PATHS = dict(known_paths)
-    setup_logging(cfg)
     wait_for_ollama(cfg["ollama"]["url"])
     preload_model(cfg["ollama"]["url"], cfg["ollama"]["model"])
     preload_whisper(cfg)

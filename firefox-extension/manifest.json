@@ -1,0 +1,22 @@
+{
+  "manifest_version": 2,
+  "name": "Jarvis Page Bridge",
+  "version": "0.1.0",
+  "description": "Sends the active page DOM text and links to local Jarvis.",
+  "permissions": [
+    "<all_urls>",
+    "http://127.0.0.1:8765/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "jarvis-page-bridge@local"
+    }
+  }
+}

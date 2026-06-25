@@ -98,8 +98,11 @@ def assistant_running() -> bool:
             "-NoProfile",
             "-Command",
             (
-                "Get-Process python -ErrorAction SilentlyContinue | "
-                "Where-Object { $_.Path -like '*ai-assistant\\voice*' } | "
+                "Get-CimInstance Win32_Process | "
+                "Where-Object { "
+                "($_.Name -eq 'python.exe' -or $_.Name -eq 'pythonw.exe') -and "
+                "$_.CommandLine -like '*ai-assistant*voice*assistant.py*' "
+                "} | "
                 "Select-Object -First 1 -ExpandProperty Id"
             ),
         ],

@@ -49,6 +49,21 @@ Use it to:
 
 For startup, this project uses a Windows Scheduled Task (`JarvisLocalAI`). That is usually better than a classic Windows service for this assistant because Jarvis needs user-session access to your microphone, speakers, windows, Cursor, browser, and desktop tools.
 
+## Firefox Page Bridge
+
+To let Jarvis read your real Firefox tabs while staying logged in:
+
+1. Start Jarvis from the UI so the local bridge is running.
+2. Open Firefox and go to `about:debugging#/runtime/this-firefox`.
+3. Click **Load Temporary Add-on...**.
+4. Select `firefox-extension/manifest.json`.
+5. Open YouTube playlists in Firefox.
+6. Ask Jarvis: **"what playlists do you see please"**.
+
+The extension sends the current page title, URL, visible text, and links to Jarvis at `http://127.0.0.1:8765/context`. It stays local on your machine.
+
+For permanent installation, see `FIREFOX-EXTENSION.md`. Normal Firefox requires a signed extension; temporary add-ons do not survive Firefox restarts.
+
 ## Voice usage
 
 1. Say **"hey jarvis"** and wait for the beep.
