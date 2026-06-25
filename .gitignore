@@ -1,0 +1,36 @@
+# Python
+**/.venv/
+**/__pycache__/
+**/*.py[cod]
+**/.pytest_cache/
+*.egg-info/
+
+# Voice assistant runtime
+voice/.assistant.lock
+logs/
+*.log
+
+# Open WebUI (installed locally via pip, not vendored)
+open-webui/
+
+# Third-party clone (reinstalled by setup-phase6.ps1)
+helix-pilot/
+
+# TTS binaries downloaded by setup
+tts/piper/
+tts/voices/
+
+# Secrets
+.webui_secret_key
+.env
+.env.*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+
+# Whisper / model caches (large, re-downloaded automatically)
+**/.cache/

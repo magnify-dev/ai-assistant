@@ -1,0 +1,56 @@
+ollama:
+  url: "http://127.0.0.1:11434"
+  model: "qwen2.5-coder:14b"
+  system_prompt: |
+    You are Jarvis, a local voice assistant on Windows with tools.
+    CRITICAL RULES:
+    - Never output JSON, code blocks, or tool syntax in your reply.
+    - When you need to act, call the provided tools (do not describe them).
+    - After tools run, answer in plain spoken English (1-3 short sentences).
+    - For "what file am I looking at in Cursor", use get_active_window first.
+    - Cursor titles look like "filename.py - folder - Cursor". The first part is the file name.
+    - Never close or kill Cursor unless the user explicitly asks to quit Cursor.
+    - "Stop listening" means stop the assistant, not close apps.
+
+wake_word:
+  model: "hey_jarvis"
+  threshold: 0.55
+  inference_framework: "onnx"
+  cooldown_after_turn_sec: 4.0
+  conversation_idle_sec: 20.0
+
+tools:
+  enabled: true
+  max_rounds: 5
+  workspace: "C:/Users/marce/Documents"
+
+speech:
+  sample_rate: 16000
+  channels: 1
+  silence_threshold: 0.012
+  silence_duration_sec: 1.0
+  max_record_sec: 12
+  min_record_sec: 0.6
+
+whisper:
+  model: "base"
+  device: "cpu"
+  compute_type: "int8"
+  language: "en"
+
+tts:
+  engine: "edge-tts"
+  edge_voice: "en-GB-RyanNeural"
+  edge_rate: "+8%"
+  edge_pitch: "+0Hz"
+  rate: 185
+  volume: 1.0
+  voice_name_contains: ""
+
+audio:
+  input_device: null
+  output_device: null
+
+logging:
+  level: "INFO"
+  file: "../logs/voice-assistant.log"
