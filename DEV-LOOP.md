@@ -15,7 +15,7 @@ Phase 2 (later): Cursor SDK automates the handoff. Phase 3 (later): Jarvis voice
 
 2. Run the loop (installs `pytest` into the voice venv on first run):
    ```powershell
-   cd C:\Users\marce\ai-assistant
+   cd C:\Users\marce\Documents\Programming\ai-assistant
    .\run-dev-loop.ps1 -Demo
    ```
 

@@ -154,6 +154,7 @@ class JarvisControlPanel(tk.Tk):
         self.title("Jarvis Control Panel")
         self.geometry("900x620")
         self.minsize(780, 520)
+        self._apply_dark_theme()
 
         self.voices: list[dict] = []
         self.voice_by_label: dict[str, str] = {}
@@ -172,6 +173,33 @@ class JarvisControlPanel(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.refresh_status()
         self.load_voices()
+
+    def _apply_dark_theme(self) -> None:
+        bg = "#0f1117"
+        panel = "#1a1d27"
+        text = "#e6e9ef"
+        accent = "#6c9eff"
+        self.configure(bg=bg)
+        style = ttk.Style(self)
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+        style.configure(".", background=bg, foreground=text, fieldbackground=panel)
+        style.configure("TFrame", background=bg)
+        style.configure("TLabelframe", background=bg, foreground=text)
+        style.configure("TLabelframe.Label", background=bg, foreground=text)
+        style.configure("TLabel", background=bg, foreground=text)
+        style.configure("TButton", background=panel, foreground=text, padding=6)
+        style.map("TButton", background=[("active", accent)], foreground=[("active", "#0f1117")])
+        style.configure("TEntry", fieldbackground=panel, foreground=text)
+        self.option_add("*Listbox.background", panel)
+        self.option_add("*Listbox.foreground", text)
+        self.option_add("*Listbox.selectBackground", accent)
+        self.option_add("*Listbox.selectForeground", "#0f1117")
+        self.option_add("*Text.background", panel)
+        self.option_add("*Text.foreground", text)
+        self.option_add("*Text.insertBackground", text)
 
     def _build_ui(self) -> None:
         main = ttk.Frame(self, padding=12)
@@ -242,6 +270,7 @@ class JarvisControlPanel(tk.Tk):
         ttk.Button(utilities, text="Open Logs Folder", command=lambda: self.open_path(LOGS_DIR)).pack(side=tk.LEFT, padx=8, pady=8)
         ttk.Button(utilities, text="Open Config", command=lambda: self.open_path(CONFIG_PATH)).pack(side=tk.LEFT, padx=4)
         ttk.Button(utilities, text="Open Web UI", command=lambda: self.open_url("http://localhost:8080")).pack(side=tk.LEFT, padx=4)
+        ttk.Button(utilities, text="Open Test Runner", command=self.open_test_runner).pack(side=tk.LEFT, padx=4)
         ttk.Label(utilities, textvariable=self.status_var).pack(side=tk.RIGHT, padx=8)
 
     def set_status(self, message: str) -> None:
@@ -424,6 +453,26 @@ class JarvisControlPanel(tk.Tk):
             ["powershell.exe", "-NoProfile", "-Command", f"Start-Process '{url}'"],
             creationflags=subprocess.CREATE_NO_WINDOW,
         )
+
+    def open_test_runner(self) -> None:
+        runner_script = ROOT / "run-test-runner.ps1"
+        if not runner_script.is_file():
+            messagebox.showerror("Missing runner", f"Not found: {runner_script}")
+            return
+        subprocess.Popen(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(runner_script),
+            ],
+            cwd=str(ROOT),
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        self.after(4000, lambda: self.open_url("http://127.0.0.1:5175"))
+        self.set_status("Starting Test Runner (pnpm dev)… open :5175")
 
     def append_output(self, text: str) -> None:
         self.log_text.configure(state=tk.NORMAL)

@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>UI Test Runner</title>
+  <style>
+    :root {
+      --bg: #0f1117;
+      --panel: #1a1d27;
+      --border: #2a2f3d;
+      --text: #e6e9ef;
+      --muted: #8b93a7;
+      --accent: #6c9eff;
+      --pass: #3dd68c;
+      --fail: #f07178;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+    }
+    header {
+      padding: 1.25rem 1.5rem;
+      border-bottom: 1px solid var(--border);
+      background: var(--panel);
+    }
+    header h1 { margin: 0; font-size: 1.25rem; font-weight: 600; }
+    header p { margin: 0.35rem 0 0; color: var(--muted); font-size: 0.9rem; }
+    main {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1rem;
+      padding: 1rem 1.5rem 2rem;
+      max-width: 1400px;
+      margin: 0 auto;
+    }
+    @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 1rem 1.25rem;
+    }
+    .card h2 { margin: 0 0 0.75rem; font-size: 0.95rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+    label { display: block; font-size: 0.85rem; color: var(--muted); margin-bottom: 0.35rem; }
+    input, textarea {
+      width: 100%;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 8px;
+      padding: 0.6rem 0.75rem;
+      font: inherit;
+    }
+    textarea { min-height: 100px; resize: vertical; }
+    .row { display: flex; flex-wrap: wrap; gap: 1rem; margin-top: 0.75rem; }
+    .check { display: flex; align-items: center; gap: 0.4rem; font-size: 0.85rem; color: var(--muted); }
+    button {
+      background: var(--accent);
+      color: #0f1117;
+      border: none;
+      border-radius: 8px;
+      padding: 0.65rem 1.2rem;
+      font-weight: 600;
+      cursor: pointer;
+      margin-top: 1rem;
+    }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    button.secondary {
+      background: transparent;
+      color: var(--accent);
+      border: 1px solid var(--border);
+    }
+    #log {
+      font-family: ui-monospace, Consolas, monospace;
+      font-size: 0.78rem;
+      line-height: 1.45;
+      white-space: pre-wrap;
+      max-height: 420px;
+      overflow-y: auto;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 0.75rem;
+    }
+    .status-pill {
+      display: inline-block;
+      padding: 0.2rem 0.6rem;
+      border-radius: 999px;
+      font-size: 0.75rem;
+      font-weight: 600;
+    }
+    .status-pill.running { background: #3d3a00; color: #ffd866; }
+    .status-pill.pass { background: #1a3d2e; color: var(--pass); }
+    .status-pill.fail { background: #3d1a1f; color: var(--fail); }
+    .status-pill.idle { background: var(--border); color: var(--muted); }
+    .prompt-box {
+      font-family: ui-monospace, Consolas, monospace;
+      font-size: 0.8rem;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 0.75rem;
+      margin-top: 0.5rem;
+    }
+    .full { grid-column: 1 / -1; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>UI Test Runner</h1>
+    <p>Railway deploy → structure check → Playwright → REPORT.md in target project</p>
+  </header>
+  <main>
+    <section class="card">
+      <h2>Run</h2>
+      <label for="project">Target project path</label>
+      <input id="project" type="text" placeholder="C:\path\to\content-manager" />
+      <label for="task" style="margin-top:0.75rem">Task (free text)</label>
+      <textarea id="task" placeholder="Log in and verify the app loads without errors…"></textarea>
+      <div class="row">
+        <label class="check"><input type="checkbox" id="push" /> Git push before deploy wait</label>
+        <label class="check"><input type="checkbox" id="skip_deploy" /> Skip deploy wait</label>
+        <label class="check"><input type="checkbox" id="skip_structure" /> Skip structure pass</label>
+        <label class="check"><input type="checkbox" id="no_ollama" /> Skip Ollama task structuring</label>
+      </div>
+      <button id="runBtn">Run UI test loop</button>
+      <button class="secondary" id="copyPrompt" type="button">Copy Cursor prompt</button>
+      <p style="margin-top:0.75rem;font-size:0.85rem;color:var(--muted)">
+        Status: <span id="statusPill" class="status-pill idle">idle</span>
+      </p>
+    </section>
+    <section class="card">
+      <h2>Cursor handoff</h2>
+      <p style="font-size:0.9rem;color:var(--muted);margin:0 0 0.5rem">
+        Open Cursor on the target project and paste:
+      </p>
+      <div class="prompt-box" id="promptText">Read .agent/current/REPORT.md and implement the fixes described there.</div>
+    </section>
+    <section class="card full">
+      <h2>Live log</h2>
+      <div id="log">Waiting for run…</div>
+    </section>
+  </main>
+  <script>
+    const projectInput = document.getElementById("project");
+    const taskInput = document.getElementById("task");
+    const runBtn = document.getElementById("runBtn");
+    const logEl = document.getElementById("log");
+    const statusPill = document.getElementById("statusPill");
+    const copyPrompt = document.getElementById("copyPrompt");
+    let pollTimer = null;
+
+    const savedProject = localStorage.getItem("ui_test_project");
+    if (savedProject) projectInput.value = savedProject;
+
+    fetch("/api/config").then(r => r.json()).then(cfg => {
+      if (!projectInput.value && cfg.default_project) projectInput.value = cfg.default_project;
+    }).catch(() => {});
+
+    function setStatus(mode, text) {
+      statusPill.className = "status-pill " + mode;
+      statusPill.textContent = text;
+    }
+
+    async function pollStatus() {
+      const res = await fetch("/api/status");
+      const data = await res.json();
+      logEl.textContent = (data.log || []).join("\n") || "No output yet.";
+      logEl.scrollTop = logEl.scrollHeight;
+      if (data.running) {
+        setStatus("running", "running");
+        runBtn.disabled = true;
+      } else {
+        runBtn.disabled = false;
+        if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+        const last = data.last_result || {};
+        if (last.overall_ok === true) setStatus("pass", "pass");
+        else if (last.overall_ok === false) setStatus("fail", "fail");
+        else setStatus("idle", "idle");
+      }
+    }
+
+    runBtn.addEventListener("click", async () => {
+      const project = projectInput.value.trim();
+      if (!project) { alert("Enter target project path"); return; }
+      localStorage.setItem("ui_test_project", project);
+      setStatus("running", "starting");
+      runBtn.disabled = true;
+      logEl.textContent = "Starting…";
+      const body = {
+        project,
+        task: taskInput.value.trim(),
+        push: document.getElementById("push").checked,
+        skip_deploy: document.getElementById("skip_deploy").checked,
+        skip_structure: document.getElementById("skip_structure").checked,
+        no_ollama: document.getElementById("no_ollama").checked,
+      };
+      const res = await fetch("/api/run", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) {
+        const err = await res.json();
+        alert(err.detail || "Run failed to start");
+        runBtn.disabled = false;
+        setStatus("idle", "idle");
+        return;
+      }
+      pollTimer = setInterval(pollStatus, 1500);
+      pollStatus();
+    });
+
+    copyPrompt.addEventListener("click", () => {
+      navigator.clipboard.writeText(document.getElementById("promptText").textContent);
+    });
+  </script>
+</body>
+</html>

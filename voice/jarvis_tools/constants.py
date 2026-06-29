@@ -20,7 +20,7 @@ GIT_ROOTS = [
     Path(p).resolve()
     for p in os.environ.get(
         "JARVIS_GIT_ROOTS",
-        f"{Path.home() / 'Documents'};{Path.home() / 'ai-assistant'}",
+        f"{Path.home() / 'Documents'};{Path.home() / 'Documents' / 'Programming' / 'ai-assistant'}",
     ).split(";")
     if p.strip()
 ]

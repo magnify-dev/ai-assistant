@@ -19,7 +19,7 @@ ollama pull qwen2.5:14b
 2. Run setup:
 
 ```powershell
-cd C:\Users\marce\ai-assistant
+cd C:\Users\marce\Documents\Programming\ai-assistant
 Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
 .\setup.ps1
 .\setup-phase6.ps1
@@ -99,7 +99,7 @@ List all voices: `voice\.venv\Scripts\edge-tts.exe --list-voices`
 Preview voices:
 
 ```powershell
-cd C:\Users\marce\ai-assistant\voice
+cd C:\Users\marce\Documents\Programming\ai-assistant\voice
 
 # List English voices
 .\.venv\Scripts\python.exe preview_voices.py --filter en --list

@@ -51,7 +51,7 @@ Helix-Pilot lets Cursor's Agent **see your screen** and click/type.
 ### One-time setup
 
 ```powershell
-cd C:\Users\marce\ai-assistant
+cd C:\Users\marce\Documents\Programming\ai-assistant
 .\setup-phase6.ps1
 ```
 

@@ -15,7 +15,7 @@ Use Mozilla's **unlisted signing**:
 1. Package the extension:
 
 ```powershell
-cd C:\Users\marce\ai-assistant
+cd C:\Users\marce\Documents\Programming\ai-assistant
 .\package-firefox-extension.ps1
 ```
 

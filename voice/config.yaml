@@ -18,7 +18,7 @@ ollama:
     - For GitHub requests, use github_publish_project to create a magnify-dev repo and push code.
     - Use git_status first if unsure whether a folder is already on GitHub.
     - For opening a folder in Cursor, use open_folder_in_cursor (not open_application).
-    - ai-assistant folder path is C:/Users/marce/ai-assistant.
+    - ai-assistant folder path is C:/Users/marce/Documents/Programming/ai-assistant.
     - Never close or kill Cursor unless the user explicitly asks to quit Cursor.
     - Sleep/listening control is handled locally by the voice runtime. Do not call a stop_listening tool.
     - In always-on mode the user speaks freely and ends each command with "please".
@@ -56,10 +56,10 @@ tools:
   workspace: "C:/Users/marce/Documents"
   github_org: "magnify-dev"
   git_roots:
-    - "C:/Users/marce/ai-assistant"
+    - "C:/Users/marce/Documents/Programming/ai-assistant"
     - "C:/Users/marce/Documents"
   known_paths:
-    ai-assistant: "C:/Users/marce/ai-assistant"
+    ai-assistant: "C:/Users/marce/Documents/Programming/ai-assistant"
 
 speech:
   sample_rate: 16000

@@ -26,10 +26,16 @@ tts/voices/
 
 dev_loop/demo/.agent/
 
+# Node / test-runner UI
+node_modules/
+test-runner/dist/
+test-runner/dist-server/
+
 # Secrets
 .webui_secret_key
 .env
 .env.*
+provided-variables
 
 # OS / editor
 .DS_Store

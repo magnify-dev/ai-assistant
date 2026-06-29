@@ -187,7 +187,7 @@ TOOL_DEFINITIONS = [
                     "folder_path": {
                         "type": "string",
                         "description": (
-                            "Folder path, e.g. C:/Users/marce/ai-assistant or ai-assistant"
+                            "Folder path, e.g. C:/Users/marce/Documents/Programming/ai-assistant or ai-assistant"
                         ),
                     },
                 },
@@ -319,7 +319,7 @@ TOOL_DEFINITIONS = [
                 "properties": {
                     "project_path": {
                         "type": "string",
-                        "description": "Project folder path (e.g. C:/Users/marce/ai-assistant)",
+                        "description": "Project folder path (e.g. C:/Users/marce/Documents/Programming/ai-assistant)",
                     },
                 },
                 "required": ["project_path"],

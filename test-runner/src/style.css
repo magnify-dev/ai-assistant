@@ -1,0 +1,50 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+}
+
+:root {
+  --radius: 0.625rem;
+}
+
+.dark {
+  --background: oklch(0.18 0.045 300);
+  --foreground: oklch(0.985 0 0);
+  --card: oklch(0.23 0.055 298);
+  --card-foreground: oklch(0.985 0 0);
+  --primary: oklch(0.92 0.004 286.32);
+  --primary-foreground: oklch(0.21 0.006 285.885);
+  --muted: oklch(0.27 0.05 298);
+  --muted-foreground: oklch(0.72 0.025 300);
+  --border: oklch(1 0 0 / 10%);
+  --destructive: oklch(0.704 0.191 22.216);
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground min-h-screen antialiased;
+    background-image: radial-gradient(ellipse 120% 80% at 50% -20%, oklch(0.35 0.12 290 / 0.35), transparent);
+  }
+}
+
+.surface-card {
+  @apply rounded-lg border border-white/10 bg-black/20 text-card-foreground shadow-[0_10px_30px_rgba(8,6,20,0.35)] backdrop-blur-sm;
+}

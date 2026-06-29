@@ -1,0 +1,9 @@
+{
+  "name": "ai-assistant",
+  "private": true,
+  "scripts": {
+    "dev": "pnpm --filter test-runner dev",
+    "build": "pnpm --filter test-runner build",
+    "start": "pnpm --filter test-runner start"
+  }
+}

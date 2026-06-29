@@ -1,0 +1,26 @@
+ollama:
+  url: "http://127.0.0.1:11434"
+  model: "qwen2.5-coder:14b"
+  timeout_sec: 180
+
+defaults:
+  # Target project when --project is omitted (path relative to ai-assistant root).
+  project: "../content-manager"
+  base_url_service: admin
+  spec: mini-admin.yaml
+  selector_mode: strict
+  log_selector_mode: true
+
+deploy:
+  wait_timeout_sec: 600
+  poll_interval_sec: 10
+  auto_push: false
+
+output:
+  dir: ".agent/current"
+  history_dir: ".agent/history"
+  artifacts_dir: "ui-artifacts"
+
+web:
+  host: "127.0.0.1"
+  port: 8767
