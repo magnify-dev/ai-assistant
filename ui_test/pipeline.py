@@ -19,6 +19,7 @@ from ui_test.events import Phase, finish, log as emit_log, phase_done, phase_sta
 from ui_test.events import get_run_state as _event_state
 from ui_test.git_deploy import collect_git_deploy_state
 from ui_test.railway_client import check_health, wait_for_deployments
+from ui_test.project_setup import ensure_project_setup
 from ui_test.railway_config import load_railway_config
 from ui_test.report import write_report_bundle
 from ui_test.runner import run_spec
@@ -56,6 +57,12 @@ def run_ui_test_loop(
 ) -> dict[str, Any]:
     reset_run_state()
     set_running(True)
+
+    setup = ensure_project_setup(project)
+    if setup.gitignore_updated:
+        emit_log("Updated project .gitignore (UI test / .agent entries)")
+    if setup.created_paths:
+        emit_log(f"Created project paths: {', '.join(setup.created_paths)}")
 
     config = merged_config(project)
     env = load_project_env(project)

@@ -23,7 +23,13 @@ Open **http://127.0.0.1:5175**. Add `CURSOR_API_KEY` to `ai-assistant/.env` for 
 
 ## Target project setup
 
-In **content-manager** (or any app repo):
+When binding a new project, run once:
+
+```powershell
+.\run-ui-test.ps1 -Project C:\path\to\repo -InitProject
+```
+
+Or it runs automatically at the start of every test loop.
 
 ```
 ui-test/railway.yaml    # URLs + Railway IDs

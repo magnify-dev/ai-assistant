@@ -6,7 +6,7 @@ Track what is built vs still missing. **Engine** = Python `ui_test/` (runs witho
 
 ## Phase 1 — Core engine ✅
 
-Python CLI: Railway, Playwright, structure scan, Ollama task structuring, `REPORT.md` in target project.
+Python CLI: Railway, Playwright, structure scan, Ollama task structuring, `REPORT.md` in target project. Auto-updates target `.gitignore` and scaffolds `ui-test/` on each run.
 
 ```powershell
 .\run-ui-test.ps1 -Project C:\path\to\content-manager

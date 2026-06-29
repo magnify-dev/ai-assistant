@@ -8,6 +8,7 @@ from pathlib import Path
 from ui_test.config_loader import default_project, engine_root, merged_config
 from ui_test.events import configure as configure_events
 from ui_test.pipeline import run_ui_test_loop
+from ui_test.project_setup import ensure_project_setup
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -26,6 +27,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-ollama", action="store_true", help="Skip Ollama task structuring")
     parser.add_argument("--headed", action="store_true", help="Show browser window")
     parser.add_argument("--serve", action="store_true", help="Start web UI only")
+    parser.add_argument("--init-project", action="store_true", help="Scaffold ui-test/ and update .gitignore on target project, then exit")
     parser.add_argument("--emit-events", action="store_true", help="Emit NDJSON events on stdout for the test-runner UI")
     parser.add_argument("-v", "--verbose", action="store_true")
     return parser
@@ -61,6 +63,22 @@ def main(argv: list[str] | None = None) -> int:
     if not project.is_dir():
         logging.error("Project path does not exist: %s", project)
         return 1
+
+    if args.init_project:
+        parent = project / "ui-test"
+        if not parent.is_dir():
+            parent.mkdir(parents=True, exist_ok=True)
+        result = ensure_project_setup(project)
+        print(f"Project: {project}")
+        print(f"Gitignore updated: {result.gitignore_updated}")
+        if result.created_paths:
+            print("Created:")
+            for path in result.created_paths:
+                print(f"  {path}")
+        else:
+            print("No new paths created (already present).")
+        return 0
+
     if not (project / "ui-test").is_dir():
         logging.error("Missing ui-test/ folder in project: %s", project)
         return 1

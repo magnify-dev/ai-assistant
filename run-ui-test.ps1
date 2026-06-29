@@ -11,7 +11,8 @@ param(
     [switch]$NoStructureBlock,
     [switch]$NoOllama,
     [switch]$Headed,
-    [switch]$Serve
+    [switch]$Serve,
+    [switch]$InitProject
 )
 
 $ErrorActionPreference = "Stop"
@@ -40,6 +41,7 @@ if ($SkipUi) { $Args += "--skip-ui" }
 if ($NoStructureBlock) { $Args += "--no-structure-block" }
 if ($NoOllama) { $Args += "--no-ollama" }
 if ($Headed) { $Args += "--headed" }
+if ($InitProject) { $Args += "--init-project" }
 if ($Project) { $Args += @("--project", $Project) }
 if ($Task) { $Args += @("--task", $Task) }
 if ($TaskFile) { $Args += @("--task-file", $TaskFile) }
