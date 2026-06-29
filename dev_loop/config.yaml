@@ -1,0 +1,16 @@
+ollama:
+  url: "http://127.0.0.1:11434"
+  model: "qwen2.5-coder:14b"
+  timeout_sec: 120
+
+defaults:
+  # Project root when --project is omitted (relative to repo root).
+  project: "."
+  # null = auto-detect (pytest if available, else skip with a warning).
+  test_cmd: null
+
+output:
+  dir: ".agent/current"
+  history_dir: ".agent/history"
+  max_test_output_chars: 24000
+  max_diff_chars: 12000

@@ -20,6 +20,12 @@ helix-pilot/
 tts/piper/
 tts/voices/
 
+# Dev loop generated reports (keep .agent/README.md)
+.agent/current/
+.agent/history/
+
+dev_loop/demo/.agent/
+
 # Secrets
 .webui_secret_key
 .env

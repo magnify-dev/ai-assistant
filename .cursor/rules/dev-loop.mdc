@@ -1,0 +1,21 @@
+---
+description: When the user references the dev loop report or .agent/current/REPORT.md, read it and implement the described fixes.
+globs:
+alwaysApply: false
+---
+
+# Dev Loop handoff
+
+When the user says things like:
+- "read the dev loop report"
+- "look at `.agent/current/REPORT.md`"
+- "implement the dev loop fixes"
+
+Do this:
+
+1. Read `.agent/current/REPORT.md` (and `task.json` if you need structured fields).
+2. Implement **only** what the report recommends — respect **Constraints** and **Acceptance criteria**.
+3. Prefer minimal, focused diffs; do not refactor unrelated code.
+4. After editing, tell the user to re-run `.\run-dev-loop.ps1` to verify tests pass.
+
+If tests already passed in the report, review git status and suggest next steps instead of making speculative edits.
