@@ -21,7 +21,7 @@ Phase 2 (later): Cursor SDK automates the handoff. Phase 3 (later): Jarvis voice
 
 3. Open Cursor Agent on this repo and paste:
    ```
-   Read .agent/current/REPORT.md and implement the fixes described there.
+   Read dev_loop/.runs/current/REPORT.md and implement the fixes described there.
    ```
 
 4. Re-run `.\run-dev-loop.ps1 -Demo` to verify the fix.
@@ -35,7 +35,7 @@ flowchart LR
     A[run-dev-loop.ps1] --> B[Run pytest / npm test]
     B --> C[Collect git diff + status]
     C --> D[Ollama analyzes failures]
-    D --> E[Write .agent/current/REPORT.md]
+    D --> E[Write dev_loop/.runs/current/REPORT.md]
     E --> F[You prompt Cursor to read REPORT.md]
     F --> G[Cursor implements]
     G --> A
@@ -45,7 +45,7 @@ flowchart LR
 |------|-----|--------|
 | Run tests | Script | stdout/stderr |
 | Analyze | Ollama (`qwen2.5-coder:14b`) | structured task |
-| Report | Script | `.agent/current/REPORT.md` |
+| Report | Script | `dev_loop/.runs/current/REPORT.md` (when run on ai-assistant repo) |
 | Implement | Cursor (manual prompt) | code edits |
 | Verify | Script again | pass / fail |
 
@@ -60,7 +60,7 @@ Edit `dev_loop/config.yaml`:
 | `ollama.url` | `http://127.0.0.1:11434` | Ollama API |
 | `ollama.model` | `qwen2.5-coder:14b` | Analysis model |
 | `defaults.test_cmd` | auto-detect | Override test command |
-| `output.dir` | `.agent/current` | Report location |
+| `output.dir` | `dev_loop/.runs/current` | Report location (dev loop on ai-assistant repo only) |
 
 Environment overrides: `DEV_LOOP_OLLAMA_URL`, `DEV_LOOP_OLLAMA_MODEL`.
 
@@ -96,7 +96,7 @@ Exit codes: `0` = tests passed or skipped, `2` = tests failed (report still writ
 .\run-dev-loop.ps1 -Project C:\Users\marce\my-app -TestCmd "pytest -q"
 ```
 
-Reports land in `<project>/.agent/current/` (not necessarily this repo).
+Reports land in `<project>/.agent/current/` for **UI test runs** (target projects like content-manager). Dev loop on this repo uses `dev_loop/.runs/current/`.
 
 ---
 
@@ -115,7 +115,7 @@ Re-run is on me — I'll run run-dev-loop.ps1 again.
 
 **With extra focus:**
 ```
-Read .agent/current/REPORT.md. Only fix the auth redirect issue; don't refactor unrelated code.
+Read dev_loop/.runs/current/REPORT.md. Only fix the auth redirect issue; don't refactor unrelated code.
 ```
 
 ---
@@ -129,7 +129,7 @@ Read .agent/current/REPORT.md. Only fix the auth redirect issue; don't refactor 
 | `test-output.txt` | Raw test log |
 | `status.json` | `ready_for_cursor`, pass/fail flag |
 
-Previous runs are archived under `.agent/history/<timestamp>/`.
+Previous dev-loop runs on this repo are archived under `dev_loop/.runs/history/<timestamp>/`. UI test runs archive under `<project>/.agent/history/`.
 
 ---
 

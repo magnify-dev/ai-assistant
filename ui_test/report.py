@@ -91,7 +91,10 @@ def render_report_markdown(payload: dict[str, Any]) -> str:
 
     if local_env and not local_env.get("ready"):
         missing = ", ".join(local_env.get("missing") or [])
-        lines.append(f"- **Local env:** missing {missing} — copy `.agent/.env.example` → `.agent/.env.local`")
+        lines.append(
+            f"- **Local env:** missing {missing} — copy `{local_env.get('env_example_path', '.env.example')}` "
+            f"→ `{local_env.get('env_path', '.env')}`"
+        )
 
     if task.get("summary"):
         lines.extend(["", "## Task", "", str(task["summary"]), ""])
@@ -146,6 +149,17 @@ def render_report_markdown(payload: dict[str, Any]) -> str:
     if ui_run.get("final_url"):
         lines.append(f"- **Final URL:** `{ui_run['final_url']}`")
 
+    run_report = payload.get("run_report") or {}
+    task_answer = str(run_report.get("task_answer") or ui_run.get("task_answer") or "").strip()
+    page_report = str(ui_run.get("report_markdown") or "").strip()
+    if not task_answer and page_report:
+        from ui_test.page_content import extract_answer_from_report
+
+        task_answer = extract_answer_from_report(page_report)
+    if task_answer:
+        plain = task_answer.replace("**", "")
+        lines.extend(["", "## Answer", "", plain, ""])
+
     lines.extend(["", "## Selector mode log", ""])
     lines.append(
         f"- strict: {step_summary.get('strict_steps', 0)}, "
@@ -188,11 +202,17 @@ def write_report_bundle(
                 "ui_run": payload.get("ui_run"),
                 "structure": payload.get("structure"),
                 "step_summary": payload.get("step_summary"),
+                "run_report": payload.get("run_report"),
             },
             indent=2,
         ),
         encoding="utf-8",
     )
+    if payload.get("run_report"):
+        (output_dir / "run-report.json").write_text(
+            json.dumps(payload["run_report"], indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
     if payload.get("step_log"):
         (output_dir / "ui-step-log.txt").write_text("\n".join(payload["step_log"]) + "\n", encoding="utf-8")
     (output_dir / "status.json").write_text(

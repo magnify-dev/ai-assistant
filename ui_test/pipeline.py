@@ -15,12 +15,17 @@ from ui_test.config_loader import (
     output_dir,
 )
 from ui_test.env_loader import apply_env, load_project_env, require_keys
-from ui_test.events import Phase, configure_run_log, finish, log as emit_log, phase_done, phase_start, reset_run_state, set_running, test_target_event
+from ui_test.events import Phase, configure_run_log, finish, log as emit_log, phase_done, phase_start, reset_run_state, set_running, structured_task_event, test_target_event, run_report_event, cheatsheet_refined_event
+from ui_test.cheatsheet_refiner import refine_cheatsheet_from_run
+from ui_test.run_report import build_run_report
 from ui_test.events import get_run_state as _event_state
+from ui_test.nav_registry import load_nav_tree, nav_tree_delta
+from ui_test.page_registry import load_site_map, site_map_delta
+from ui_test.exploration_runner import run_exploration
 from ui_test.git_deploy import collect_git_deploy_state
 from ui_test.railway_client import check_health, wait_for_deployments
 from ui_test.local_env import format_local_env_hint, local_env_status
-from ui_test.local_server import ensure_local_server, local_run_config, url_is_up
+from ui_test.local_server import ensure_local_server, local_run_config, url_is_up, _all_targets_up
 from ui_test.project_profile import ensure_cheatsheet, ensure_profile, local_base_url
 from ui_test.project_paths import agent_tasks_dir
 from ui_test.project_setup import ensure_project_setup
@@ -31,7 +36,7 @@ from ui_test.spec_loader import base_url_for_spec, load_spec, resolve_spec_file,
 from ui_test.step_log import StepLogger
 from ui_test.structure import run_structure_pass
 from ui_test.ollama import ensure_ollama_ready
-from ui_test.task_structurer import structure_task_with_ollama
+from ui_test.task_structurer import fallback_structured_task, structure_task_with_ollama
 
 logger = logging.getLogger(__name__)
 
@@ -47,12 +52,26 @@ def _read_task_text(project: Path, task: str | None, task_file: Path | None) -> 
     return ""
 
 
+def _resolve_test_target(
+    test_target: str | None,
+    skip_deploy: bool,
+    defaults: dict[str, Any],
+) -> str:
+    if test_target in ("local", "deployed"):
+        return test_target
+    cfg = defaults.get("test_target")
+    if cfg in ("local", "deployed"):
+        return str(cfg)
+    return "local" if skip_deploy else "deployed"
+
+
 def run_ui_test_loop(
     project: Path,
     *,
     task: str | None = None,
     task_file: Path | None = None,
     skip_deploy: bool = False,
+    test_target: str | None = None,
     skip_structure: bool = False,
     skip_ui: bool = False,
     do_push: bool = False,
@@ -86,6 +105,10 @@ def run_ui_test_loop(
     apply_env(env)
 
     defaults = config.get("defaults") if isinstance(config.get("defaults"), dict) else {}
+    target_mode = _resolve_test_target(test_target, skip_deploy, defaults)
+    if target_mode == "local":
+        skip_deploy = True
+
     default_mode = str(defaults.get("selector_mode") or "strict")
     log_modes = bool(defaults.get("log_selector_mode", True))
     step_logger = StepLogger(enabled=log_modes)
@@ -103,13 +126,17 @@ def run_ui_test_loop(
         raise RuntimeError("Could not resolve base URL from railway.yaml or spec")
 
     emit_log(f"Project: {project}")
+    emit_log(f"Test target: {target_mode}")
     emit_log(f"Base URL: {base_url}")
-    if skip_deploy:
-        from ui_test.project_profile import local_base_url
-
+    if target_mode == "local":
         local = local_base_url(project)
         if local:
-            emit_log(f"Local cheatsheet URL: {local} (skip deploy — testing locally)")
+            emit_log(f"Local cheatsheet URL: {local}")
+    elif target_mode == "deployed":
+        admin_svc = railway.service("admin")
+        if admin_svc and admin_svc.url:
+            base_url = str(admin_svc.url).rstrip("/")
+            emit_log(f"Deployed URL: {base_url}")
     emit_log(f"Spec: {spec_path}")
 
     if not no_ollama:
@@ -130,7 +157,20 @@ def run_ui_test_loop(
             set_running(False)
             raise
 
+    tree_urls = [
+        str(n.get("url") or "/")
+        for n in (spec_bundle.data.get("tree") or [])
+        if isinstance(n, dict)
+    ]
+    spec_summary = (
+        f"Spec file: {spec_path.name}. "
+        f"After login, Playwright navigates: {', '.join(tree_urls) or '(none)'}. "
+        f"Used for auth only when task-driven exploration is enabled."
+    )
+
     free_text = _read_task_text(project, task, task_file)
+    exploration_cfg = defaults.get("exploration") if isinstance(defaults.get("exploration"), dict) else {}
+    use_exploration = bool(free_text) and not no_ollama and bool(exploration_cfg.get("enabled", True))
     structured_task: dict[str, Any] | None = None
     if free_text:
         phase_start(Phase.TASK, "Structuring task")
@@ -143,29 +183,44 @@ def run_ui_test_loop(
                 timeout_sec=float(ollama_cfg.get("timeout_sec") or 180),
                 free_text=free_text,
                 app_context=f"Mini admin at {base_url}. Auth via /login.",
-                spec_summary=f"Spec file: {spec_path.name}, nodes: {len(spec_bundle.data.get('tree') or [])}",
+                spec_summary=spec_summary,
             )
             if structured_task:
-                structured_task["source_text"] = free_text
+                structured_task["spec_runs"] = (
+                    "Exploration mode: discover → decide → act → evaluate. "
+                    "Fixed spec used for login/auth only. Exploration persists in .agent/exploration.yaml."
+                    if use_exploration
+                    else spec_summary
+                )
                 save_structured_task(project, structured_task)
+                structured_task_event(structured_task)
+                gaps = structured_task.get("intent_gaps") or []
+                if gaps:
+                    emit_log(
+                        f"Task alignment warning: {gaps[0]}",
+                        phase=Phase.TASK.value,
+                        level="error",
+                    )
                 emit_log(
                     f"Structured task: {structured_task.get('summary', '(no summary)')}",
                     phase=Phase.TASK.value,
                 )
         else:
-            structured_task = {"summary": free_text, "source_text": free_text}
+            structured_task = fallback_structured_task(free_text)
+            structured_task["spec_runs"] = spec_summary
+            structured_task_event(structured_task)
         phase_done(Phase.TASK, ok=True, message=structured_task.get("summary", "") if structured_task else "")
 
     phase_start(Phase.GIT, "Checking git state")
     git = collect_git_deploy_state(project, do_push=do_push)
     git_payload = asdict(git)
     emit_log(f"Git branch: {git.branch or '(n/a)'}, uncommitted: {git.has_uncommitted}", phase=Phase.GIT.value)
-    if git.has_uncommitted and skip_deploy:
+    if git.has_uncommitted and (skip_deploy or target_mode == "local"):
         phase_done(
             Phase.GIT,
             ok=True,
             status="warning",
-            message=f"uncommitted ({git.status[:80] if git.status else 'changes'}) — OK for local run",
+            message=f"uncommitted ({git.status[:80] if git.status else 'changes'}) — OK for local/deployed skip",
         )
     else:
         phase_done(Phase.GIT, ok=not git.has_uncommitted, message=git.status[:120] if git.status else "clean")
@@ -219,12 +274,24 @@ def run_ui_test_loop(
 
     local_session = None
     local_server_payload: dict[str, Any] = {"skipped": True}
-    testing_locally = skip_deploy and bool(local_base_url(project))
+    testing_locally = target_mode == "local" and bool(local_base_url(project))
     used_deployed_fallback = False
-    test_target_source = "deployed" if not testing_locally else "local"
+    test_target_source = "deployed" if target_mode == "deployed" else "local"
     local_url = local_base_url(project) if testing_locally else ""
 
-    if testing_locally:
+    if target_mode == "deployed":
+        admin_svc = railway.service("admin")
+        if admin_svc and admin_svc.url:
+            base_url = str(admin_svc.url).rstrip("/")
+        phase_start(Phase.LOCAL, "Using deployed service (Railway)")
+        local_server_payload = {
+            "skipped": True,
+            "ok": True,
+            "message": f"Testing deployed at {base_url}",
+            "test_target_mode": "deployed",
+        }
+        phase_done(Phase.LOCAL, ok=True, message=f"deployed {base_url}")
+    elif testing_locally:
         env_status = local_env_status(project)
         if not env_status["ready"]:
             emit_log(
@@ -248,6 +315,8 @@ def run_ui_test_loop(
                 "start_command": local_session.start_command,
                 "env_ready": env_status["ready"],
                 "env_missing": env_status["missing"],
+                "keep_alive": local_session.config.keep_alive,
+                "launch_in_terminal": local_session.config.launch_in_terminal,
             }
             if local_result.ok:
                 base_url = local_url or base_url
@@ -293,19 +362,31 @@ def run_ui_test_loop(
         health_ok = True
         if testing_locally and not used_deployed_fallback:
             cfg = local_run_config(project)
-            check_url = (cfg.health_url if cfg else base_url) or base_url
-            up, msg = url_is_up(check_url)
-            health_results.append(
-                {
-                    "service": "local",
-                    "url": check_url,
-                    "ok": up,
-                    "status_code": 0,
-                    "message": msg if up else f"Not reachable: {msg}",
-                }
-            )
-            health_ok = up
-            emit_log(f"Health local: {msg if up else 'FAIL — ' + msg}", phase=Phase.HEALTH.value)
+            if cfg:
+                up, msg = _all_targets_up(cfg)
+                health_results.append(
+                    {
+                        "service": "local",
+                        "url": cfg.base_url,
+                        "ok": up,
+                        "status_code": 0,
+                        "message": msg if up else f"Not reachable: {msg}",
+                    }
+                )
+                health_ok = up
+            else:
+                up, msg = url_is_up(base_url)
+                health_results.append(
+                    {
+                        "service": "local",
+                        "url": base_url,
+                        "ok": up,
+                        "status_code": 0,
+                        "message": msg if up else f"Not reachable: {msg}",
+                    }
+                )
+                health_ok = up
+            emit_log(f"Health local: {msg if health_ok else 'FAIL — ' + msg}", phase=Phase.HEALTH.value)
         elif testing_locally and used_deployed_fallback:
             admin_svc = railway.service("admin")
             if admin_svc:
@@ -361,40 +442,103 @@ def run_ui_test_loop(
             phase_done(Phase.STRUCTURE, ok=False, message="Local server not reachable")
 
         ui_run_payload: dict[str, Any] = {"passed": False, "skipped": skip_ui}
+        site_map_before = load_site_map(project)
+        nav_tree_before = load_nav_tree(project)
         if not skip_ui and health_ok:
-            phase_start(Phase.UI_TEST, "Playwright UI test")
-            try:
-                run_result = run_spec(
-                    base_url=base_url,
-                    spec=spec_bundle.data,
-                    env=env,
-                    logger=step_logger,
-                    artifacts_dir=artifacts_dir(config, project),
-                    default_mode=default_mode,
-                    headless=headless,
-                    stop_on_structure_missing=structure_blocks,
-                    structure_missing=all_missing if structure_blocks else set(),
-                )
-                ui_run_payload = {
-                    "passed": run_result.passed,
-                    "final_url": run_result.final_url,
-                    "error": run_result.error,
-                    "steps": len(run_result.step_results),
-                }
+            if use_exploration:
+                phase_start(Phase.EXPLORE, "AI exploration (discover → decide → act)")
                 emit_log(
-                    f"UI test: {'PASS' if run_result.passed else 'FAIL'} — {run_result.error or 'ok'}",
-                    phase=Phase.UI_TEST.value,
+                    "Exploration mode: discover interactables, consult site map, Ollama decides next action",
+                    phase=Phase.EXPLORE.value,
                 )
-                phase_done(Phase.UI_TEST, ok=run_result.passed, message=run_result.error or "ok")
-            except Exception as exc:
-                ui_run_payload = {
-                    "passed": False,
-                    "final_url": "",
-                    "error": str(exc),
-                    "steps": 0,
-                }
-                emit_log(f"UI test: FAIL — {exc}", phase=Phase.UI_TEST.value, level="error")
-                phase_done(Phase.UI_TEST, ok=False, message=str(exc))
+                try:
+                    ollama_cfg = config.get("ollama") if isinstance(config.get("ollama"), dict) else {}
+                    explore_result = run_exploration(
+                        project=project,
+                        base_url=base_url,
+                        spec=spec_bundle.data,
+                        env=env,
+                        logger=step_logger,
+                        task_text=free_text,
+                        structured_task=structured_task,
+                        ollama_url=ollama_url(config),
+                        ollama_model=ollama_model(config),
+                        timeout_sec=float(ollama_cfg.get("timeout_sec") or 180),
+                        max_steps=int(exploration_cfg.get("max_steps") or 20),
+                        headless=headless,
+                        artifacts_dir=artifacts_dir(config, project),
+                        on_log=lambda msg: emit_log(msg, phase=Phase.EXPLORE.value),
+                    )
+                    ui_run_payload = {
+                        "passed": explore_result.passed,
+                        "final_url": explore_result.final_url,
+                        "error": explore_result.error,
+                        "steps": len(explore_result.steps),
+                        "mode": "exploration",
+                        "exploration_steps": explore_result.steps,
+                        "evaluation": explore_result.evaluation,
+                        "report_path": explore_result.report_path,
+                        "report_markdown": explore_result.report_markdown,
+                        "task_answer": explore_result.task_answer,
+                        "page_findings": explore_result.page_findings,
+                        "playwright_session": explore_result.playwright_session,
+                        "site_map_path": explore_result.site_map_path,
+                        "pages_discovered": explore_result.pages_discovered,
+                    }
+                    emit_log(
+                        f"Exploration: {'PASS' if explore_result.passed else 'FAIL'} — "
+                        f"{explore_result.error or 'ok'} ({explore_result.pages_discovered} pages in site map)",
+                        phase=Phase.EXPLORE.value,
+                    )
+                    ui_run_payload["site_map_changes"] = site_map_delta(site_map_before, load_site_map(project))
+                    ui_run_payload["nav_tree_changes"] = nav_tree_delta(nav_tree_before, load_nav_tree(project))
+                    phase_done(Phase.EXPLORE, ok=explore_result.passed, message=explore_result.error or "ok")
+                except Exception as exc:
+                    ui_run_payload = {
+                        "passed": False,
+                        "final_url": "",
+                        "error": str(exc),
+                        "steps": 0,
+                        "mode": "exploration",
+                    }
+                    emit_log(f"Exploration: FAIL — {exc}", phase=Phase.EXPLORE.value, level="error")
+                    phase_done(Phase.EXPLORE, ok=False, message=str(exc))
+            else:
+                phase_start(Phase.UI_TEST, "Playwright UI test")
+                try:
+                    run_result = run_spec(
+                        base_url=base_url,
+                        spec=spec_bundle.data,
+                        env=env,
+                        logger=step_logger,
+                        artifacts_dir=artifacts_dir(config, project),
+                        default_mode=default_mode,
+                        headless=headless,
+                        stop_on_structure_missing=structure_blocks,
+                        structure_missing=all_missing if structure_blocks else set(),
+                    )
+                    ui_run_payload = {
+                        "passed": run_result.passed,
+                        "final_url": run_result.final_url,
+                        "error": run_result.error,
+                        "steps": len(run_result.step_results),
+                        "mode": "spec",
+                    }
+                    emit_log(
+                        f"UI test: {'PASS' if run_result.passed else 'FAIL'} — {run_result.error or 'ok'}",
+                        phase=Phase.UI_TEST.value,
+                    )
+                    phase_done(Phase.UI_TEST, ok=run_result.passed, message=run_result.error or "ok")
+                except Exception as exc:
+                    ui_run_payload = {
+                        "passed": False,
+                        "final_url": "",
+                        "error": str(exc),
+                        "steps": 0,
+                        "mode": "spec",
+                    }
+                    emit_log(f"UI test: FAIL — {exc}", phase=Phase.UI_TEST.value, level="error")
+                    phase_done(Phase.UI_TEST, ok=False, message=str(exc))
         elif not skip_ui and not health_ok:
             ui_run_payload = {
                 "passed": False,
@@ -405,12 +549,15 @@ def run_ui_test_loop(
             emit_log("UI test skipped — local server not healthy", phase=Phase.UI_TEST.value, level="error")
             phase_done(Phase.UI_TEST, ok=False, message="Local server not reachable")
 
+        site_map_changes = site_map_delta(site_map_before, load_site_map(project))
+        nav_tree_changes = nav_tree_delta(nav_tree_before, load_nav_tree(project))
+
         health_ok = all(h.get("ok") for h in health_results) if health_results else True
         deploy_ok = all(d.get("ok") for d in deploy_results) if deploy_results else True
         structure_ok = all(s.get("ok") for s in structure_payload) if structure_payload else True
         ui_ok = ui_run_payload.get("passed") if not skip_ui else True
         local_ok = local_server_payload.get("ok", True) if not local_server_payload.get("skipped") else True
-        git_blocks = git.has_uncommitted and not skip_deploy
+        git_blocks = git.has_uncommitted and not skip_deploy and target_mode != "local"
 
         cursor_steps: list[str] = []
         if local_server_payload.get("used_fallback"):
@@ -438,16 +585,54 @@ def run_ui_test_loop(
             "git": git_payload,
             "local_server": local_server_payload,
             "local_env": local_env_status(project) if testing_locally else None,
-            "test_target": {"url": base_url, "source": test_target_source, "local_url": local_url},
+            "test_target": {"url": base_url, "source": test_target_source, "local_url": local_url, "mode": target_mode},
             "deploy": {"results": deploy_results},
             "health": health_results,
             "structure": structure_payload,
             "ui_run": ui_run_payload,
+            "site_map_changes": site_map_changes,
+            "nav_tree_changes": nav_tree_changes,
             "step_log": step_logger.lines() if log_modes else [],
+            "step_entries": step_logger.entries_payload() if log_modes else [],
             "step_summary": step_logger.summary(),
             "cursor_steps": cursor_steps,
             "overall_ok": overall_ok,
         }
+
+        cheatsheet_refine: dict[str, Any] = {"added_learnings": [], "added_notes": []}
+        if not no_ollama:
+            emit_log("Reviewing cheatsheet learnings (append-only)...", phase=Phase.DONE.value)
+            cheatsheet_refine = refine_cheatsheet_from_run(
+                project,
+                run_report={},
+                run_payload={
+                    "structured_task": structured_task,
+                    "ui_run": ui_run_payload,
+                    "test_target": {"url": base_url, "source": test_target_source},
+                    "local_server": local_server_payload,
+                },
+                url=ollama_url(config),
+                model=ollama_model(config),
+                timeout_sec=float(
+                    (config.get("ollama") or {}).get("timeout_sec") or 180
+                    if isinstance(config.get("ollama"), dict)
+                    else 180
+                ),
+            )
+            if cheatsheet_refine.get("added_learnings") or cheatsheet_refine.get("added_notes"):
+                cheatsheet_refined_event(
+                    added_learnings=cheatsheet_refine.get("added_learnings") or [],
+                    added_notes=cheatsheet_refine.get("added_notes") or [],
+                )
+                emit_log(
+                    f"Cheatsheet: +{len(cheatsheet_refine.get('added_learnings') or [])} learning(s), "
+                    f"+{len(cheatsheet_refine.get('added_notes') or [])} note(s)",
+                )
+        payload["cheatsheet_refine"] = cheatsheet_refine
+
+        run_report = build_run_report(payload)
+        payload["run_report"] = run_report
+        run_report_event(run_report)
 
         out = output_dir(config, project)
         hist = history_dir(config, project)

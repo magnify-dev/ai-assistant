@@ -37,13 +37,13 @@ def ollama_model(config: dict[str, Any]) -> str:
 
 def output_dir(config: dict[str, Any], project: Path) -> Path:
     output = config.get("output") if isinstance(config.get("output"), dict) else {}
-    rel = str(output.get("dir") or ".agent/current")
+    rel = str(output.get("dir") or "dev_loop/.runs/current")
     path = (project / rel).resolve() if not Path(rel).is_absolute() else Path(rel)
     return path
 
 
 def history_dir(config: dict[str, Any], project: Path) -> Path:
     output = config.get("output") if isinstance(config.get("output"), dict) else {}
-    rel = str(output.get("history_dir") or ".agent/history")
+    rel = str(output.get("history_dir") or "dev_loop/.runs/history")
     path = (project / rel).resolve() if not Path(rel).is_absolute() else Path(rel)
     return path

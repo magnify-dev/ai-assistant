@@ -74,6 +74,21 @@ class StepLogger:
             except ImportError:
                 pass
 
+    def entries_payload(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "timestamp": e.timestamp,
+                "mode": e.mode.value,
+                "ephemeral": e.ephemeral,
+                "page_url": e.page_url,
+                "action": e.action,
+                "target": e.target,
+                "ok": e.ok,
+                "message": e.message,
+            }
+            for e in self.entries
+        ]
+
     def lines(self) -> list[str]:
         return [entry.format_line() for entry in self.entries]
 

@@ -103,10 +103,21 @@ def run_auth_flow(
     auth: dict[str, Any],
     env: dict[str, str],
     logger: StepLogger,
+    *,
+    artifacts_dir: Path | None = None,
 ) -> None:
     auth_url = str(auth.get("url") or "/login")
-    page.goto(_resolve_url(base_url, auth_url), wait_until="domcontentloaded", timeout=60000)
-    page.wait_for_load_state("networkidle", timeout=30000)
+    target = _resolve_url(base_url, auth_url)
+    try:
+        page.goto(target, wait_until="domcontentloaded", timeout=60000)
+        try:
+            page.wait_for_load_state("load", timeout=15000)
+        except PlaywrightTimeout:
+            pass
+    except PlaywrightTimeout as exc:
+        emit_page_state(page, context="auth_goto_failed", node_url=auth_url, error=str(exc))
+        _maybe_screenshot(page, artifacts_dir, "auth_goto_failed")
+        raise RuntimeError(f"Could not open {target} — is the local dev server running? ({exc})") from exc
     emit_page_state(page, context="auth", node_url=auth_url)
     for step in auth.get("steps") or []:
         if not isinstance(step, dict):
@@ -325,12 +336,16 @@ def run_spec(
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=headless)
-        context = browser.new_context()
+        context = browser.new_context(
+            viewport={"width": 960, "height": 640},
+            device_scale_factor=1,
+            color_scheme="light",
+        )
         page = context.new_page()
         try:
             auth = spec.get("auth")
             if isinstance(auth, dict):
-                run_auth_flow(page, base_url, auth, env, logger)
+                run_auth_flow(page, base_url, auth, env, logger, artifacts_dir=artifacts_dir)
 
             for node in spec.get("tree") or []:
                 if not isinstance(node, dict):
@@ -378,6 +393,10 @@ def run_spec(
                         return RunResult(False, step_results, page.url, result.message)
 
             return RunResult(True, step_results, page.url, "")
+        except (PlaywrightTimeout, ValueError, RuntimeError) as exc:
+            emit_page_state(page, context="run_failed", error=str(exc))
+            _maybe_screenshot(page, artifacts_dir, "run_failed")
+            return RunResult(False, step_results, page.url, str(exc))
         finally:
             context.close()
             browser.close()

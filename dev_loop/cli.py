@@ -52,7 +52,7 @@ def _resolve_test_cmd(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="dev_loop",
-        description="Run tests, analyze with Ollama, write .agent/current/REPORT.md for Cursor.",
+        description="Run tests, analyze with Ollama, write dev_loop/.runs/current/REPORT.md for Cursor.",
     )
     parser.add_argument(
         "--project",

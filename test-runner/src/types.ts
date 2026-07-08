@@ -9,6 +9,7 @@ export type PhaseKey =
   | "health"
   | "structure"
   | "ui_test"
+  | "exploration"
   | "cursor";
 
 export const PHASES: { key: PhaseKey; label: string; group: "local" | "cursor" }[] = [
@@ -19,7 +20,8 @@ export const PHASES: { key: PhaseKey; label: string; group: "local" | "cursor" }
   { key: "deploy", label: "Deploy", group: "local" },
   { key: "health", label: "Health", group: "local" },
   { key: "structure", label: "Structure", group: "local" },
-  { key: "ui_test", label: "UI test", group: "local" },
+  { key: "exploration", label: "UI exploration", group: "local" },
+  { key: "ui_test", label: "UI test (spec)", group: "local" },
   { key: "cursor", label: "Cursor agent", group: "cursor" },
 ];
 

@@ -71,7 +71,7 @@ def render_report_markdown(
         "## Quick prompt",
         "",
         "```",
-        "Read .agent/current/REPORT.md and implement the fixes described there.",
+        "Read dev_loop/.runs/current/REPORT.md and implement the fixes described there.",
         "Keep changes minimal and match the acceptance criteria.",
         "```",
         "",

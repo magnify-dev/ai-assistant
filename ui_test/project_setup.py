@@ -21,21 +21,16 @@ GITIGNORE_LINES = (
     f"!{AGENT_DIR}/README.md",
 )
 
-ENV_EXAMPLE_CONTENT = """# Copy to .env.local and fill in (never commit .env or .env.local)
+ENV_EXAMPLE_CONTENT = """# Assistant-only secrets (never commit .env)
+#
+# App runtime vars (DATABASE_URL, PORT, VITE_*) live in micro-services/admin/.env
+# — copy micro-services/admin/.env.example → micro-services/admin/.env
 
-# --- UI test credentials ---
+# --- UI test login (must match a user in the DB) ---
 UI_TEST_EMAIL=
 UI_TEST_PASSWORD=
 
-# Or use ADMIN_SEED_* — the runner maps them automatically
-# ADMIN_SEED_EMAIL=
-# ADMIN_SEED_PASSWORD=
-
-# --- Local dev (when cheatsheet required_env includes DATABASE_URL) ---
-# DATABASE_URL=postgres://user:pass@host:5432/db
-# PORT=3100
-
-# --- Railway (optional — for deploy wait) ---
+# --- Railway (optional — for deploy-wait runs) ---
 RAILWAY_TOKEN=
 """
 
@@ -48,6 +43,8 @@ Everything the [ai-assistant](https://github.com/) `ui_test` engine needs lives 
 | Path | Purpose |
 |------|---------|
 | `cheatsheet.yaml` | How to run locally before Railway deploy |
+| `exploration.yaml` | Navigation tree + page catalog (how to move, what is where) |
+| `cheatsheet.yaml` | Local dev, deploy, and run settings (not page exploration) |
 | `profile.json` | Saved project settings |
 | `railway.yaml` | Railway service URLs and IDs |
 | `specs/*.yaml` | State-based UI traversal trees |

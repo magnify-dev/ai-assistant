@@ -19,6 +19,19 @@ import {
   type ProjectSettings,
 } from "./project-store.js";
 import { readLocalEnvStatus } from "./local-env.js";
+import {
+  artifactContentType,
+  listRunHistory,
+  readExploration,
+  readNavTree,
+  readRunBundle,
+  readCheatsheetLearnings,
+  readLocalDevStatus,
+  readRunReport,
+  readSiteMap,
+  resolveRunArtifact,
+  sessionWithArtifactUrls,
+} from "./project-report.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 dotenv.config({ path: path.join(REPO_ROOT, ".env") });
@@ -30,7 +43,7 @@ const cursorRunner = new CursorRunner();
 
 type StoredEvent = Record<string, unknown>;
 const eventLog: StoredEvent[] = [];
-const engineLogPath = path.join(REPO_ROOT, ".agent", "current", "test-runner-last-run.log");
+const engineLogPath = path.join(REPO_ROOT, "logs", "test-runner-last-run.log");
 let projectRunLogPath: string | null = null;
 
 function formatRunnerLogLine(event: StoredEvent): string {
@@ -50,6 +63,17 @@ function formatRunnerLogLine(event: StoredEvent): string {
     const count = Array.isArray(event.interactables) ? event.interactables.length : 0;
     const ctx = event.context ? ` (${event.context})` : "";
     return `[browser] ${event.url} — ${count} interactables${ctx}`;
+  }
+  if (type === "site_map") {
+    const pages = event.pages as Record<string, unknown> | undefined;
+    return `[site_map] ${pages ? Object.keys(pages).length : 0} page(s), +${String(event.new_elements ?? 0)} capability(s)`;
+  }
+  if (type === "nav_tree") {
+    const routes = event.routes as Record<string, unknown> | undefined;
+    return `[nav_tree] ${routes ? Object.keys(routes).length : 0} route(s), +${String(event.new_elements ?? 0)} interactable(s)`;
+  }
+  if (type === "agent_decision") {
+    return `[agent] ${String(event.action ?? "")}: ${String(event.reason ?? "")}`.trim();
   }
   if (type === "process_exit") return `[process_exit] code=${String(event.code)}`;
   return JSON.stringify(event);
@@ -78,6 +102,21 @@ let runState: Record<string, unknown> = {
   phase: "idle",
   phases: {},
 };
+
+function resetRunStateForNewRun(project: string) {
+  runState = {
+    running: true,
+    phase: "idle",
+    phases: {},
+    project,
+    structuredTask: null,
+    runReport: null,
+    browserState: null,
+    testTarget: null,
+    lastResult: null,
+  };
+  pushEvent({ type: "run_cleared" });
+}
 
 function pushEvent(event: StoredEvent) {
   eventLog.push({ ...event, ts: event.ts ?? new Date().toISOString() });
@@ -110,6 +149,8 @@ function pushEvent(event: StoredEvent) {
       interactables: event.interactables,
       context: event.context,
       node_url: event.node_url,
+      screenshot_b64: event.screenshot_b64,
+      error: event.error,
       ts: event.ts,
     };
   }
@@ -118,6 +159,48 @@ function pushEvent(event: StoredEvent) {
       url: event.url,
       source: event.source,
       local_url: event.local_url,
+      ts: event.ts,
+    };
+  }
+  if (event.type === "structured_task") {
+    runState.structuredTask = {
+      summary: event.summary,
+      source_text: event.source_text,
+      scope_urls: event.scope_urls,
+      success_criteria: event.success_criteria,
+      suggested_steps: event.suggested_steps,
+      notes_for_cursor: event.notes_for_cursor,
+    };
+  }
+  if (event.type === "run_report" && event.report) {
+    runState.runReport = event.report;
+  }
+  if (event.type === "cheatsheet_refined") {
+    runState.cheatsheetRefined = {
+      added_learnings: event.added_learnings,
+      added_notes: event.added_notes,
+    };
+  }
+  if (event.type === "site_map") {
+    runState.siteMap = {
+      pages: event.pages,
+      new_elements: event.new_elements,
+      ts: event.ts,
+    };
+  }
+  if (event.type === "nav_tree") {
+    runState.navTree = {
+      routes: event.routes,
+      global_nav: event.global_nav,
+      new_elements: event.new_elements,
+      ts: event.ts,
+    };
+  }
+  if (event.type === "agent_decision") {
+    runState.lastAgentDecision = {
+      action: event.action,
+      reason: event.reason,
+      phase: event.phase,
       ts: event.ts,
     };
   }
@@ -221,6 +304,116 @@ app.delete("/api/projects/:id", (req, res) => {
     return;
   }
   res.json({ ok: true });
+});
+
+app.get("/api/project/local-dev", (req, res) => {
+  const projectPath = req.query.path;
+  if (!projectPath || typeof projectPath !== "string") {
+    res.status(400).json({ error: "path query param is required" });
+    return;
+  }
+  res.json(readLocalDevStatus(projectPath));
+});
+
+app.get("/api/project/run-history", (req, res) => {
+  const projectPath = req.query.path;
+  if (!projectPath || typeof projectPath !== "string") {
+    res.status(400).json({ error: "path query param is required" });
+    return;
+  }
+  res.json(listRunHistory(projectPath));
+});
+
+app.get("/api/project/run", (req, res) => {
+  const projectPath = req.query.path;
+  const runId = req.query.runId;
+  if (!projectPath || typeof projectPath !== "string") {
+    res.status(400).json({ error: "path query param is required" });
+    return;
+  }
+  if (!runId || typeof runId !== "string") {
+    res.status(400).json({ error: "runId query param is required" });
+    return;
+  }
+  const bundle = readRunBundle(projectPath, runId);
+  res.json({
+    ...bundle,
+    playwrightSession: sessionWithArtifactUrls(projectPath, runId, bundle.playwrightSession),
+  });
+});
+
+app.get("/api/project/run-artifact", (req, res) => {
+  const projectPath = req.query.path;
+  const runId = req.query.runId;
+  const file = req.query.file;
+  if (!projectPath || typeof projectPath !== "string") {
+    res.status(400).json({ error: "path query param is required" });
+    return;
+  }
+  if (!runId || typeof runId !== "string") {
+    res.status(400).json({ error: "runId query param is required" });
+    return;
+  }
+  if (!file || typeof file !== "string") {
+    res.status(400).json({ error: "file query param is required" });
+    return;
+  }
+  try {
+    const artifactPath = resolveRunArtifact(projectPath, runId, file);
+    res.setHeader("Content-Type", artifactContentType(artifactPath));
+    fs.createReadStream(artifactPath).pipe(res);
+  } catch (err) {
+    res.status(404).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+app.get("/api/project/run-report", (req, res) => {
+  const projectPath = req.query.path;
+  if (!projectPath || typeof projectPath !== "string") {
+    res.status(400).json({ error: "path query param is required" });
+    return;
+  }
+  const bundle = readRunReport(projectPath);
+  res.json({
+    ...bundle,
+    playwrightSession: sessionWithArtifactUrls(projectPath, "current", bundle.playwrightSession),
+  });
+});
+
+app.get("/api/project/learnings", (req, res) => {
+  const projectPath = req.query.path;
+  if (!projectPath || typeof projectPath !== "string") {
+    res.status(400).json({ error: "path query param is required" });
+    return;
+  }
+  res.json(readCheatsheetLearnings(projectPath));
+});
+
+app.get("/api/project/exploration", (req, res) => {
+  const projectPath = req.query.path;
+  if (!projectPath || typeof projectPath !== "string") {
+    res.status(400).json({ error: "path query param is required" });
+    return;
+  }
+  res.json(readExploration(projectPath));
+});
+
+app.get("/api/project/site-map", (req, res) => {
+  const projectPath = req.query.path;
+  if (!projectPath || typeof projectPath !== "string") {
+    res.status(400).json({ error: "path query param is required" });
+    return;
+  }
+  res.json(readSiteMap(projectPath));
+});
+
+app.get("/api/project/nav-tree", (req, res) => {
+  const projectPath = req.query.path;
+  if (!projectPath || typeof projectPath !== "string") {
+    res.status(400).json({ error: "path query param is required" });
+    return;
+  }
+  res.json(readNavTree(projectPath));
 });
 
 app.get("/api/project/local-env", (req, res) => {
@@ -346,7 +539,7 @@ app.post("/api/run/local", (req, res) => {
   }
 
   eventLog.length = 0;
-  runState = { running: true, phase: "task_structure", phases: {}, project };
+  resetRunStateForNewRun(project);
   initRunLogs(project);
 
   try {
@@ -355,6 +548,7 @@ app.post("/api/run/local", (req, res) => {
       task,
       push,
       skipDeploy,
+      testTarget: req.body?.testTarget === "deployed" ? "deployed" : "local",
       skipStructure,
       skipUi,
       noOllama,
@@ -440,7 +634,7 @@ app.post("/api/run/full", async (req, res) => {
   const body = req.body ?? {};
   const project = typeof body.project === "string" ? body.project : "";
   eventLog.length = 0;
-  runState = { running: true, phase: "task_structure", phases: {}, project };
+  resetRunStateForNewRun(project || "");
   initRunLogs(project || undefined);
 
   pythonRunner.once("event", (event) => {
@@ -464,6 +658,7 @@ app.post("/api/run/full", async (req, res) => {
       task: body.task,
       push: body.push,
       skipDeploy: body.skipDeploy,
+      testTarget: body.testTarget === "deployed" ? "deployed" : "local",
       skipStructure: body.skipStructure,
       skipUi: body.skipUi,
       noOllama: body.noOllama,

@@ -25,11 +25,13 @@ local:
   start_cwd: .
   health_url: http://localhost:3000
   env_files:
+    - micro-services/admin/.env
     - .agent/.env
-    - .agent/.env.local
   required_env:
     - DATABASE_URL
   auto_start: true
+  keep_alive: true
+  launch_in_terminal: true
   startup_timeout_sec: 120
 
 deploy:
@@ -42,7 +44,8 @@ spec:
   default: mini-admin.yaml
 
 notes:
-  - Copy .agent/.env.example to .agent/.env.local and set DATABASE_URL for local runs.
+  - Copy micro-services/admin/.env.example to micro-services/admin/.env and set DATABASE_URL.
+  - Optional: UI test login + Railway token in .agent/.env (UI_TEST_EMAIL, UI_TEST_PASSWORD, RAILWAY_TOKEN).
   - Local server is started automatically from start_commands when skip deploy is enabled.
   - Set UI_TEST_EMAIL and UI_TEST_PASSWORD in .agent/.env
 """
@@ -128,6 +131,10 @@ def local_base_url(project: Path) -> str:
     sheet = load_cheatsheet(project)
     local = sheet.get("local") if isinstance(sheet.get("local"), dict) else {}
     url = str(local.get("base_url") or "").strip().rstrip("/")
+    if not url:
+        return ""
+    if "localhost" in url:
+        url = url.replace("://localhost:", "://127.0.0.1:").replace("://localhost/", "://127.0.0.1/")
     return url
 
 

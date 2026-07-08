@@ -18,6 +18,7 @@ class Phase(str, Enum):
     HEALTH = "health"
     STRUCTURE = "structure"
     UI_TEST = "ui_test"
+    EXPLORE = "exploration"
     CURSOR = "cursor"
     DONE = "done"
     ERROR = "error"
@@ -72,6 +73,11 @@ def format_event_line(event: dict[str, Any]) -> str:
         return f"[browser] {event.get('url')} — {count} interactables{ctx}"
     if event_type == "test_target":
         return f"[target] {event.get('source')}: {event.get('url')}"
+    if event_type == "site_map":
+        pages = event.get("pages") or {}
+        return f"[site_map] {len(pages)} page(s), +{event.get('new_elements', 0)} element(s)"
+    if event_type == "agent_decision":
+        return f"[agent] {event.get('action')}: {event.get('reason') or ''}".strip()
     if event_type == "cursor":
         return f"[cursor] {event.get('status', '')} {event.get('message', '')}".strip()
     if event_type == "cursor_text" and event.get("text"):
@@ -104,6 +110,10 @@ def reset_run_state() -> None:
             "browser_state": None,
             "last_result": None,
             "test_target": None,
+            "structured_task": None,
+            "run_report": None,
+            "site_map": None,
+            "last_agent_decision": None,
         }
     )
 
@@ -156,6 +166,55 @@ def test_target_event(*, url: str, source: str, local_url: str = "") -> None:
     _dispatch({"type": "test_target", "url": url, "source": source, "local_url": local_url})
 
 
+def structured_task_event(task: dict[str, Any]) -> None:
+    _run_state["structured_task"] = task
+    _dispatch({"type": "structured_task", **task})
+
+
+def run_report_event(report: dict[str, Any]) -> None:
+    _run_state["run_report"] = report
+    _dispatch({"type": "run_report", "report": report})
+
+
+def nav_tree_event(
+    *,
+    routes: dict[str, Any],
+    global_nav: list[dict[str, Any]] | None = None,
+    changed: bool = False,
+    new_elements: int = 0,
+) -> None:
+    payload = {
+        "routes": routes,
+        "global_nav": global_nav or [],
+        "changed": changed,
+        "new_elements": new_elements,
+    }
+    _run_state["nav_tree"] = payload
+    _dispatch({"type": "nav_tree", **payload})
+
+
+def site_map_event(
+    *,
+    pages: dict[str, Any],
+    changed: bool = False,
+    new_elements: int = 0,
+) -> None:
+    payload = {"pages": pages, "changed": changed, "new_elements": new_elements}
+    _run_state["site_map"] = payload
+    _dispatch({"type": "site_map", **payload})
+
+
+def agent_decision_event(decision: dict[str, Any]) -> None:
+    _run_state["last_agent_decision"] = decision
+    _dispatch({"type": "agent_decision", **decision})
+
+
+def cheatsheet_refined_event(*, added_learnings: list[dict[str, Any]], added_notes: list[str]) -> None:
+    payload = {"added_learnings": added_learnings, "added_notes": added_notes}
+    _run_state["cheatsheet_refined"] = payload
+    _dispatch({"type": "cheatsheet_refined", **payload})
+
+
 def log(message: str, *, phase: str | None = None, level: str = "info") -> None:
     entry = {"message": message, "phase": phase or _run_state.get("phase"), "level": level}
     logs = list(_run_state.get("log") or [])
@@ -171,6 +230,8 @@ def browser_state_event(
     interactables: list[dict[str, Any]] | None = None,
     context: str = "",
     node_url: str = "",
+    screenshot_b64: str | None = None,
+    error: str | None = None,
 ) -> None:
     entry = {
         "url": url,
@@ -178,6 +239,8 @@ def browser_state_event(
         "interactables": interactables or [],
         "context": context,
         "node_url": node_url,
+        "screenshot_b64": screenshot_b64,
+        "error": error,
     }
     _run_state["browser_state"] = entry
     _dispatch({"type": "browser_state", **entry})

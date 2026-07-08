@@ -26,7 +26,7 @@ def _parse_env_file(path: Path) -> dict[str, str]:
 
 
 def load_project_env(project: Path) -> dict[str, str]:
-    """Load `.agent/.env` and `.agent/.env.local` (later overrides earlier)."""
+    """Load env files listed in cheatsheet `local.env_files` (merged, later overrides earlier)."""
     base = agent_dir(project)
     merged: dict[str, str] = {}
     for name in (ENV_FILE, ENV_LOCAL):

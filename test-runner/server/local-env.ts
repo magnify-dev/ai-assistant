@@ -4,7 +4,7 @@ import path from "node:path";
 function parseEnvFile(content: string): Record<string, string> {
   const result: Record<string, string> = {};
   for (const line of content.split("\n")) {
-    const stripped = line.trim();
+    const stripped = line.replace(/\r$/, "").trim();
     if (!stripped || stripped.startsWith("#")) continue;
     const eq = stripped.indexOf("=");
     if (eq <= 0) continue;
@@ -18,19 +18,31 @@ function parseEnvFile(content: string): Record<string, string> {
   return result;
 }
 
+function envExampleFor(envPath: string): string {
+  return envPath.endsWith(".env") ? `${envPath.slice(0, -4)}.env.example` : `${envPath}.example`;
+}
+
+function primaryEnvFile(envFiles: string[]): string {
+  const normalized = envFiles.map((file) => file.replace(/\\/g, "/"));
+  const appFiles = normalized.filter((file) => !file.includes(".agent/"));
+  if (appFiles.length) return appFiles[appFiles.length - 1];
+  return normalized[normalized.length - 1] ?? "micro-services/admin/.env";
+}
+
 function parseCheatsheetEnvFiles(cheatsheet: string): string[] {
   const files: string[] = [];
   const block = cheatsheet.match(/env_files:\s*\n((?:\s+-\s+.+\n?)+)/);
   if (block) {
     for (const line of block[1].split("\n")) {
-      const m = line.match(/^\s+-\s+(.+)$/);
-      if (m) files.push(m[1].trim());
+      const trimmed = line.replace(/\r$/, "");
+      const match = trimmed.match(/^\s+-\s+(.+)$/);
+      if (match) files.push(match[1].trim());
     }
   }
   const single = cheatsheet.match(/^\s*env_file:\s*(.+)$/m);
   if (single) files.unshift(single[1].trim());
   if (!files.length) {
-    files.push(".agent/.env", ".agent/.env.local");
+    files.push("micro-services/admin/.env", ".agent/.env");
   }
   return [...new Set(files)];
 }
@@ -40,8 +52,9 @@ function parseRequiredEnv(cheatsheet: string): string[] {
   if (block) {
     const keys: string[] = [];
     for (const line of block[1].split("\n")) {
-      const m = line.match(/^\s+-\s+(.+)$/);
-      if (m) keys.push(m[1].trim());
+      const trimmed = line.replace(/\r$/, "");
+      const match = trimmed.match(/^\s+-\s+(.+)$/);
+      if (match) keys.push(match[1].trim());
     }
     if (keys.length) return keys;
   }
@@ -55,6 +68,8 @@ export function readLocalEnvStatus(projectPath: string) {
   const cheatsheet = fs.existsSync(cheatsheetPath) ? fs.readFileSync(cheatsheetPath, "utf8") : "";
   const envFiles = parseCheatsheetEnvFiles(cheatsheet);
   const required = parseRequiredEnv(cheatsheet);
+  const primaryEnv = primaryEnvFile(envFiles);
+  const primaryExample = envExampleFor(primaryEnv);
 
   const merged: Record<string, string> = {};
   const fileStatus: { path: string; exists: boolean }[] = [];
@@ -67,18 +82,20 @@ export function readLocalEnvStatus(projectPath: string) {
   }
 
   const missing = required.filter((key) => !String(merged[key] ?? "").trim());
-  const envExample = path.join(agentDir, ".env.example");
-  const envLocal = path.join(agentDir, ".env.local");
+  const primaryEnvAbs = path.isAbsolute(primaryEnv) ? primaryEnv : path.join(resolved, primaryEnv);
+  const primaryExampleAbs = path.isAbsolute(primaryExample) ? primaryExample : path.join(resolved, primaryExample);
 
   return {
     ready: missing.length === 0,
     missing,
     required,
     env_files: fileStatus,
-    has_env_example: fs.existsSync(envExample),
-    has_env_local: fs.existsSync(envLocal),
-    env_example_path: ".agent/.env.example",
-    env_local_path: ".agent/.env.local",
+    has_env: fs.existsSync(primaryEnvAbs),
+    has_env_example: fs.existsSync(primaryExampleAbs),
+    has_env_local: fs.existsSync(path.join(agentDir, ".env.local")),
+    env_path: primaryEnv,
+    env_example_path: primaryExample,
+    env_local_path: primaryEnv,
     local_base_url: cheatsheet.match(/^\s*base_url:\s*(.+)$/m)?.[1]?.trim() ?? "",
   };
 }

@@ -20,11 +20,11 @@ helix-pilot/
 tts/piper/
 tts/voices/
 
-# Dev loop / UI test generated reports (keep .agent/README.md)
-.agent/*
-!.agent/README.md
+# Dev loop generated runs (not project .agent/)
+dev_loop/.runs/
 
-dev_loop/demo/.agent/
+# Legacy — remove if present
+.agent/
 
 # Node / test-runner UI
 node_modules/

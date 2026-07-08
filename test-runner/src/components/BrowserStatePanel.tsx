@@ -19,7 +19,7 @@ export function BrowserStatePanel({ state, lastStep }: Props) {
   if (!state) {
     return (
       <div className="space-y-2 text-xs text-white/50">
-        <p>Browser state appears here during Playwright runs.</p>
+        <p>Browser preview and interactables appear here during Playwright runs.</p>
         {lastStep ? (
           <p className="text-white/40">
             Last step: {lastStep.action} {lastStep.target}{" "}
@@ -32,12 +32,30 @@ export function BrowserStatePanel({ state, lastStep }: Props) {
 
   return (
     <div className="space-y-3">
+      {state.screenshot_b64 ? (
+        <div>
+          <p className="mb-1 text-[10px] uppercase tracking-wide text-white/40">Page preview</p>
+          <div className="inline-block max-w-full overflow-hidden rounded-md border border-white/10 bg-white p-0.5">
+            <img
+              src={`data:image/jpeg;base64,${state.screenshot_b64}`}
+              alt="Playwright page preview"
+              className="mx-auto block max-h-64 w-auto max-w-full"
+            />
+          </div>
+        </div>
+      ) : null}
+
       <div>
         <p className="text-[10px] uppercase tracking-wide text-white/40">Current URL</p>
-        <p className="break-all font-mono text-xs text-sky-200/90">{state.url}</p>
+        <p className="break-all font-mono text-xs text-sky-200/90">{state.url || "(not loaded)"}</p>
         {state.title ? <p className="mt-1 text-xs text-white/50">{state.title}</p> : null}
         {state.context ? (
           <p className="mt-1 text-[10px] text-white/40">Context: {state.context}</p>
+        ) : null}
+        {state.error ? (
+          <p className="mt-1 rounded border border-red-500/30 bg-red-500/10 px-2 py-1 text-xs text-red-200/90">
+            {state.error}
+          </p>
         ) : null}
       </div>
 

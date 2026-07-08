@@ -19,7 +19,7 @@ def cheatsheet_env_files(project: Path) -> tuple[str, ...]:
     if env_file:
         files.insert(0, env_file)
     if not files:
-        files = [f"{agent_dir(project).name}/.env", f"{agent_dir(project).name}/.env.local"]
+        files = ["micro-services/admin/.env", f"{agent_dir(project).name}/.env"]
     return tuple(dict.fromkeys(files))
 
 
@@ -42,29 +42,47 @@ def load_merged_local_env(project: Path) -> dict[str, str]:
     return merged
 
 
+def _env_example_path(env_path: str) -> str:
+    if env_path.endswith(".env"):
+        return f"{env_path[:-4]}.env.example"
+    return f"{env_path}.example"
+
+
+def _primary_env_file(env_files: tuple[str, ...]) -> str:
+    normalized = [f.replace("\\", "/") for f in env_files]
+    app_files = [f for f in normalized if ".agent/" not in f]
+    if app_files:
+        return app_files[-1]
+    return normalized[-1] if normalized else f"{AGENT_DIR}/{ENV_FILE}"
+
+
 def local_env_status(project: Path) -> dict[str, Any]:
     base = agent_dir(project)
     env_files = cheatsheet_env_files(project)
     required = cheatsheet_required_env(project)
     merged = load_merged_local_env(project)
     missing = require_keys(merged, list(required))
+    primary_env = _primary_env_file(env_files)
+    primary_example = _env_example_path(primary_env)
 
     file_status: list[dict[str, Any]] = []
     for rel in env_files:
         path = project / rel if not Path(rel).is_absolute() else Path(rel)
         file_status.append({"path": rel, "exists": path.is_file()})
 
-    example_path = base / ENV_EXAMPLE
-    local_path = base / ENV_LOCAL
+    primary_path = project / primary_env if not Path(primary_env).is_absolute() else Path(primary_env)
+    example_path = project / primary_example if not Path(primary_example).is_absolute() else Path(primary_example)
     return {
         "ready": len(missing) == 0,
         "missing": missing,
         "required": list(required),
         "env_files": file_status,
-        "has_env_local": local_path.is_file(),
+        "has_env": primary_path.is_file(),
+        "has_env_local": (base / ENV_LOCAL).is_file(),
         "has_env_example": example_path.is_file(),
-        "env_example_path": f"{base.name}/{ENV_EXAMPLE}",
-        "env_local_path": f"{base.name}/{ENV_LOCAL}",
+        "env_path": primary_env,
+        "env_example_path": primary_example,
+        "env_local_path": primary_env,
     }
 
 
@@ -73,7 +91,7 @@ def format_local_env_hint(project: Path, missing: list[str]) -> str:
     keys = ", ".join(missing)
     if status["has_env_example"]:
         return (
-            f"Missing {keys}. Copy {status['env_example_path']} -> {status['env_local_path']} "
+            f"Missing {keys}. Copy {status['env_example_path']} -> {status['env_path']} "
             f"and set values (see cheatsheet notes)."
         )
-    return f"Missing {keys} in {status['env_local_path']} or cheatsheet env_files."
+    return f"Missing {keys} in {status['env_path']} or cheatsheet env_files."

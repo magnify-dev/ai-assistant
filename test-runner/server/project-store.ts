@@ -7,6 +7,8 @@ export type ProjectSettings = {
   task?: string;
   push?: boolean;
   skipDeploy?: boolean;
+  testTarget?: "local" | "deployed";
+  skipDeployWait?: boolean;
   skipCursor?: boolean;
   cursorRuntime?: "cloud" | "local";
   repoUrl?: string;

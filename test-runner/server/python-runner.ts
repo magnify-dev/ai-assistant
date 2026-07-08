@@ -11,6 +11,7 @@ export type RunOptions = {
   task?: string;
   push?: boolean;
   skipDeploy?: boolean;
+  testTarget?: "local" | "deployed";
   skipStructure?: boolean;
   skipUi?: boolean;
   noOllama?: boolean;
@@ -39,6 +40,7 @@ export class PythonRunner extends EventEmitter {
     if (options.task) args.push("--task", options.task);
     if (options.push) args.push("--push");
     if (options.skipDeploy) args.push("--skip-deploy");
+    if (options.testTarget) args.push("--test-target", options.testTarget);
     if (options.skipStructure) args.push("--skip-structure");
     if (options.skipUi) args.push("--skip-ui");
     if (options.noOllama) args.push("--no-ollama");

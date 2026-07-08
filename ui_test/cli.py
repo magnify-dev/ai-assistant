@@ -22,6 +22,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--task-file", help="Path to free-text task file")
     parser.add_argument("--push", action="store_true", help="Git push before waiting for Railway deploy")
     parser.add_argument("--skip-deploy", action="store_true", help="Skip Railway deploy wait")
+    parser.add_argument(
+        "--test-target",
+        choices=("local", "deployed"),
+        help="UI test target: local dev (cheatsheet) or deployed Railway URL",
+    )
     parser.add_argument("--skip-structure", action="store_true", help="Skip data-testid structure pass")
     parser.add_argument("--skip-ui", action="store_true", help="Skip Playwright UI execution")
     parser.add_argument("--no-structure-block", action="store_true", help="Run UI even when test_ids missing")
@@ -93,6 +98,7 @@ def main(argv: list[str] | None = None) -> int:
             task=args.task,
             task_file=task_file,
             skip_deploy=args.skip_deploy,
+            test_target=args.test_target,
             skip_structure=args.skip_structure,
             skip_ui=args.skip_ui,
             do_push=args.push,

@@ -10,7 +10,7 @@ defaults:
   test_cmd: null
 
 output:
-  dir: ".agent/current"
-  history_dir: ".agent/history"
+  dir: "dev_loop/.runs/current"
+  history_dir: "dev_loop/.runs/history"
   max_test_output_chars: 24000
   max_diff_chars: 12000
