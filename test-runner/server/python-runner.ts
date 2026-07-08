@@ -47,7 +47,12 @@ export class PythonRunner extends EventEmitter {
 
     this.proc = spawn(python, args, {
       cwd: REPO_ROOT,
-      env: { ...process.env, PYTHONUNBUFFERED: "1" },
+      env: {
+        ...process.env,
+        PYTHONUNBUFFERED: "1",
+        PYTHONPATH: REPO_ROOT,
+        PYTHONIOENCODING: "utf-8",
+      },
       windowsHide: true,
     });
 

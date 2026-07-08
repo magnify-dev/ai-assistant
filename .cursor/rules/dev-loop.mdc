@@ -13,7 +13,7 @@ When the user says things like:
 
 Do this:
 
-1. Read `.agent/current/REPORT.md` (and `task.json` if you need structured fields).
+1. Read `.agent/current/REPORT.md` (and `RUN-LOG.txt` / `task.json` if you need run context).
 2. Implement **only** what the report recommends — respect **Constraints** and **Acceptance criteria**.
 3. Prefer minimal, focused diffs; do not refactor unrelated code.
 4. After editing, tell the user to re-run `.\run-dev-loop.ps1` to verify tests pass.

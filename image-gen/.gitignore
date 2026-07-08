@@ -1,0 +1,14 @@
+# Local venv
+.venv/
+
+# ComfyUI clone (reinstalled by setup.ps1)
+ComfyUI/
+
+# Generated images
+output/
+
+# HF cache inside project
+.cache/
+
+.env
+.env.local

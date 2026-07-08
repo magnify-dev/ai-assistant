@@ -1,0 +1,5 @@
+huggingface_hub>=0.27.0
+gradio>=5.0.0
+requests>=2.32.0
+pyyaml>=6.0
+Pillow>=10.0.0

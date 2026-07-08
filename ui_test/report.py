@@ -42,17 +42,34 @@ def render_report_markdown(payload: dict[str, Any]) -> str:
     cursor_steps = payload.get("cursor_steps") or []
 
     status = "PASS" if overall_ok else "FAIL"
+    test_target = payload.get("test_target") or {}
+    local_env = payload.get("local_env") or {}
+
+    all_missing_for_prompt: set[str] = set()
+    for item in structure:
+        if isinstance(item, dict):
+            all_missing_for_prompt.update(item.get("missing") or [])
+
+    quick_lines = [
+        "Read .agent/current/REPORT.md and implement the fixes described there.",
+    ]
+    if all_missing_for_prompt:
+        quick_lines.append("Add missing data-testid hooks listed under Structure. Keep changes minimal.")
+    elif cursor_steps:
+        quick_lines.append("Focus on the items under Recommended implementation.")
+    else:
+        quick_lines.append("Keep changes minimal.")
+
     lines = [
         "# UI Test Loop — Implementation Report",
         "",
         "> **For Cursor:** Read this file on the **target project** and implement fixes.",
-        "> Re-run `run-ui-test.ps1` from ai-assistant after changes deploy to Railway.",
+        "> Re-run the test runner from ai-assistant after changes.",
         "",
         "## Quick prompt",
         "",
         "```",
-        "Read .agent/current/REPORT.md and implement the fixes described there.",
-        "Add missing data-testid hooks listed under Structure. Keep changes minimal.",
+        *quick_lines,
         "```",
         "",
         "## Run info",
@@ -60,7 +77,21 @@ def render_report_markdown(payload: dict[str, Any]) -> str:
         f"- **Project:** `{project}`",
         f"- **Generated:** {generated}",
         f"- **Overall status:** {status}",
+        f"- **Run log:** `.agent/current/RUN-LOG.txt`",
     ]
+
+    if test_target.get("url"):
+        source = test_target.get("source", "unknown")
+        source_label = {
+            "local": "Local dev",
+            "deployed_fallback": "Railway (local failed)",
+            "deployed": "Railway",
+        }.get(str(source), str(source))
+        lines.append(f"- **Test target:** `{test_target['url']}` ({source_label})")
+
+    if local_env and not local_env.get("ready"):
+        missing = ", ".join(local_env.get("missing") or [])
+        lines.append(f"- **Local env:** missing {missing} — copy `.agent/.env.example` → `.agent/.env.local`")
 
     if task.get("summary"):
         lines.extend(["", "## Task", "", str(task["summary"]), ""])

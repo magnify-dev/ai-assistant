@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "activeProjectId": "db173deb-348c-4113-80ae-e8c747b97647",
+  "projects": [
+    {
+      "id": "db173deb-348c-4113-80ae-e8c747b97647",
+      "name": "content-manager",
+      "path": "C:\\Users\\marce\\Documents\\Programming\\content-manager",
+      "lastUsed": "2026-07-08T14:42:34.058Z",
+      "settings": {
+        "task": "Verify login and then write the report about the groups that are present in the database, use the ui to discover them\n",
+        "push": false,
+        "skipDeploy": true,
+        "skipCursor": true,
+        "cursorRuntime": "local",
+        "repoUrl": "",
+        "cursorPrompt": ""
+      }
+    }
+  ]
+}

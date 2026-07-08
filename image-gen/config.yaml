@@ -1,0 +1,23 @@
+comfyui:
+  host: "127.0.0.1"
+  port: 8188
+
+simple_ui:
+  host: "127.0.0.1"
+  port: 7860
+
+model:
+  checkpoint: "ponyDiffusionV6XL_v6StartWithThisOne.safetensors"
+  huggingface_repo: "LyliaEngine/Pony_Diffusion_V6_XL"
+  huggingface_file: "ponyDiffusionV6XL_v6StartWithThisOne.safetensors"
+
+defaults:
+  width: 1024
+  height: 1024
+  steps: 28
+  cfg: 7.0
+  sampler: "euler_ancestral"
+  scheduler: "normal"
+  # Pony tag quality prefix (anime)
+  prompt_prefix: "score_9, score_8_up, score_7_up, source_anime, rating_explicit, "
+  negative_prompt: "score_6, score_5, score_4, worst quality, low quality, text, watermark, blurry, bad anatomy, bad hands, extra fingers, missing fingers, deformed, ugly"

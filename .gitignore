@@ -49,3 +49,9 @@ desktop.ini
 
 # Whisper / model caches (large, re-downloaded automatically)
 **/.cache/
+
+# Local image generation (ComfyUI clone + venv + outputs)
+image-gen/.venv/
+image-gen/ComfyUI/
+image-gen/output/
+image-gen/.cache/

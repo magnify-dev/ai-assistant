@@ -5,7 +5,20 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { buildReportPrompt, CursorRunner } from "./cursor-agent.js";
+import { fetchOllamaStatus, preloadOllamaModel, readOllamaConfig } from "./ollama.js";
 import { defaultProjectPath, PythonRunner, REPO_ROOT } from "./python-runner.js";
+import {
+  loadRegistry,
+  readProjectBundle,
+  readSpec,
+  removeProject,
+  setActiveProject,
+  upsertProject,
+  writeCheatsheet,
+  writeProfile,
+  type ProjectSettings,
+} from "./project-store.js";
+import { readLocalEnvStatus } from "./local-env.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 dotenv.config({ path: path.join(REPO_ROOT, ".env") });
@@ -17,6 +30,49 @@ const cursorRunner = new CursorRunner();
 
 type StoredEvent = Record<string, unknown>;
 const eventLog: StoredEvent[] = [];
+const engineLogPath = path.join(REPO_ROOT, ".agent", "current", "test-runner-last-run.log");
+let projectRunLogPath: string | null = null;
+
+function formatRunnerLogLine(event: StoredEvent): string {
+  const type = event.type;
+  if (type === "phase") {
+    return `[phase:${event.phase}] ${event.status} ${event.message ?? ""}`.trim();
+  }
+  if (type === "log") return String(event.message ?? "");
+  if (type === "step") {
+    const mark = event.ok ? "✓" : "✗";
+    return `[${event.mode ?? "strict"}] ${event.action} ${event.target} ${mark} ${event.message ?? ""}`.trim();
+  }
+  if (type === "done") return `[done] overall_ok=${String(event.overall_ok)}`;
+  if (type === "cursor") return `[cursor] ${event.status ?? ""} ${event.message ?? ""}`.trim();
+  if (type === "cursor_text" && event.text) return `[cursor] ${event.text}`;
+  if (type === "browser_state") {
+    const count = Array.isArray(event.interactables) ? event.interactables.length : 0;
+    const ctx = event.context ? ` (${event.context})` : "";
+    return `[browser] ${event.url} — ${count} interactables${ctx}`;
+  }
+  if (type === "process_exit") return `[process_exit] code=${String(event.code)}`;
+  return JSON.stringify(event);
+}
+
+function initRunLogs(project?: string) {
+  fs.mkdirSync(path.dirname(engineLogPath), { recursive: true });
+  const header = `# Test runner log — ${new Date().toISOString()}\n`;
+  fs.writeFileSync(engineLogPath, header, "utf8");
+  projectRunLogPath = project ? path.join(project, ".agent", "current", "RUN-LOG.txt") : null;
+}
+
+function appendRunLogs(event: StoredEvent) {
+  const line = formatRunnerLogLine(event);
+  if (!line) return;
+  try {
+    fs.appendFileSync(engineLogPath, line + "\n", "utf8");
+    // Project RUN-LOG.txt is owned by the Python ui_test process — do not duplicate here.
+  } catch {
+    /* ignore log write errors */
+  }
+}
+
 let runState: Record<string, unknown> = {
   running: false,
   phase: "idle",
@@ -26,6 +82,7 @@ let runState: Record<string, unknown> = {
 function pushEvent(event: StoredEvent) {
   eventLog.push({ ...event, ts: event.ts ?? new Date().toISOString() });
   if (eventLog.length > 2000) eventLog.splice(0, eventLog.length - 2000);
+  appendRunLogs(event);
 
   if (event.type === "phase" && typeof event.phase === "string") {
     runState.phase = event.phase;
@@ -46,6 +103,24 @@ function pushEvent(event: StoredEvent) {
   if (event.type === "process_exit") {
     runState.running = false;
   }
+  if (event.type === "browser_state") {
+    runState.browserState = {
+      url: event.url,
+      title: event.title,
+      interactables: event.interactables,
+      context: event.context,
+      node_url: event.node_url,
+      ts: event.ts,
+    };
+  }
+  if (event.type === "test_target") {
+    runState.testTarget = {
+      url: event.url,
+      source: event.source,
+      local_url: event.local_url,
+      ts: event.ts,
+    };
+  }
 }
 
 pythonRunner.on("event", pushEvent);
@@ -59,27 +134,176 @@ app.get("/api/health", (_req, res) => {
   res.json({ ok: true });
 });
 
-app.get("/api/config", (_req, res) => {
+app.get("/api/config", async (_req, res) => {
+  const ollama = readOllamaConfig();
+  const ollamaStatus = await fetchOllamaStatus(ollama);
   res.json({
     defaultProject: defaultProjectPath(),
     hasCursorApiKey: Boolean(process.env.CURSOR_API_KEY),
     repoRoot: REPO_ROOT,
+    ollama: {
+      ...ollama,
+      ...ollamaStatus,
+    },
   });
 });
 
+app.post("/api/ollama/preload", async (_req, res) => {
+  const ollama = readOllamaConfig();
+  try {
+    const status = await fetchOllamaStatus(ollama);
+    if (!status.reachable) {
+      res.status(503).json({ error: "Ollama is not reachable at " + ollama.url });
+      return;
+    }
+    if (!status.modelAvailable) {
+      res.status(400).json({ error: `Model ${ollama.model} is not installed. Run: ollama pull ${ollama.model}` });
+      return;
+    }
+    if (status.modelLoaded) {
+      res.json({ ok: true, message: `${ollama.model} already loaded` });
+      return;
+    }
+    await preloadOllamaModel(ollama);
+    res.json({ ok: true, message: `${ollama.model} loaded into VRAM` });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
 app.get("/api/state", (_req, res) => {
-  res.json({ ...runState, events: eventLog.slice(-300) });
+  res.json({
+    ...runState,
+    events: eventLog.slice(-300),
+    logPaths: {
+      engine: engineLogPath,
+      project: projectRunLogPath,
+    },
+  });
+});
+
+app.get("/api/projects", (_req, res) => {
+  res.json(loadRegistry());
+});
+
+app.post("/api/projects", (req, res) => {
+  const { path: projectPath, name, settings } = req.body ?? {};
+  if (!projectPath || typeof projectPath !== "string") {
+    res.status(400).json({ error: "path is required" });
+    return;
+  }
+  if (!fs.existsSync(projectPath)) {
+    res.status(400).json({ error: "Project path does not exist" });
+    return;
+  }
+  const entry = upsertProject(projectPath, settings as ProjectSettings | undefined, name);
+  res.json(entry);
+});
+
+app.post("/api/projects/active", (req, res) => {
+  const { id } = req.body ?? {};
+  if (!id || typeof id !== "string") {
+    res.status(400).json({ error: "id is required" });
+    return;
+  }
+  const project = setActiveProject(id);
+  if (!project) {
+    res.status(404).json({ error: "Project not found" });
+    return;
+  }
+  res.json(project);
+});
+
+app.delete("/api/projects/:id", (req, res) => {
+  const ok = removeProject(req.params.id);
+  if (!ok) {
+    res.status(404).json({ error: "Project not found" });
+    return;
+  }
+  res.json({ ok: true });
+});
+
+app.get("/api/project/local-env", (req, res) => {
+  const projectPath = req.query.path;
+  if (!projectPath || typeof projectPath !== "string") {
+    res.status(400).json({ error: "path query param is required" });
+    return;
+  }
+  if (!fs.existsSync(projectPath)) {
+    res.status(404).json({ error: "Project path does not exist" });
+    return;
+  }
+  res.json(readLocalEnvStatus(projectPath));
+});
+
+app.get("/api/project/bundle", (req, res) => {
+  const projectPath = req.query.path;
+  if (!projectPath || typeof projectPath !== "string") {
+    res.status(400).json({ error: "path query param is required" });
+    return;
+  }
+  if (!fs.existsSync(projectPath)) {
+    res.status(404).json({ error: "Project path does not exist" });
+    return;
+  }
+  res.json(readProjectBundle(projectPath));
+});
+
+app.put("/api/project/cheatsheet", (req, res) => {
+  const { path: projectPath, content } = req.body ?? {};
+  if (!projectPath || typeof projectPath !== "string") {
+    res.status(400).json({ error: "path is required" });
+    return;
+  }
+  if (typeof content !== "string") {
+    res.status(400).json({ error: "content is required" });
+    return;
+  }
+  const saved = writeCheatsheet(projectPath, content);
+  res.json({ ok: true, path: saved });
+});
+
+app.put("/api/project/profile", (req, res) => {
+  const { path: projectPath, profile } = req.body ?? {};
+  if (!projectPath || typeof projectPath !== "string") {
+    res.status(400).json({ error: "path is required" });
+    return;
+  }
+  if (!profile || typeof profile !== "object") {
+    res.status(400).json({ error: "profile object is required" });
+    return;
+  }
+  const saved = writeProfile(projectPath, profile as Record<string, unknown>);
+  res.json({ ok: true, path: saved });
+});
+
+app.get("/api/project/spec", (req, res) => {
+  const projectPath = req.query.path;
+  const name = req.query.name;
+  if (!projectPath || typeof projectPath !== "string" || !name || typeof name !== "string") {
+    res.status(400).json({ error: "path and name query params are required" });
+    return;
+  }
+  try {
+    res.json({ name, content: readSpec(projectPath, name) });
+  } catch (err) {
+    res.status(404).json({ error: err instanceof Error ? err.message : String(err) });
+  }
 });
 
 app.get("/api/events", (req, res) => {
   res.setHeader("Content-Type", "text/event-stream");
-  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
   res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
   res.flushHeaders();
 
   const send = (payload: StoredEvent) => {
+    if (res.writableEnded) return;
     res.write(`data: ${JSON.stringify(payload)}\n\n`);
   };
+
+  send({ type: "connected", ts: new Date().toISOString() });
 
   for (const event of eventLog.slice(-50)) {
     send(event);
@@ -89,7 +313,13 @@ app.get("/api/events", (req, res) => {
   pythonRunner.on("event", onEvent);
   cursorRunner.on("event", onEvent);
 
+  const heartbeat = setInterval(() => {
+    if (res.writableEnded) return;
+    res.write(": heartbeat\n\n");
+  }, 15000);
+
   req.on("close", () => {
+    clearInterval(heartbeat);
     pythonRunner.off("event", onEvent);
     cursorRunner.off("event", onEvent);
   });
@@ -116,7 +346,8 @@ app.post("/api/run/local", (req, res) => {
   }
 
   eventLog.length = 0;
-  runState = { running: true, phase: "task_structure", phases: {} };
+  runState = { running: true, phase: "task_structure", phases: {}, project };
+  initRunLogs(project);
 
   try {
     pythonRunner.start({
@@ -178,6 +409,7 @@ app.post("/api/run/cursor", async (req, res) => {
     status: "running",
     message: "Cursor SDK agent starting…",
   });
+  initRunLogs(project);
 
   void cursorRunner
     .run({
@@ -206,8 +438,10 @@ app.post("/api/run/full", async (req, res) => {
   }
 
   const body = req.body ?? {};
+  const project = typeof body.project === "string" ? body.project : "";
   eventLog.length = 0;
-  runState = { running: true, phase: "task_structure", phases: {} };
+  runState = { running: true, phase: "task_structure", phases: {}, project };
+  initRunLogs(project || undefined);
 
   pythonRunner.once("event", (event) => {
     if (event.type !== "done" && event.type !== "process_exit") return;
@@ -248,7 +482,41 @@ if (fs.existsSync(distDir)) {
   });
 }
 
-app.listen(PORT, "127.0.0.1", () => {
+const server = app.listen(PORT, "127.0.0.1", () => {
   console.log(`Test runner API on http://127.0.0.1:${PORT}`);
   console.log(`Dev UI: http://127.0.0.1:5175 (pnpm dev)`);
+
+  const ollama = readOllamaConfig();
+  void (async () => {
+    const status = await fetchOllamaStatus(ollama);
+    if (!status.reachable) {
+      console.log("Ollama: not reachable — start Ollama before running tests");
+      return;
+    }
+    if (!status.modelAvailable) {
+      console.log(`Ollama: model ${ollama.model} not installed — run: ollama pull ${ollama.model}`);
+      return;
+    }
+    if (status.modelLoaded) {
+      console.log(`Ollama: ${ollama.model} already loaded`);
+      return;
+    }
+    console.log(`Ollama: preloading ${ollama.model} into VRAM…`);
+    try {
+      await preloadOllamaModel(ollama);
+      console.log(`Ollama: ${ollama.model} ready`);
+    } catch (err) {
+      console.log(`Ollama preload skipped: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  })();
+});
+
+server.on("error", (err: NodeJS.ErrnoException) => {
+  if (err.code === "EADDRINUSE") {
+    console.error(
+      `Port ${PORT} is already in use. Stop the other test runner, or run: .\\scripts\\stop-test-runner-ports.ps1`,
+    );
+    process.exit(1);
+  }
+  throw err;
 });

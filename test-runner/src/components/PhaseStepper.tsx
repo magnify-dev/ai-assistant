@@ -1,10 +1,11 @@
-import { CheckCircle2, Circle, Loader2, XCircle } from "lucide-react";
+import { AlertTriangle, CheckCircle2, Circle, Loader2, XCircle } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { PHASES, type PhaseMap } from "@/types";
 
 function statusIcon(status?: string) {
   if (status === "running") return <Loader2 className="size-4 animate-spin text-sky-300" />;
   if (status === "done") return <CheckCircle2 className="size-4 text-green-400" />;
+  if (status === "warning") return <AlertTriangle className="size-4 text-amber-400" />;
   if (status === "failed") return <XCircle className="size-4 text-red-400" />;
   return <Circle className="size-4 text-white/30" />;
 }

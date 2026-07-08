@@ -8,6 +8,7 @@ from urllib.parse import urlparse
 
 from playwright.sync_api import Page, TimeoutError as PlaywrightTimeout, sync_playwright
 
+from ui_test.browser_state import emit_page_state
 from ui_test.step_log import SelectorMode, StepLogger, parse_mode, substitute_env
 
 
@@ -46,14 +47,27 @@ def _target_selector(target: dict[str, Any], mode: SelectorMode) -> tuple[str, s
         return f'[data-testid="{tid}"]', f"test_id={tid}"
     if target.get("selector"):
         return str(target["selector"]), f"selector={target['selector']}"
-    if mode == SelectorMode.FUZZY and target.get("text"):
-        text = str(target["text"])
-        return f"text={text}", f'text="{text}"'
     if target.get("role") and target.get("name"):
         role = str(target["role"])
         name = str(target["name"])
         return f"role={role}[name={name!r}]", f"role={role} name={name!r}"
+    if mode == SelectorMode.FUZZY and target.get("text"):
+        text = str(target["text"])
+        return f"text={text}", f'text="{text}"'
     raise ValueError(f"No usable target for mode={mode.value}: {target}")
+
+
+def _resolve_click_locator(page: Page, click: dict[str, Any], click_mode: SelectorMode):
+    if click.get("role") and click.get("name"):
+        label = f"role={click['role']} name={click['name']}"
+        return page.get_by_role(str(click["role"]), name=str(click["name"])).first, label
+    if click_mode == SelectorMode.FUZZY and click.get("text"):
+        text = str(click["text"])
+        button = page.get_by_role("button", name=text)
+        if button.count() > 0:
+            return button.first, f'button="{text}"'
+    sel, label = _target_selector(click, click_mode)
+    return page.locator(sel).first, label
 
 
 def _maybe_screenshot(page: Page, artifacts_dir: Path | None, label: str) -> str | None:
@@ -69,6 +83,20 @@ def _maybe_screenshot(page: Page, artifacts_dir: Path | None, label: str) -> str
         return None
 
 
+def _fill_input_stable(page: Page, selector: str, value: str, *, label: str) -> None:
+    loc = page.locator(selector).first
+    loc.wait_for(state="visible", timeout=15000)
+    for attempt in range(3):
+        loc.fill(value, timeout=15000)
+        try:
+            if loc.input_value(timeout=2000) == value:
+                return
+        except PlaywrightTimeout:
+            pass
+        page.wait_for_timeout(250 * (attempt + 1))
+    raise RuntimeError(f"Could not set {label} — input value did not stick (React hydration?)")
+
+
 def run_auth_flow(
     page: Page,
     base_url: str,
@@ -78,6 +106,8 @@ def run_auth_flow(
 ) -> None:
     auth_url = str(auth.get("url") or "/login")
     page.goto(_resolve_url(base_url, auth_url), wait_until="domcontentloaded", timeout=60000)
+    page.wait_for_load_state("networkidle", timeout=30000)
+    emit_page_state(page, context="auth", node_url=auth_url)
     for step in auth.get("steps") or []:
         if not isinstance(step, dict):
             continue
@@ -85,7 +115,6 @@ def run_auth_flow(
         ephemeral = bool(step.get("ephemeral"))
         if "fill" in step:
             target = step["fill"] if isinstance(step["fill"], dict) else {}
-            selector_key = "selector" if target.get("selector") else "test_id"
             if target.get("test_id"):
                 sel = f'[data-testid="{target["test_id"]}"]'
                 label = f"test_id={target['test_id']}"
@@ -93,7 +122,9 @@ def run_auth_flow(
                 sel = str(target.get("selector") or "")
                 label = sel
             value = substitute_env(str(target.get("value") or step.get("value") or ""), env)
-            page.locator(sel).first.fill(value, timeout=15000)
+            if not value:
+                raise RuntimeError(f"Missing env value for auth fill target {label}")
+            _fill_input_stable(page, sel, value, label=label)
             logger.log(
                 mode=mode,
                 ephemeral=ephemeral,
@@ -109,20 +140,59 @@ def run_auth_flow(
             click_mode = mode
             if click.get("text") and not click.get("test_id") and not click.get("selector"):
                 click_mode = SelectorMode.FUZZY
-            sel, label = _target_selector(click, click_mode)
-            page.locator(sel).first.click(timeout=15000)
+            sel, label = _resolve_click_locator(page, click, click_mode)
+            login_response: Any = None
+            try:
+                with page.expect_response(
+                    lambda r: "/api/auth/login" in r.url and r.request.method == "POST",
+                    timeout=30000,
+                ) as resp_info:
+                    sel.click(timeout=15000)
+                login_response = resp_info.value
+            except PlaywrightTimeout:
+                sel.click(timeout=15000)
             page.wait_for_load_state("domcontentloaded", timeout=30000)
+            click_ok = True
+            click_msg = ""
+            if login_response is not None:
+                click_ok = login_response.ok
+                click_msg = f"login HTTP {login_response.status}"
             logger.log(
                 mode=mode,
                 ephemeral=ephemeral,
                 page_url=page.url,
                 action="click",
                 target=label,
-                ok=True,
+                ok=click_ok,
+                message=click_msg,
             )
+            if login_response is not None and not login_response.ok:
+                try:
+                    body = login_response.json()
+                    err = body.get("error") if isinstance(body, dict) else None
+                    if err:
+                        raise RuntimeError(f"Login API failed: {err}")
+                except RuntimeError:
+                    raise
+                except Exception:
+                    raise RuntimeError(f"Login API failed: HTTP {login_response.status}")
+            emit_page_state(page, context="after_auth_click")
         elif step.get("expect_url"):
             expected = str(step["expect_url"])
+            timeout_ms = int(step.get("timeout_ms") or auth.get("expect_url_timeout_ms") or 30000)
+            try:
+                page.wait_for_url(lambda url: _url_matches(url, expected), timeout=timeout_ms)
+            except PlaywrightTimeout:
+                pass
             ok = _url_matches(page.url, expected)
+            detail = ""
+            if not ok and "/login" in page.url:
+                try:
+                    err = page.locator("form .text-red-200").first
+                    if err.count() and err.is_visible():
+                        detail = f" — {err.inner_text(timeout=1000).strip()}"
+                except Exception:
+                    pass
             logger.log(
                 mode=SelectorMode.STRICT,
                 ephemeral=ephemeral,
@@ -130,10 +200,12 @@ def run_auth_flow(
                 action="expect_url",
                 target=expected,
                 ok=ok,
-                message="" if ok else f"got {page.url}",
+                message="" if ok else f"got {page.url}{detail}",
             )
             if not ok:
-                raise RuntimeError(f"Auth expect_url failed: wanted {expected}, got {page.url}")
+                raise RuntimeError(
+                    f"Auth expect_url failed: wanted {expected}, got {page.url}{detail}"
+                )
 
 
 def _run_expect(page: Page, expect: dict[str, Any], artifacts_dir: Path | None, label: str) -> StepResult:
@@ -183,6 +255,7 @@ def _execute_step(
             path = str(step.get("url") or "/")
             page.goto(_resolve_url(base_url, path), wait_until="domcontentloaded", timeout=60000)
             logger.log(mode=mode, ephemeral=ephemeral, page_url=page.url, action="navigate", target=path, ok=True)
+            emit_page_state(page, context="after_navigate", node_url=path)
             return StepResult(True, f"navigated to {page.url}")
 
         target = step.get("target") if isinstance(step.get("target"), dict) else {}
@@ -193,8 +266,8 @@ def _execute_step(
             page.locator(sel).first.fill(value, timeout=15000)
             logger.log(mode=mode, ephemeral=ephemeral, page_url=page.url, action="fill", target=tlabel, ok=True)
         elif action == "click":
-            sel, tlabel = _target_selector(target, mode)
-            page.locator(sel).first.click(timeout=15000)
+            loc, tlabel = _resolve_click_locator(page, target, mode)
+            loc.click(timeout=15000)
             page.wait_for_timeout(800)
             logger.log(mode=mode, ephemeral=ephemeral, page_url=page.url, action="click", target=tlabel, ok=True)
         elif action == "wait":
@@ -216,7 +289,9 @@ def _execute_step(
                 ok=result.ok,
                 message=result.message,
             )
+            emit_page_state(page, context="after_expect" if result.ok else "expect_failed")
             return result
+        emit_page_state(page, context=f"after_{action}")
         return StepResult(True, "ok")
     except (PlaywrightTimeout, ValueError, RuntimeError) as exc:
         shot = _maybe_screenshot(page, artifacts_dir, label)
@@ -263,6 +338,7 @@ def run_spec(
                 path = str(node.get("url") or "/")
                 page.goto(_resolve_url(base_url, path), wait_until="domcontentloaded", timeout=60000)
                 page.wait_for_timeout(1000)
+                emit_page_state(page, context="node", node_url=path)
 
                 node_test_id = node.get("test_id")
                 if node_test_id:

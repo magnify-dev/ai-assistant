@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from ui_test.project_paths import agent_railway_path
 from ui_test.config_loader import load_yaml
 
 
@@ -43,7 +44,7 @@ class RailwayConfig:
 
 
 def load_railway_config(project: Path) -> RailwayConfig:
-    raw = load_yaml(project / "ui-test" / "railway.yaml")
+    raw = load_yaml(agent_railway_path(project))
     services: dict[str, RailwayService] = {}
     for name, data in (raw.get("services") or {}).items():
         if not isinstance(data, dict):

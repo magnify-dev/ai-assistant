@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from ui_test.project_paths import agent_dir, ENV_FILE, ENV_LOCAL
+
 
 def _parse_env_file(path: Path) -> dict[str, str]:
     if not path.is_file():
@@ -24,10 +26,10 @@ def _parse_env_file(path: Path) -> dict[str, str]:
 
 
 def load_project_env(project: Path) -> dict[str, str]:
-    """Load ui-test/.env and ui-test/.env.local (later overrides earlier)."""
-    base = project / "ui-test"
+    """Load `.agent/.env` and `.agent/.env.local` (later overrides earlier)."""
+    base = agent_dir(project)
     merged: dict[str, str] = {}
-    for name in (".env", ".env.local"):
+    for name in (ENV_FILE, ENV_LOCAL):
         merged.update(_parse_env_file(base / name))
     return merged
 

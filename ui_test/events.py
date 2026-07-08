@@ -4,13 +4,16 @@ import json
 import sys
 from datetime import datetime, timezone
 from enum import Enum
+from pathlib import Path
 from typing import Any, Callable
 
 
 class Phase(str, Enum):
     IDLE = "idle"
+    OLLAMA = "ollama"
     TASK = "task_structure"
     GIT = "git"
+    LOCAL = "local_server"
     DEPLOY = "deploy"
     HEALTH = "health"
     STRUCTURE = "structure"
@@ -24,12 +27,14 @@ EventHandler = Callable[[dict[str, Any]], None]
 
 _handlers: list[EventHandler] = []
 _emit_json: bool = False
+_run_log_path: Path | None = None
 _run_state: dict[str, Any] = {
     "running": False,
     "phase": Phase.IDLE.value,
     "phases": {},
     "log": [],
     "steps": [],
+    "browser_state": None,
     "last_result": None,
 }
 
@@ -37,6 +42,51 @@ _run_state: dict[str, Any] = {
 def configure(*, emit_json: bool = False) -> None:
     global _emit_json
     _emit_json = emit_json
+
+
+def configure_run_log(path: Path) -> None:
+    """Persist human-readable run lines for agents (`.agent/current/RUN-LOG.txt`)."""
+    global _run_log_path
+    _run_log_path = path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"# UI test run log — started {datetime.now(timezone.utc).isoformat()}\n", encoding="utf-8")
+
+
+def format_event_line(event: dict[str, Any]) -> str:
+    event_type = event.get("type")
+    if event_type == "step":
+        mark = "✓" if event.get("ok") else "✗"
+        msg = f" {event['message']}" if event.get("message") else ""
+        return f"[{event.get('mode', 'strict')}] {event.get('action')} {event.get('target')} {mark}{msg}".strip()
+    if event_type == "phase":
+        return f"[phase:{event.get('phase')}] {event.get('status')} {event.get('message') or ''}".strip()
+    if event_type == "log":
+        return str(event.get("message") or "")
+    if event_type == "done":
+        return f"[done] overall_ok={event.get('overall_ok')}"
+    if event_type == "run_state":
+        return f"[run_state] running={event.get('running')}"
+    if event_type == "browser_state":
+        count = len(event.get("interactables") or [])
+        ctx = f" ({event.get('context')})" if event.get("context") else ""
+        return f"[browser] {event.get('url')} — {count} interactables{ctx}"
+    if event_type == "test_target":
+        return f"[target] {event.get('source')}: {event.get('url')}"
+    if event_type == "cursor":
+        return f"[cursor] {event.get('status', '')} {event.get('message', '')}".strip()
+    if event_type == "cursor_text" and event.get("text"):
+        return f"[cursor] {event['text']}"
+    return json.dumps(event, ensure_ascii=False)
+
+
+def _append_run_log(event: dict[str, Any]) -> None:
+    if not _run_log_path:
+        return
+    line = format_event_line(event)
+    if not line:
+        return
+    with _run_log_path.open("a", encoding="utf-8") as handle:
+        handle.write(line + "\n")
 
 
 def subscribe(handler: EventHandler) -> None:
@@ -51,7 +101,9 @@ def reset_run_state() -> None:
             "phases": {},
             "log": [],
             "steps": [],
+            "browser_state": None,
             "last_result": None,
+            "test_target": None,
         }
     )
 
@@ -63,6 +115,7 @@ def get_run_state() -> dict[str, Any]:
 def _dispatch(event: dict[str, Any]) -> None:
     ts = datetime.now(timezone.utc).isoformat()
     payload = {"ts": ts, **event}
+    _append_run_log(payload)
     for handler in _handlers:
         handler(payload)
     if _emit_json:
@@ -83,18 +136,24 @@ def phase_start(phase: Phase, message: str = "") -> None:
     log(message or f"Phase {phase.value} started", phase=phase.value)
 
 
-def phase_done(phase: Phase, *, ok: bool, message: str = "") -> None:
+def phase_done(phase: Phase, *, ok: bool, message: str = "", status: str | None = None) -> None:
+    final_status = status or ("done" if ok else "failed")
     phases = dict(_run_state.get("phases") or {})
-    phases[phase.value] = {"status": "done" if ok else "failed", "message": message}
+    phases[phase.value] = {"status": final_status, "message": message}
     _run_state["phases"] = phases
     _dispatch(
         {
             "type": "phase",
             "phase": phase.value,
-            "status": "done" if ok else "failed",
+            "status": final_status,
             "message": message,
         }
     )
+
+
+def test_target_event(*, url: str, source: str, local_url: str = "") -> None:
+    _run_state["test_target"] = {"url": url, "source": source, "local_url": local_url}
+    _dispatch({"type": "test_target", "url": url, "source": source, "local_url": local_url})
 
 
 def log(message: str, *, phase: str | None = None, level: str = "info") -> None:
@@ -103,6 +162,25 @@ def log(message: str, *, phase: str | None = None, level: str = "info") -> None:
     logs.append(entry)
     _run_state["log"] = logs[-500:]
     _dispatch({"type": "log", **entry})
+
+
+def browser_state_event(
+    *,
+    url: str,
+    title: str = "",
+    interactables: list[dict[str, Any]] | None = None,
+    context: str = "",
+    node_url: str = "",
+) -> None:
+    entry = {
+        "url": url,
+        "title": title,
+        "interactables": interactables or [],
+        "context": context,
+        "node_url": node_url,
+    }
+    _run_state["browser_state"] = entry
+    _dispatch({"type": "browser_state", **entry})
 
 
 def step_event(

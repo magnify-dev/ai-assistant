@@ -15,12 +15,26 @@ if (-not (Test-Path $VenvPython)) {
 & $VenvPython -m pip install -r (Join-Path $Root "ui_test\requirements.txt") -q 2>$null
 & $VenvPython -m playwright install chromium 2>$null
 
+$PreloadScript = Join-Path $Root "scripts\preload-ollama.ps1"
+if (Test-Path $PreloadScript) {
+    & $PreloadScript
+}
+
+$StopPortsScript = Join-Path $Root "scripts\stop-test-runner-ports.ps1"
+if (Test-Path $StopPortsScript) {
+    & $StopPortsScript
+}
+
 Push-Location $Root
 try {
-    if (-not (Test-Path "node_modules")) {
-        pnpm install
+    pnpm install
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "pnpm install failed. Fix dependency errors above, then retry."
     }
     pnpm dev
+    if ($LASTEXITCODE -ne 0) {
+        exit $LASTEXITCODE
+    }
 }
 finally {
     Pop-Location

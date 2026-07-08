@@ -6,6 +6,8 @@ from typing import Any
 
 import yaml
 
+from ui_test.project_paths import agent_config_path, agent_dir
+
 _ENGINE_ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -35,7 +37,7 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
 
 
 def load_project_config(project: Path) -> dict[str, Any]:
-    return load_yaml(project / "ui-test" / "config.yaml")
+    return load_yaml(agent_config_path(project))
 
 
 def merged_config(project: Path) -> dict[str, Any]:
@@ -44,8 +46,13 @@ def merged_config(project: Path) -> dict[str, Any]:
     return _deep_merge(engine, project_cfg)
 
 
+def agent_project_dir(project: Path) -> Path:
+    return agent_dir(project)
+
+
 def ui_test_dir(project: Path) -> Path:
-    return project / "ui-test"
+    """Deprecated alias — use agent_project_dir()."""
+    return agent_dir(project)
 
 
 def output_dir(config: dict[str, Any], project: Path) -> Path:
