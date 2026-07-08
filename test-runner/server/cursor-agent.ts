@@ -9,6 +9,7 @@ export type CursorRunOptions = {
   runtime: CursorRuntime;
   repoUrl?: string;
   apiKey: string;
+  modelId?: string;
 };
 
 export class CursorRunner extends EventEmitter {
@@ -29,6 +30,8 @@ export class CursorRunner extends EventEmitter {
       message: `Starting ${options.runtime} Cursor agent…`,
     });
 
+    const modelId = options.modelId || "composer-2.5";
+
     try {
       if (options.runtime === "cloud") {
         if (!options.repoUrl) {
@@ -36,7 +39,7 @@ export class CursorRunner extends EventEmitter {
         }
         await using agent = await Agent.create({
           apiKey: options.apiKey,
-          model: { id: "composer-2.5" },
+          model: { id: modelId },
           cloud: {
             repos: [{ url: options.repoUrl }],
           },
@@ -87,7 +90,7 @@ export class CursorRunner extends EventEmitter {
 
       await using agent = await Agent.create({
         apiKey: options.apiKey,
-        model: { id: "composer-2.5" },
+        model: { id: modelId },
         local: {
           cwd: options.cwd,
           settingSources: [],

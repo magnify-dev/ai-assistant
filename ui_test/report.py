@@ -106,6 +106,12 @@ def render_report_markdown(payload: dict[str, Any]) -> str:
         lines.append(f"- **Branch:** `{git.get('branch') or '(detached)'}`")
         lines.append(f"- **Uncommitted changes:** {'yes' if git.get('has_uncommitted') else 'no'}")
         lines.append(f"- **Unpushed commits:** {git.get('unpushed_commits', 0)}")
+        auto_commit = git.get("auto_commit") if isinstance(git.get("auto_commit"), dict) else None
+        if auto_commit and auto_commit.get("attempted"):
+            if auto_commit.get("ok"):
+                lines.append(f"- **Auto-commit:** `{auto_commit.get('subject') or 'ok'}`")
+            else:
+                lines.append(f"- **Auto-commit failed:** {auto_commit.get('error') or 'unknown'}")
         if git.get("push_message"):
             lines.append(f"- **Push:** {git['push_message']}")
     else:

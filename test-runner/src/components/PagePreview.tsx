@@ -11,6 +11,19 @@ type Props = {
   replayMode?: boolean;
 };
 
+function MediaFrame({ children, className }: { children: React.ReactNode; className?: string }) {
+  return (
+    <div
+      className={cn(
+        "flex items-center justify-center overflow-hidden rounded-lg border border-white/10 bg-neutral-950/90",
+        className,
+      )}
+    >
+      {children}
+    </div>
+  );
+}
+
 export function PagePreview({ state, session, frameIndex = 0, onFrameIndexChange, lastAction, replayMode }: Props) {
   const frames = session?.frames ?? [];
   const activeFrame = frames[frameIndex] ?? frames[frames.length - 1];
@@ -30,7 +43,7 @@ export function PagePreview({ state, session, frameIndex = 0, onFrameIndexChange
 
   if (replayMode && session) {
     return (
-      <div className="flex h-full min-h-0 flex-col gap-3">
+      <div className="flex flex-col gap-3">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div className="min-w-0">
             <p className="truncate text-sm font-medium text-white/90">{activeFrame?.label || "Recorded session"}</p>
@@ -42,18 +55,23 @@ export function PagePreview({ state, session, frameIndex = 0, onFrameIndexChange
         </div>
 
         {session.videoUrl ? (
-          <div className="rounded-lg border border-white/10 bg-black/40 p-2">
-            <p className="mb-1 text-[10px] uppercase tracking-wide text-white/40">Session video</p>
-            <video src={session.videoUrl} controls className="max-h-48 w-full rounded bg-black" />
+          <div className="space-y-1">
+            <p className="text-[10px] uppercase tracking-wide text-white/40">Session video</p>
+            <MediaFrame className="p-1">
+              <video src={session.videoUrl} controls className="max-h-44 w-full rounded object-contain" />
+            </MediaFrame>
           </div>
         ) : null}
 
-        <div className="flex min-h-0 flex-1 items-start justify-center overflow-auto rounded-lg border border-white/10 bg-white p-1">
-          {screenshotUrl ? (
-            <img src={screenshotUrl} alt="Recorded step" className="max-h-full w-auto max-w-full object-contain" />
-          ) : (
-            <div className="flex h-64 w-full items-center justify-center text-sm text-black/50">No screenshot for this step</div>
-          )}
+        <div className="space-y-1">
+          <p className="text-[10px] uppercase tracking-wide text-white/40">Screenshot</p>
+          <MediaFrame className="min-h-[120px] max-h-[min(48vh,420px)] p-1">
+            {screenshotUrl ? (
+              <img src={screenshotUrl} alt="Recorded step" className="max-h-[min(48vh,416px)] w-auto max-w-full object-contain" />
+            ) : (
+              <div className="flex h-32 w-full items-center justify-center text-sm text-white/40">No screenshot for this step</div>
+            )}
+          </MediaFrame>
         </div>
 
         {frames.length > 1 ? (
@@ -74,7 +92,7 @@ export function PagePreview({ state, session, frameIndex = 0, onFrameIndexChange
               max={Math.max(0, frames.length - 1)}
               value={frameIndex}
               onChange={(e) => onFrameIndexChange?.(Number(e.target.value))}
-              className="w-full"
+              className="w-full accent-violet-400"
             />
           </div>
         ) : session.traceUrl ? (
@@ -90,7 +108,7 @@ export function PagePreview({ state, session, frameIndex = 0, onFrameIndexChange
 
   if (!display) {
     return (
-      <div className="flex h-full min-h-[420px] flex-col items-center justify-center rounded-lg border border-dashed border-white/15 bg-black/20 p-8 text-center">
+      <div className="flex min-h-[200px] flex-col items-center justify-center rounded-lg border border-dashed border-white/15 bg-black/20 p-8 text-center">
         <p className="text-sm text-white/50">Page preview will appear when Playwright opens a page.</p>
         {lastAction ? <p className="mt-2 text-xs text-white/40">{lastAction}</p> : null}
       </div>
@@ -98,7 +116,7 @@ export function PagePreview({ state, session, frameIndex = 0, onFrameIndexChange
   }
 
   return (
-    <div className="flex h-full min-h-0 flex-col gap-3">
+    <div className="flex flex-col gap-3">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="min-w-0">
           <p className="truncate text-sm font-medium text-white/90">{display.title || "Untitled page"}</p>
@@ -109,19 +127,19 @@ export function PagePreview({ state, session, frameIndex = 0, onFrameIndexChange
         ) : null}
       </div>
 
-      <div className="flex min-h-0 flex-1 items-start justify-center overflow-auto rounded-lg border border-white/10 bg-white p-1">
+      <MediaFrame className="min-h-[120px] max-h-[min(52vh,480px)] p-1">
         {state?.screenshot_b64 ? (
           <img
             src={`data:image/jpeg;base64,${state.screenshot_b64}`}
             alt="Live page preview"
-            className="max-h-full w-auto max-w-full object-contain"
+            className="max-h-[min(52vh,476px)] w-auto max-w-full object-contain"
           />
         ) : screenshotUrl ? (
-          <img src={screenshotUrl} alt="Recorded page preview" className="max-h-full w-auto max-w-full object-contain" />
+          <img src={screenshotUrl} alt="Recorded page preview" className="max-h-[min(52vh,476px)] w-auto max-w-full object-contain" />
         ) : (
-          <div className="flex h-64 w-full items-center justify-center text-sm text-black/50">No screenshot yet</div>
+          <div className="flex h-32 w-full items-center justify-center text-sm text-white/40">No screenshot yet</div>
         )}
-      </div>
+      </MediaFrame>
 
       {lastAction ? (
         <p className={cn("rounded border border-white/10 bg-black/30 px-2 py-1.5 text-xs text-white/70")}>{lastAction}</p>

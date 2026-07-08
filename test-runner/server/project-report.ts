@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { parse as parseYaml } from "yaml";
+import { canResumeTranscript, readCollaborationTranscript } from "./collaboration-transcript.js";
 
 type ExplorationDoc = {
   version?: number;
@@ -55,6 +56,7 @@ export type RunSummary = {
   generatedAt: string;
   hasSession: boolean;
   frameCount: number;
+  canResume: boolean;
 };
 
 export function readRunBundle(projectPath: string, runId: string) {
@@ -75,6 +77,7 @@ export function readRunBundle(projectPath: string, runId: string) {
     (task?.structured_task as Record<string, unknown> | undefined) ??
     (report?.requested as Record<string, unknown> | undefined);
   const status = readJsonFile<Record<string, unknown>>(path.join(root, "status.json"));
+  const collaborationTranscript = readCollaborationTranscript(projectPath, runId);
   return {
     runId,
     root,
@@ -85,6 +88,7 @@ export function readRunBundle(projectPath: string, runId: string) {
     playwrightSession,
     status,
     hasRun: Boolean(report),
+    collaborationTranscript,
   };
 }
 
@@ -102,6 +106,7 @@ function summarizeRun(runId: string, bundle: ReturnType<typeof readRunBundle>): 
     generatedAt: String(bundle.status?.generated_at ?? (report as { generated_at?: string } | null)?.generated_at ?? runId),
     hasSession: Boolean(session && (frames > 0 || session.frame_count)),
     frameCount: frames,
+    canResume: canResumeTranscript(bundle.collaborationTranscript),
   };
 }
 

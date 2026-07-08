@@ -1,6 +1,8 @@
 import { useMemo, useState } from "react";
 import type { RunReport, StructuredTask, TestTarget } from "@/lib/projectTypes";
+import type { AgentRunCard, CollaborationResult } from "@/lib/collaborationTypes";
 import { PHASES, type PhaseKey, type PhaseMap } from "@/types";
+import { CollaborationPanel } from "@/components/CollaborationPanel";
 import { ExplorationPanel } from "@/components/ExplorationPanel";
 import { ProgressCard, phaseToStatus, type ProgressStatus } from "@/components/ProgressCard";
 import { cn } from "@/lib/utils";
@@ -17,7 +19,18 @@ type Props = {
   skipDeploy: boolean;
   hasTask: boolean;
   skipCursor?: boolean;
+  agentCards?: AgentRunCard[];
+  collaborationResult?: CollaborationResult | null;
+  hideCollaboration?: boolean;
 };
+
+function isExplorationMode(
+  hasTask: boolean,
+  runReport: RunReport | null,
+  phases: PhaseMap,
+): boolean {
+  return runReport?.mode === "exploration" || Boolean(phases.exploration) || (hasTask && !phases.ui_test);
+}
 
 function pipelineStepKeys(
   testTargetMode: "local" | "deployed",
@@ -26,8 +39,7 @@ function pipelineStepKeys(
   runReport: RunReport | null,
   phases: PhaseMap,
 ): PhaseKey[] {
-  const exploration =
-    runReport?.mode === "exploration" || Boolean(phases.exploration) || (hasTask && !phases.ui_test);
+  const exploration = isExplorationMode(hasTask, runReport, phases);
   const keys: PhaseKey[] = ["ollama"];
   if (hasTask) keys.push("task_structure");
   keys.push("git");
@@ -40,6 +52,93 @@ function pipelineStepKeys(
   if (!exploration) keys.push("structure");
   keys.push(exploration ? "exploration" : "ui_test");
   return keys;
+}
+
+/** Git → deploy wait → health → UI test — shown during collaboration verify runs. */
+function deployVerifyStepKeys(
+  testTargetMode: "local" | "deployed",
+  skipDeploy: boolean,
+  hasTask: boolean,
+  runReport: RunReport | null,
+  phases: PhaseMap,
+): PhaseKey[] {
+  const exploration = isExplorationMode(hasTask, runReport, phases);
+  const keys: PhaseKey[] = ["git"];
+  if (testTargetMode === "local") {
+    keys.push("local_server");
+  } else if (!skipDeploy) {
+    keys.push("deploy");
+  }
+  keys.push("health");
+  keys.push(exploration ? "exploration" : "ui_test");
+  return keys;
+}
+
+const PIPELINE_PHASE_KEYS = new Set<PhaseKey>([
+  "ollama",
+  "task_structure",
+  "git",
+  "local_server",
+  "deploy",
+  "health",
+  "structure",
+  "exploration",
+  "ui_test",
+]);
+
+function hasPipelinePhaseActivity(phases: PhaseMap): boolean {
+  return Object.keys(phases).some((key) => PIPELINE_PHASE_KEYS.has(key as PhaseKey));
+}
+
+function renderStepCards(
+  stepKeys: PhaseKey[],
+  phases: PhaseMap,
+  running: boolean,
+  structuredTask: StructuredTask | null,
+) {
+  return stepKeys.map((key) => {
+    const phase = phases[key];
+    const isTask = key === "task_structure";
+    const status = stepStatus(key, phase, running, structuredTask);
+    const label = phaseLabel(key);
+    const summary =
+      phase?.message ||
+      (isTask && running && !structuredTask ? "Structuring…" : status === "idle" && running ? "Pending…" : undefined);
+
+    return (
+      <ProgressCard
+        key={key}
+        title={label}
+        status={status}
+        summary={summary}
+        defaultOpen={status === "failed" || (isTask && Boolean(structuredTask))}
+        highlight={isTask || key === "exploration" || key === "ui_test" || key === "deploy" || key === "git"}
+      >
+        {isTask && structuredTask ? (
+          <div className="space-y-2">
+            {structuredTask.summary ? <p className="text-white/85">{structuredTask.summary}</p> : null}
+            {structuredTask.source_text ? (
+              <p className="whitespace-pre-wrap text-white/65">{structuredTask.source_text}</p>
+            ) : null}
+            {(structuredTask.success_criteria?.length ?? 0) > 0 ? (
+              <ul className="list-disc space-y-1 pl-4 text-white/70">
+                {structuredTask.success_criteria!.map((c) => (
+                  <li key={c}>{c}</li>
+                ))}
+              </ul>
+            ) : null}
+            {(structuredTask.intent_gaps?.length ?? 0) > 0 ? (
+              <ul className="list-disc space-y-1 pl-4 text-amber-200/90">
+                {structuredTask.intent_gaps!.map((g) => (
+                  <li key={g}>{g}</li>
+                ))}
+              </ul>
+            ) : null}
+          </div>
+        ) : undefined}
+      </ProgressCard>
+    );
+  });
 }
 
 function extractAnswerSection(report: string): string {
@@ -86,6 +185,9 @@ export function RunProgressPanel({
   skipDeploy,
   hasTask,
   skipCursor,
+  agentCards = [],
+  collaborationResult = null,
+  hideCollaboration = false,
 }: Props) {
   const [inspectExploration, setInspectExploration] = useState(false);
 
@@ -94,11 +196,21 @@ export function RunProgressPanel({
     [testTargetMode, skipDeploy, hasTask, runReport, phases],
   );
 
+  const deployStepKeys = useMemo(
+    () => deployVerifyStepKeys(testTargetMode, skipDeploy, hasTask, runReport, phases),
+    [testTargetMode, skipDeploy, hasTask, runReport, phases],
+  );
+
   const taskAnswer = useMemo(() => resolveTaskAnswer(runReport), [runReport]);
   const taskAnswerPlain = plainAnswer(taskAnswer);
 
-  const showCursor = !skipCursor;
-  const showPipeline = running || lastResult !== null || Object.keys(phases).length > 0;
+  const showCursor = !skipCursor && agentCards.length === 0;
+  const showCollaboration = agentCards.length > 0 || Boolean(collaborationResult);
+  const pipelineActive = running || lastResult !== null || hasPipelinePhaseActivity(phases);
+  const showFullPipeline = pipelineActive && !showCollaboration;
+  const showDeployPipeline =
+    showCollaboration &&
+    (running || hasPipelinePhaseActivity(phases) || Boolean(runReport) || Boolean(testTarget?.url));
 
   const overallStatus: ProgressStatus = running
     ? "running"
@@ -133,55 +245,22 @@ export function RunProgressPanel({
       </div>
 
       <div className="min-h-0 flex-1 space-y-2 overflow-y-auto pr-1">
+        {showCollaboration && !hideCollaboration ? (
+          <CollaborationPanel agentCards={agentCards} collaborationResult={collaborationResult} running={running} compact />
+        ) : null}
+
         {testTarget?.url ? (
           <ProgressCard title="Target" status="done" summary={`${testTarget.source}: ${testTarget.url}`} />
         ) : null}
 
-        {showPipeline
-          ? stepKeys.map((key) => {
-              const phase = phases[key];
-              const isTask = key === "task_structure";
-              const status = stepStatus(key, phase, running, structuredTask);
-              const label = phaseLabel(key);
-              const summary =
-                phase?.message ||
-                (isTask && running && !structuredTask ? "Structuring…" : status === "idle" && running ? "Pending…" : undefined);
+        {showDeployPipeline ? (
+          <>
+            <p className="text-[10px] font-semibold uppercase tracking-wide text-white/40">Deploy &amp; verify</p>
+            {renderStepCards(deployStepKeys, phases, running, structuredTask)}
+          </>
+        ) : null}
 
-              return (
-                <ProgressCard
-                  key={key}
-                  title={label}
-                  status={status}
-                  summary={summary}
-                  defaultOpen={isTask && Boolean(structuredTask)}
-                  highlight={isTask || key === "exploration" || key === "ui_test"}
-                >
-                  {isTask && structuredTask ? (
-                    <div className="space-y-2">
-                      {structuredTask.summary ? <p className="text-white/85">{structuredTask.summary}</p> : null}
-                      {structuredTask.source_text ? (
-                        <p className="whitespace-pre-wrap text-white/65">{structuredTask.source_text}</p>
-                      ) : null}
-                      {(structuredTask.success_criteria?.length ?? 0) > 0 ? (
-                        <ul className="list-disc space-y-1 pl-4 text-white/70">
-                          {structuredTask.success_criteria!.map((c) => (
-                            <li key={c}>{c}</li>
-                          ))}
-                        </ul>
-                      ) : null}
-                      {(structuredTask.intent_gaps?.length ?? 0) > 0 ? (
-                        <ul className="list-disc space-y-1 pl-4 text-amber-200/90">
-                          {structuredTask.intent_gaps!.map((g) => (
-                            <li key={g}>{g}</li>
-                          ))}
-                        </ul>
-                      ) : null}
-                    </div>
-                  ) : undefined}
-                </ProgressCard>
-              );
-            })
-          : null}
+        {showFullPipeline ? renderStepCards(stepKeys, phases, running, structuredTask) : null}
 
         <ProgressCard
           title="Report"

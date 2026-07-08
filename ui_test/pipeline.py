@@ -23,6 +23,7 @@ from ui_test.nav_registry import load_nav_tree, nav_tree_delta
 from ui_test.page_registry import load_site_map, site_map_delta
 from ui_test.exploration_runner import run_exploration
 from ui_test.git_deploy import collect_git_deploy_state
+from ui_test.git_commit import auto_commit_if_needed
 from ui_test.railway_client import check_health, wait_for_deployments
 from ui_test.local_env import format_local_env_hint, local_env_status
 from ui_test.local_server import ensure_local_server, local_run_config, url_is_up, _all_targets_up
@@ -212,8 +213,39 @@ def run_ui_test_loop(
         phase_done(Phase.TASK, ok=True, message=structured_task.get("summary", "") if structured_task else "")
 
     phase_start(Phase.GIT, "Checking git state")
-    git = collect_git_deploy_state(project, do_push=do_push)
+    git = collect_git_deploy_state(project, do_push=False)
+    auto_commit_result = None
+    if git.has_uncommitted and do_push and target_mode == "deployed" and git.is_repo:
+        emit_log("Uncommitted changes — local agent will commit before push", phase=Phase.GIT.value)
+        ollama_cfg = config.get("ollama") if isinstance(config.get("ollama"), dict) else {}
+        commit_task_text = free_text
+        if structured_task:
+            commit_task_text = str(
+                structured_task.get("source_text") or structured_task.get("summary") or free_text
+            )
+        auto_commit_result = auto_commit_if_needed(
+            project,
+            task_text=commit_task_text,
+            changed_files=git.changed_files,
+            status=git.status,
+            ollama_url=ollama_url(config) if not no_ollama else "",
+            ollama_model=ollama_model(config) if not no_ollama else "",
+            timeout_sec=float(ollama_cfg.get("timeout_sec") or 60),
+        )
+        if auto_commit_result.ok:
+            emit_log(f"Committed: {auto_commit_result.subject}", phase=Phase.GIT.value)
+            git = collect_git_deploy_state(project, do_push=False)
+        else:
+            emit_log(f"Auto-commit failed: {auto_commit_result.error}", phase=Phase.GIT.value, level="error")
+
     git_payload = asdict(git)
+    if auto_commit_result:
+        git_payload["auto_commit"] = {
+            "attempted": auto_commit_result.attempted,
+            "ok": auto_commit_result.ok,
+            "subject": auto_commit_result.subject,
+            "error": auto_commit_result.error,
+        }
     emit_log(f"Git branch: {git.branch or '(n/a)'}, uncommitted: {git.has_uncommitted}", phase=Phase.GIT.value)
     if git.has_uncommitted and (skip_deploy or target_mode == "local"):
         phase_done(
@@ -228,7 +260,7 @@ def run_ui_test_loop(
     deploy_results: list[dict[str, Any]] = []
     health_results: list[dict[str, Any]] = []
 
-    token = env.get("RAILWAY_TOKEN") or ""
+    token = str(env.get("RAILWAY_TOKEN") or "").strip()
     if git.changed_files:
         affected = railway.services_for_paths(git.changed_files)
     else:
@@ -238,6 +270,8 @@ def run_ui_test_loop(
 
     if not skip_deploy:
         phase_start(Phase.DEPLOY, "Railway deploy")
+        if token:
+            emit_log("Using RAILWAY_TOKEN from project env (.agent/.env)", phase=Phase.DEPLOY.value)
         if git.has_uncommitted:
             emit_log("WARNING: Uncommitted changes — deploy may not include latest code", phase=Phase.DEPLOY.value)
         if git.unpushed_commits and not do_push:
@@ -246,13 +280,17 @@ def run_ui_test_loop(
                 phase=Phase.DEPLOY.value,
             )
 
+        deploy_ok = True
+        deploy_message = ""
         if do_push and git.is_repo:
             git = collect_git_deploy_state(project, do_push=True)
             git_payload = asdict(git)
             emit_log(git.push_message, phase=Phase.DEPLOY.value)
+            if git.push_attempted and not git.push_ok:
+                deploy_ok = False
+                deploy_message = git.push_message or "Git push failed"
 
-        deploy_ok = True
-        if token and git.is_repo and (do_push or git.unpushed_commits == 0):
+        if deploy_ok and token and git.is_repo and (do_push or git.unpushed_commits == 0):
             if not require_keys(env, ["RAILWAY_TOKEN"]) and affected:
                 emit_log(f"Waiting for Railway deploy ({len(affected)} service(s))...", phase=Phase.DEPLOY.value)
                 results = wait_for_deployments(
@@ -266,9 +304,15 @@ def run_ui_test_loop(
                 deploy_ok = all(r.ok for r in results)
                 for r in results:
                     emit_log(f"Deploy {r.service}: {r.status}", phase=Phase.DEPLOY.value)
+                if not deploy_ok:
+                    failed = [r for r in results if not r.ok]
+                    deploy_message = "; ".join(f"{r.service}: {r.status}" for r in failed[:3])
         elif not token:
-            emit_log("No RAILWAY_TOKEN — skipping deploy wait", phase=Phase.DEPLOY.value)
-        phase_done(Phase.DEPLOY, ok=deploy_ok)
+            emit_log(
+                "No RAILWAY_TOKEN in project .agent/.env (or cheatsheet env_files) — skipping deploy wait",
+                phase=Phase.DEPLOY.value,
+            )
+        phase_done(Phase.DEPLOY, ok=deploy_ok, message=deploy_message)
     else:
         emit_log("Deploy wait skipped", phase=Phase.DEPLOY.value)
 
@@ -570,7 +614,10 @@ def run_ui_test_loop(
         if not ui_ok and ui_run_payload.get("error"):
             cursor_steps.append(f"Fix UI failure: {ui_run_payload['error']}")
         if git.has_uncommitted and not skip_deploy:
-            cursor_steps.append("Commit and push changes so Railway can deploy them.")
+            if auto_commit_result and auto_commit_result.attempted and not auto_commit_result.ok:
+                cursor_steps.append(f"Auto-commit failed: {auto_commit_result.error}")
+            else:
+                cursor_steps.append("Commit and push changes so Railway can deploy them.")
         elif git.has_uncommitted and skip_deploy:
             emit_log("Git has uncommitted changes (ignored for local-only run)", phase=Phase.GIT.value)
         if structured_task and structured_task.get("notes_for_cursor"):

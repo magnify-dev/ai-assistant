@@ -1,3 +1,4 @@
+import "./sdk-bootstrap.js";
 import cors from "cors";
 import dotenv from "dotenv";
 import express from "express";
@@ -5,6 +6,9 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { buildReportPrompt, CursorRunner } from "./cursor-agent.js";
+import { CollaborationLoop } from "./collaboration-loop.js";
+import { readCollaborationConfig, writeCollaborationConfig } from "./collaboration-config.js";
+import { canResumeTranscript, readCollaborationTranscript } from "./collaboration-transcript.js";
 import { fetchOllamaStatus, preloadOllamaModel, readOllamaConfig } from "./ollama.js";
 import { defaultProjectPath, PythonRunner, REPO_ROOT } from "./python-runner.js";
 import {
@@ -19,6 +23,7 @@ import {
   type ProjectSettings,
 } from "./project-store.js";
 import { readLocalEnvStatus } from "./local-env.js";
+import { resolveRunTargetOptions } from "./run-target.js";
 import {
   artifactContentType,
   listRunHistory,
@@ -40,6 +45,7 @@ dotenv.config({ path: path.join(REPO_ROOT, "test-runner", ".env") });
 const PORT = Number(process.env.TEST_RUNNER_PORT || 8767);
 const pythonRunner = new PythonRunner();
 const cursorRunner = new CursorRunner();
+const collaborationLoop = new CollaborationLoop(pythonRunner, cursorRunner);
 
 type StoredEvent = Record<string, unknown>;
 const eventLog: StoredEvent[] = [];
@@ -74,6 +80,13 @@ function formatRunnerLogLine(event: StoredEvent): string {
   }
   if (type === "agent_decision") {
     return `[agent] ${String(event.action ?? "")}: ${String(event.reason ?? "")}`.trim();
+  }
+  if (type === "agent_card") {
+    const card = event.card as Record<string, unknown> | undefined;
+    return `[${card?.agent ?? "agent"}] ${card?.status ?? ""} ${card?.summary ?? ""}`.trim();
+  }
+  if (type === "collaboration_done") {
+    return `[collaboration] ok=${String(event.ok)} ${event.error ?? event.answer ?? ""}`.trim();
   }
   if (type === "process_exit") return `[process_exit] code=${String(event.code)}`;
   return JSON.stringify(event);
@@ -114,6 +127,9 @@ function resetRunStateForNewRun(project: string) {
     browserState: null,
     testTarget: null,
     lastResult: null,
+    agentCards: [],
+    collaborationActive: false,
+    collaborationResult: null,
   };
   pushEvent({ type: "run_cleared" });
 }
@@ -204,10 +220,36 @@ function pushEvent(event: StoredEvent) {
       ts: event.ts,
     };
   }
+  if (event.type === "agent_card" && event.card) {
+    const cards = Array.isArray(runState.agentCards) ? [...(runState.agentCards as StoredEvent[])] : [];
+    const card = event.card as Record<string, unknown>;
+    const idx = cards.findIndex((c) => c.id === card.id);
+    if (idx >= 0) {
+      cards[idx] = card;
+    } else {
+      cards.push(card);
+    }
+    runState.agentCards = cards;
+  }
+  if (event.type === "collaboration_start") {
+    runState.agentCards = [];
+    runState.collaborationActive = true;
+  }
+  if (event.type === "collaboration_done") {
+    runState.collaborationActive = false;
+    runState.running = false;
+    runState.collaborationResult = {
+      ok: event.ok,
+      answer: event.answer,
+      error: event.error,
+      iterations: event.iterations,
+    };
+  }
 }
 
 pythonRunner.on("event", pushEvent);
 cursorRunner.on("event", pushEvent);
+collaborationLoop.on("event", pushEvent);
 
 const app = express();
 app.use(cors());
@@ -505,6 +547,7 @@ app.get("/api/events", (req, res) => {
   const onEvent = (event: StoredEvent) => send(event);
   pythonRunner.on("event", onEvent);
   cursorRunner.on("event", onEvent);
+  collaborationLoop.on("event", onEvent);
 
   const heartbeat = setInterval(() => {
     if (res.writableEnded) return;
@@ -515,23 +558,23 @@ app.get("/api/events", (req, res) => {
     clearInterval(heartbeat);
     pythonRunner.off("event", onEvent);
     cursorRunner.off("event", onEvent);
+    collaborationLoop.off("event", onEvent);
   });
 });
 
 app.post("/api/run/local", (req, res) => {
-  if (pythonRunner.running) {
+  if (pythonRunner.running || collaborationLoop.isActive) {
     res.status(409).json({ error: "Local agent run already in progress" });
     return;
   }
   const {
     project,
     task = "",
-    push = false,
-    skipDeploy = false,
     skipStructure = false,
     skipUi = false,
     noOllama = false,
   } = req.body ?? {};
+  const target = resolveRunTargetOptions(req.body?.testTarget);
 
   if (!project || typeof project !== "string") {
     res.status(400).json({ error: "project is required" });
@@ -546,9 +589,9 @@ app.post("/api/run/local", (req, res) => {
     pythonRunner.start({
       project,
       task,
-      push,
-      skipDeploy,
-      testTarget: req.body?.testTarget === "deployed" ? "deployed" : "local",
+      push: target.push,
+      skipDeploy: target.skipDeploy,
+      testTarget: target.testTarget,
       skipStructure,
       skipUi,
       noOllama,
@@ -560,7 +603,7 @@ app.post("/api/run/local", (req, res) => {
 });
 
 app.post("/api/run/cursor", async (req, res) => {
-  if (cursorRunner.isRunning) {
+  if (cursorRunner.isRunning || collaborationLoop.isActive) {
     res.status(409).json({ error: "Cursor agent already running" });
     return;
   }
@@ -625,8 +668,137 @@ app.post("/api/run/cursor", async (req, res) => {
   res.json({ started: true, prompt: finalPrompt });
 });
 
+app.get("/api/collaboration/config", (_req, res) => {
+  res.json(readCollaborationConfig());
+});
+
+app.put("/api/collaboration/config", (req, res) => {
+  const { helperPrompt, helperModel, maxTestRetries, maxIterations } = req.body ?? {};
+  const updated = writeCollaborationConfig({
+    helperPrompt: typeof helperPrompt === "string" ? helperPrompt : readCollaborationConfig().helperPrompt,
+    helperModel: typeof helperModel === "string" ? helperModel : readCollaborationConfig().helperModel,
+    maxTestRetries: typeof maxTestRetries === "number" ? maxTestRetries : readCollaborationConfig().maxTestRetries,
+    maxIterations: typeof maxIterations === "number" ? maxIterations : readCollaborationConfig().maxIterations,
+  });
+  res.json(updated);
+});
+
+app.post("/api/run/collaborate", async (req, res) => {
+  if (pythonRunner.running || cursorRunner.isRunning || collaborationLoop.isActive) {
+    res.status(409).json({ error: "A run is already in progress" });
+    return;
+  }
+
+  const body = req.body ?? {};
+  const project = typeof body.project === "string" ? body.project : "";
+  if (!project) {
+    res.status(400).json({ error: "project is required" });
+    return;
+  }
+
+  eventLog.length = 0;
+  resetRunStateForNewRun(project);
+  initRunLogs(project);
+
+  const apiKey = process.env.CURSOR_API_KEY;
+  const target = resolveRunTargetOptions(body.testTarget);
+
+  void collaborationLoop
+    .run({
+      project,
+      task: body.task,
+      push: target.push,
+      skipDeploy: target.skipDeploy,
+      testTarget: target.testTarget,
+      skipStructure: body.skipStructure,
+      skipUi: body.skipUi,
+      noOllama: body.noOllama,
+      cursorRuntime: body.cursorRuntime === "local" ? "local" : "cloud",
+      repoUrl: body.repoUrl,
+      apiKey,
+    })
+    .then((result) => {
+      pushEvent({
+        type: "done",
+        overall_ok: result.ok,
+        error: result.error,
+        answer: result.answer,
+      });
+    })
+    .catch((err) => {
+      pushEvent({
+        type: "collaboration_done",
+        ok: false,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    });
+
+  res.json({ started: true });
+});
+
+app.post("/api/run/resume", async (req, res) => {
+  if (pythonRunner.running || cursorRunner.isRunning || collaborationLoop.isActive) {
+    res.status(409).json({ error: "A run is already in progress" });
+    return;
+  }
+
+  const body = req.body ?? {};
+  const project = typeof body.project === "string" ? body.project : "";
+  const runId = typeof body.runId === "string" ? body.runId : "";
+  if (!project || !runId) {
+    res.status(400).json({ error: "project and runId are required" });
+    return;
+  }
+
+  const transcript = readCollaborationTranscript(project, runId);
+  if (!transcript || !canResumeTranscript(transcript)) {
+    res.status(400).json({ error: "No resumable collaboration transcript for this run" });
+    return;
+  }
+
+  eventLog.length = 0;
+  resetRunStateForNewRun(project);
+  initRunLogs(project);
+
+  const apiKey = process.env.CURSOR_API_KEY;
+  const target = resolveRunTargetOptions(body.testTarget);
+
+  void collaborationLoop
+    .run({
+      project,
+      task: transcript.task,
+      push: target.push,
+      skipDeploy: target.skipDeploy,
+      testTarget: target.testTarget,
+      skipStructure: body.skipStructure,
+      skipUi: body.skipUi,
+      noOllama: body.noOllama,
+      cursorRuntime: body.cursorRuntime === "local" ? "local" : "cloud",
+      repoUrl: body.repoUrl,
+      apiKey,
+      resumeFrom: transcript,
+    })
+    .then((result) => {
+      pushEvent({
+        type: "done",
+        overall_ok: result.ok,
+        error: result.error,
+        answer: result.answer,
+      });
+    })
+    .catch((err) => {
+      pushEvent({
+        type: "collaboration_done",
+        ok: false,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    });
+
+  res.json({ started: true, resumedFrom: runId, task: transcript.task });
+});
+
 app.post("/api/run/full", async (req, res) => {
-  if (pythonRunner.running || cursorRunner.isRunning) {
+  if (pythonRunner.running || cursorRunner.isRunning || collaborationLoop.isActive) {
     res.status(409).json({ error: "A run is already in progress" });
     return;
   }
@@ -636,37 +808,63 @@ app.post("/api/run/full", async (req, res) => {
   eventLog.length = 0;
   resetRunStateForNewRun(project || "");
   initRunLogs(project || undefined);
+  const target = resolveRunTargetOptions(body.testTarget);
 
-  pythonRunner.once("event", (event) => {
-    if (event.type !== "done" && event.type !== "process_exit") return;
-    const apiKey = process.env.CURSOR_API_KEY;
-    if (!apiKey || body.skipCursor) return;
-    const project = body.project as string;
-    const reportRel = ".agent/current/REPORT.md";
-    void cursorRunner.run({
-      prompt: buildReportPrompt(reportRel),
-      cwd: project,
-      runtime: body.cursorRuntime === "local" ? "local" : "cloud",
-      repoUrl: body.repoUrl,
-      apiKey,
+  if (body.skipCursor) {
+    pythonRunner.once("event", (event) => {
+      if (event.type !== "done" && event.type !== "process_exit") return;
     });
-  });
+    try {
+      pythonRunner.start({
+        project: body.project,
+        task: body.task,
+        push: target.push,
+        skipDeploy: target.skipDeploy,
+        testTarget: target.testTarget,
+        skipStructure: body.skipStructure,
+        skipUi: body.skipUi,
+        noOllama: body.noOllama,
+      });
+      res.json({ started: true });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+    return;
+  }
 
-  try {
-    pythonRunner.start({
-      project: body.project,
+  const apiKey = process.env.CURSOR_API_KEY;
+
+  void collaborationLoop
+    .run({
+      project,
       task: body.task,
-      push: body.push,
-      skipDeploy: body.skipDeploy,
-      testTarget: body.testTarget === "deployed" ? "deployed" : "local",
+      push: target.push,
+      skipDeploy: target.skipDeploy,
+      testTarget: target.testTarget,
       skipStructure: body.skipStructure,
       skipUi: body.skipUi,
       noOllama: body.noOllama,
+      cursorRuntime: body.cursorRuntime === "local" ? "local" : "cloud",
+      repoUrl: body.repoUrl,
+      apiKey,
+    })
+    .then((result) => {
+      pushEvent({
+        type: "done",
+        overall_ok: result.ok,
+        error: result.error,
+        answer: result.answer,
+      });
+    })
+    .catch((err) => {
+      pushEvent({
+        type: "collaboration_done",
+        ok: false,
+        error: err instanceof Error ? err.message : String(err),
+      });
     });
-    res.json({ started: true });
-  } catch (err) {
-    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
-  }
+
+  res.json({ started: true });
 });
 
 const distDir = path.join(__dirname, "../dist");

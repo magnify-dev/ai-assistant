@@ -4,10 +4,12 @@ import type { RunHistoryEntry } from "@/lib/projectTypes";
 type Props = {
   runs: RunHistoryEntry[];
   loading?: boolean;
+  running?: boolean;
   onInspect: (runId: string) => void;
+  onResume?: (runId: string) => void;
 };
 
-export function RunHistoryPanel({ runs, loading, onInspect }: Props) {
+export function RunHistoryPanel({ runs, loading, running, onInspect, onResume }: Props) {
   if (loading) {
     return <p className="text-xs text-white/50">Loading run history…</p>;
   }
@@ -46,13 +48,25 @@ export function RunHistoryPanel({ runs, loading, onInspect }: Props) {
               <p className="truncate text-xs text-white/55">{run.summary}</p>
               {run.finalUrl ? <p className="truncate font-mono text-[10px] text-white/40">{run.finalUrl}</p> : null}
             </div>
-            <button
-              type="button"
-              onClick={() => onInspect(run.id)}
-              className="shrink-0 rounded border border-white/15 px-2 py-1 text-xs text-white/75 hover:bg-white/5"
-            >
-              Inspect
-            </button>
+            <div className="flex shrink-0 flex-col gap-1">
+              <button
+                type="button"
+                onClick={() => onInspect(run.id)}
+                className="rounded border border-white/15 px-2 py-1 text-xs text-white/75 hover:bg-white/5"
+              >
+                Inspect
+              </button>
+              {run.canResume && onResume ? (
+                <button
+                  type="button"
+                  disabled={running}
+                  onClick={() => onResume(run.id)}
+                  className="rounded border border-amber-500/30 px-2 py-1 text-xs text-amber-100 hover:bg-amber-950/30 disabled:opacity-50"
+                >
+                  Resume
+                </button>
+              ) : null}
+            </div>
           </li>
         ))}
       </ul>

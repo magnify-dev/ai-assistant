@@ -1,5 +1,5 @@
 import { ChevronDown, ChevronRight, Circle, Loader2, XCircle, CheckCircle2, AlertTriangle } from "lucide-react";
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 import { cn } from "@/lib/utils";
 
 export type ProgressStatus = "idle" | "running" | "done" | "failed" | "warning";
@@ -13,7 +13,7 @@ function StatusIcon({ status }: { status: ProgressStatus }) {
 }
 
 type Props = {
-  title: string;
+  title: ReactNode;
   status: ProgressStatus;
   summary?: string;
   children?: React.ReactNode;
@@ -50,7 +50,16 @@ export function ProgressCard({ title, status, summary, children, defaultOpen = f
         <StatusIcon status={status} />
         <div className="min-w-0 flex-1">
           <div className="text-sm font-medium text-white/90">{title}</div>
-          {summary ? <div className="mt-0.5 truncate text-xs text-white/55">{summary}</div> : null}
+          {summary ? (
+            <div
+              className={cn(
+                "mt-0.5 text-xs text-white/55",
+                status === "failed" ? "whitespace-pre-wrap break-words" : "truncate",
+              )}
+            >
+              {summary}
+            </div>
+          ) : null}
         </div>
         {expandable ? (
           open ? (

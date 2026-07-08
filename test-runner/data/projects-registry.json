@@ -6,17 +6,13 @@
       "id": "db173deb-348c-4113-80ae-e8c747b97647",
       "name": "content-manager",
       "path": "C:\\Users\\marce\\Documents\\Programming\\content-manager",
-      "lastUsed": "2026-07-08T17:14:05.714Z",
+      "lastUsed": "2026-07-08T19:44:01.710Z",
       "settings": {
-        "task": "Find the analitics for the channels and report to me which channel has the most views",
-        "push": false,
-        "skipDeploy": true,
-        "skipCursor": true,
+        "task": "Okay on the home page the 2 services we have displayed have diffrent lenghts of cards since the upload service is displaying Oauth issues, this should be fixed so that the cards are always the same lenght, and oAuth issues should appear somewhere else inside the card",
+        "skipCursor": false,
         "cursorRuntime": "local",
         "repoUrl": "",
-        "cursorPrompt": "",
-        "testTarget": "deployed",
-        "skipDeployWait": false
+        "testTarget": "deployed"
       }
     }
   ]

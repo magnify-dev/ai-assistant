@@ -66,6 +66,8 @@ export type LocalEnvStatus = {
   env_example_path: string;
   env_local_path: string;
   local_base_url?: string;
+  has_railway_token?: boolean;
+  railway_token_path?: string | null;
 };
 
 export type TestTarget = {
@@ -165,4 +167,5 @@ export type RunHistoryEntry = {
   generatedAt: string;
   hasSession: boolean;
   frameCount: number;
+  canResume?: boolean;
 };

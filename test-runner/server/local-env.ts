@@ -61,6 +61,20 @@ function parseRequiredEnv(cheatsheet: string): string[] {
   return ["DATABASE_URL"];
 }
 
+function findEnvKeySource(resolved: string, envFiles: string[], key: string): string | null {
+  const checked = new Set<string>();
+  for (const rel of [...envFiles, ".agent/.env", ".agent/.env.local"]) {
+    const norm = rel.replace(/\\/g, "/");
+    if (checked.has(norm)) continue;
+    checked.add(norm);
+    const filePath = path.isAbsolute(rel) ? rel : path.join(resolved, rel);
+    if (!fs.existsSync(filePath)) continue;
+    const parsed = parseEnvFile(fs.readFileSync(filePath, "utf8"));
+    if (String(parsed[key] ?? "").trim()) return norm;
+  }
+  return null;
+}
+
 export function readLocalEnvStatus(projectPath: string) {
   const resolved = path.resolve(projectPath);
   const agentDir = path.join(resolved, ".agent");
@@ -80,8 +94,13 @@ export function readLocalEnvStatus(projectPath: string) {
       Object.assign(merged, parseEnvFile(fs.readFileSync(filePath, "utf8")));
     }
   }
+  const agentEnvLocal = path.join(agentDir, ".env.local");
+  if (fs.existsSync(agentEnvLocal)) {
+    Object.assign(merged, parseEnvFile(fs.readFileSync(agentEnvLocal, "utf8")));
+  }
 
   const missing = required.filter((key) => !String(merged[key] ?? "").trim());
+  const railwayTokenPath = findEnvKeySource(resolved, envFiles, "RAILWAY_TOKEN");
   const primaryEnvAbs = path.isAbsolute(primaryEnv) ? primaryEnv : path.join(resolved, primaryEnv);
   const primaryExampleAbs = path.isAbsolute(primaryExample) ? primaryExample : path.join(resolved, primaryExample);
 
@@ -97,5 +116,7 @@ export function readLocalEnvStatus(projectPath: string) {
     env_example_path: primaryExample,
     env_local_path: primaryEnv,
     local_base_url: cheatsheet.match(/^\s*base_url:\s*(.+)$/m)?.[1]?.trim() ?? "",
+    has_railway_token: Boolean(String(merged.RAILWAY_TOKEN ?? "").trim()),
+    railway_token_path: railwayTokenPath,
   };
 }

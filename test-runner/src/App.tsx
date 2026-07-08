@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { CollaborationPanel } from "@/components/CollaborationPanel";
+import { CurrentRunStatus } from "@/components/CurrentRunStatus";
 import { CheatsheetPanel } from "@/components/CheatsheetPanel";
 import { ExplorationPanel } from "@/components/ExplorationPanel";
 import { PagePreview } from "@/components/PagePreview";
@@ -7,6 +9,7 @@ import { RunHistoryPanel } from "@/components/RunHistoryPanel";
 import { RunProgressPanel } from "@/components/RunProgressPanel";
 import { cn } from "@/lib/utils";
 import { apiFetch, eventsUrl } from "@/lib/api";
+import { runTargetOptions } from "@/lib/runTarget";
 import type {
   BrowserState,
   LocalEnvStatus,
@@ -17,20 +20,19 @@ import type {
   StructuredTask,
   TestTarget,
 } from "@/lib/projectTypes";
+import type { AgentRunCard, CollaborationConfig, CollaborationResult } from "@/lib/collaborationTypes";
 import type { PhaseMap, RunEvent } from "@/types";
+
+const BROWSER_PHASES = ["exploration", "ui_test"] as const;
 
 const SETTINGS_KEY = "test_runner_settings_v2";
 
 type StoredSettings = {
   project?: string;
   task?: string;
-  cursorPrompt?: string;
   repoUrl?: string;
   cursorRuntime?: "cloud" | "local";
-  push?: boolean;
-  skipDeploy?: boolean;
   testTarget?: "local" | "deployed";
-  skipDeployWait?: boolean;
   skipCursor?: boolean;
 };
 
@@ -77,6 +79,8 @@ function applyStateFromServer(
     testTarget?: TestTarget;
     structuredTask?: StructuredTask;
     runReport?: RunReport;
+    agentCards?: AgentRunCard[];
+    collaborationResult?: CollaborationResult | null;
   },
   setters: {
     setRunning: (v: boolean) => void;
@@ -88,6 +92,8 @@ function applyStateFromServer(
     setTestTarget?: (v: TestTarget | null) => void;
     setStructuredTask?: (v: StructuredTask | null) => void;
     setRunReport?: (v: RunReport | null) => void;
+    setAgentCards?: (v: AgentRunCard[]) => void;
+    setCollaborationResult?: (v: CollaborationResult | null) => void;
   },
 ) {
   if (typeof data.running === "boolean") setters.setRunning(data.running);
@@ -108,6 +114,12 @@ function applyStateFromServer(
   }
   if (data.runReport && setters.setRunReport) {
     setters.setRunReport(data.runReport as RunReport);
+  }
+  if (Array.isArray(data.agentCards) && setters.setAgentCards) {
+    setters.setAgentCards(data.agentCards as AgentRunCard[]);
+  }
+  if (data.collaborationResult !== undefined && setters.setCollaborationResult) {
+    setters.setCollaborationResult(data.collaborationResult as CollaborationResult | null);
   }
 }
 
@@ -137,6 +149,14 @@ function formatEventLine(event: RunEvent): string {
   if (event.type === "cursor_text" && event.text) {
     return `[cursor] ${event.text}`;
   }
+  if (event.type === "agent_card") {
+    const card = (event as { card?: AgentRunCard }).card;
+    return `[${card?.agent ?? "agent"}] ${card?.status ?? ""} ${card?.summary ?? ""}`.trim();
+  }
+  if (event.type === "collaboration_done") {
+    const e = event as { ok?: boolean; error?: string; answer?: string };
+    return `[collaboration] ok=${String(e.ok)} ${e.error ?? e.answer ?? ""}`.trim();
+  }
   if (event.type === "cursor") {
     return `[cursor] ${event.status ?? ""} ${event.message ?? ""}`.trim();
   }
@@ -163,12 +183,9 @@ export default function App() {
   const [config, setConfig] = useState<Config | null>(null);
   const [project, setProject] = useState("");
   const [task, setTask] = useState("");
-  const [cursorPrompt, setCursorPrompt] = useState("");
   const [repoUrl, setRepoUrl] = useState("");
   const [cursorRuntime, setCursorRuntime] = useState<"cloud" | "local">("cloud");
-  const [push, setPush] = useState(false);
   const [testTargetMode, setTestTargetMode] = useState<"local" | "deployed">("local");
-  const [skipDeployWait, setSkipDeployWait] = useState(false);
   const [skipCursor, setSkipCursor] = useState(false);
   const [running, setRunning] = useState(false);
   const [phases, setPhases] = useState<PhaseMap>({});
@@ -190,17 +207,17 @@ export default function App() {
   const [viewingRunId, setViewingRunId] = useState<string | null>(null);
   const [playwrightSession, setPlaywrightSession] = useState<PlaywrightSession | null>(null);
   const [sessionFrameIndex, setSessionFrameIndex] = useState(0);
+  const [agentCards, setAgentCards] = useState<AgentRunCard[]>([]);
+  const [collaborationResult, setCollaborationResult] = useState<CollaborationResult | null>(null);
+  const [collabConfig, setCollabConfig] = useState<CollaborationConfig | null>(null);
+  const [helperPromptDraft, setHelperPromptDraft] = useState("");
+  const [savingCollabConfig, setSavingCollabConfig] = useState(false);
+  const [projectEnv, setProjectEnv] = useState<LocalEnvStatus | null>(null);
   const logRef = useRef<HTMLPreElement>(null);
   const runningRef = useRef(running);
   runningRef.current = running;
 
-  const runApiOptions = useMemo(
-    () => ({
-      testTarget: testTargetMode,
-      skipDeploy: testTargetMode === "local" ? true : !skipDeployWait,
-    }),
-    [testTargetMode, skipDeployWait],
-  );
+  const runApiOptions = useMemo(() => runTargetOptions(testTargetMode), [testTargetMode]);
 
   const clearRunPanels = useCallback(() => {
     setEvents([]);
@@ -215,21 +232,20 @@ export default function App() {
     setViewingRunId(null);
     setPlaywrightSession(null);
     setSessionFrameIndex(0);
+    setAgentCards([]);
+    setCollaborationResult(null);
   }, []);
 
   const persistSettings = useCallback(() => {
     saveStoredSettings({
       project,
       task,
-      cursorPrompt,
       repoUrl,
       cursorRuntime,
-      push,
       testTarget: testTargetMode,
-      skipDeployWait,
       skipCursor,
     });
-  }, [project, task, cursorPrompt, repoUrl, cursorRuntime, push, testTargetMode, skipDeployWait, skipCursor]);
+  }, [project, task, repoUrl, cursorRuntime, testTargetMode, skipCursor]);
 
   const saveProjectToRegistry = useCallback(async () => {
     if (!project.trim()) return;
@@ -239,23 +255,19 @@ export default function App() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         path: project,
-        settings: { task, push, testTarget: testTargetMode, skipDeployWait, skipCursor, cursorRuntime, repoUrl, cursorPrompt },
+        settings: { task, testTarget: testTargetMode, skipCursor, cursorRuntime, repoUrl },
       }),
     });
-  }, [project, task, push, testTargetMode, skipDeployWait, skipCursor, cursorRuntime, repoUrl, cursorPrompt, persistSettings]);
+  }, [project, task, testTargetMode, skipCursor, cursorRuntime, repoUrl, persistSettings]);
 
   const applyProjectSettings = useCallback((settings?: ProjectsRegistry["projects"][0]["settings"]) => {
     if (!settings) return;
     if (settings.task !== undefined) setTask(settings.task);
-    if (settings.push !== undefined) setPush(settings.push);
     if (settings.testTarget) setTestTargetMode(settings.testTarget);
     else if (settings.skipDeploy !== undefined) setTestTargetMode(settings.skipDeploy ? "local" : "deployed");
-    if (settings.skipDeployWait !== undefined) setSkipDeployWait(settings.skipDeployWait);
-    else if (settings.skipDeploy === false) setSkipDeployWait(true);
     if (settings.skipCursor !== undefined) setSkipCursor(settings.skipCursor);
     if (settings.cursorRuntime) setCursorRuntime(settings.cursorRuntime);
     if (settings.repoUrl !== undefined) setRepoUrl(settings.repoUrl);
-    if (settings.cursorPrompt !== undefined) setCursorPrompt(settings.cursorPrompt);
   }, []);
 
   const refreshConfig = useCallback(() => {
@@ -282,6 +294,8 @@ export default function App() {
           setTestTarget,
           setStructuredTask,
           setRunReport,
+          setAgentCards,
+          setCollaborationResult,
         });
       })
       .catch(() => {});
@@ -357,15 +371,19 @@ export default function App() {
         if (data.ollama) setOllamaStatus(data.ollama);
         setProject(stored.project || data.defaultProject || "");
         if (stored.task) setTask(stored.task);
-        if (stored.cursorPrompt) setCursorPrompt(stored.cursorPrompt);
         if (stored.repoUrl) setRepoUrl(stored.repoUrl);
         if (stored.cursorRuntime) setCursorRuntime(stored.cursorRuntime);
-        if (stored.push !== undefined) setPush(stored.push);
         if (stored.testTarget) setTestTargetMode(stored.testTarget);
         else if (stored.skipDeploy !== undefined) setTestTargetMode(stored.skipDeploy ? "local" : "deployed");
-        if (stored.skipDeployWait !== undefined) setSkipDeployWait(stored.skipDeployWait);
-        else if (stored.skipDeploy === false) setSkipDeployWait(true);
         if (stored.skipCursor !== undefined) setSkipCursor(stored.skipCursor);
+      })
+      .catch(() => {});
+
+    apiFetch("/api/collaboration/config")
+      .then((r) => r.json())
+      .then((data: CollaborationConfig) => {
+        setCollabConfig(data);
+        setHelperPromptDraft(data.helperPrompt);
       })
       .catch(() => {});
 
@@ -382,6 +400,17 @@ export default function App() {
 
     refreshState();
   }, [refreshState, applyProjectSettings]);
+
+  useEffect(() => {
+    if (!project.trim()) {
+      setProjectEnv(null);
+      return;
+    }
+    apiFetch(`/api/project/local-env?path=${encodeURIComponent(project)}`)
+      .then((r) => r.json())
+      .then((data: LocalEnvStatus) => setProjectEnv(data))
+      .catch(() => setProjectEnv(null));
+  }, [project]);
 
   useEffect(() => {
     if (logRef.current) {
@@ -445,6 +474,38 @@ export default function App() {
     if (event.type === "site_map" || event.type === "nav_tree" || event.type === "agent_decision") {
       window.dispatchEvent(new CustomEvent("test-runner-event", { detail: event }));
     }
+    if (event.type === "agent_card" && (event as { card?: AgentRunCard }).card) {
+      const card = (event as { card: AgentRunCard }).card;
+      setAgentCards((prev) => {
+        const idx = prev.findIndex((c) => c.id === card.id);
+        if (idx >= 0) {
+          const next = [...prev];
+          next[idx] = card;
+          return next;
+        }
+        return [...prev, card];
+      });
+    }
+    if (event.type === "collaboration_start") {
+      const resumed = Boolean((event as { resumed?: boolean }).resumed);
+      if (!resumed) {
+        setAgentCards([]);
+      }
+      setCollaborationResult(null);
+    }
+    if (event.type === "phases_reset") {
+      setPhases({});
+      setStructuredTask(null);
+      setRunReport(null);
+      setTestTarget(null);
+      setLastResult(null);
+    }
+    if (event.type === "collaboration_done") {
+      const e = event as { ok?: boolean; answer?: string; error?: string; iterations?: number };
+      setCollaborationResult({ ok: e.ok, answer: e.answer, error: e.error, iterations: e.iterations });
+      setRunning(false);
+      loadRunHistory();
+    }
     if (event.type === "run_cleared") {
       setStructuredTask(null);
       setRunReport(null);
@@ -457,6 +518,8 @@ export default function App() {
       setViewingRunId(null);
       setPlaywrightSession(null);
       setSessionFrameIndex(0);
+      setAgentCards([]);
+      setCollaborationResult(null);
     }
     if (event.type === "done") {
       setRunning(false);
@@ -527,6 +590,11 @@ export default function App() {
           pageReport?: string;
           structuredTask?: StructuredTask;
           playwrightSession?: PlaywrightSession | null;
+          collaborationTranscript?: {
+            task?: string;
+            agentCards?: AgentRunCard[];
+            collaborationResult?: CollaborationResult;
+          } | null;
         };
         if (!data.report) return;
         const report = { ...data.report };
@@ -583,6 +651,15 @@ export default function App() {
           }
         }
         setPhases(phaseMap);
+        if (data.collaborationTranscript?.agentCards?.length) {
+          setAgentCards(
+            data.collaborationTranscript.agentCards.map((c) => ({ ...c, historical: true })),
+          );
+          setCollaborationResult(data.collaborationTranscript.collaborationResult ?? null);
+        } else {
+          setAgentCards([]);
+          setCollaborationResult(null);
+        }
         setView("run");
       } catch {
         /* ignore */
@@ -590,6 +667,68 @@ export default function App() {
     },
     [project],
   );
+
+  const resumeFromRun = useCallback(
+    async (runId: string) => {
+      if (!project.trim() || running) return;
+      persistSettings();
+      void saveProjectToRegistry();
+      clearRunPanels();
+      setView("run");
+      setRunning(true);
+      setViewingRunId(null);
+      refreshState();
+      const res = await apiFetch("/api/run/resume", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          project,
+          runId,
+          ...runApiOptions,
+          cursorRuntime,
+          repoUrl: repoUrl || undefined,
+        }),
+      });
+      if (!res.ok) {
+        const err = await res.json();
+        applyEvent({ type: "log", message: err.error ?? "Failed to resume run", level: "error" });
+        setRunning(false);
+      }
+    },
+    [
+      project,
+      running,
+      persistSettings,
+      saveProjectToRegistry,
+      clearRunPanels,
+      refreshState,
+      runApiOptions,
+      cursorRuntime,
+      repoUrl,
+      applyEvent,
+    ],
+  );
+
+  const saveCollabConfig = async () => {
+    setSavingCollabConfig(true);
+    try {
+      const res = await apiFetch("/api/collaboration/config", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          helperPrompt: helperPromptDraft,
+          helperModel: collabConfig?.helperModel ?? "composer-2.5",
+          maxTestRetries: collabConfig?.maxTestRetries ?? 3,
+          maxIterations: collabConfig?.maxIterations ?? 10,
+        }),
+      });
+      const data = (await res.json()) as CollaborationConfig;
+      setCollabConfig(data);
+      setHelperPromptDraft(data.helperPrompt);
+    } finally {
+      setSavingCollabConfig(false);
+    }
+  };
 
   const logLines = useMemo(() => events.map(formatEventLine).filter(Boolean), [events]);
 
@@ -607,7 +746,6 @@ export default function App() {
       body: JSON.stringify({
         project,
         task,
-        push,
         ...runApiOptions,
         skipCursor,
         cursorRuntime,
@@ -632,7 +770,7 @@ export default function App() {
     const res = await apiFetch("/api/run/local", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ project, task, push, ...runApiOptions }),
+      body: JSON.stringify({ project, task, ...runApiOptions }),
     });
     if (!res.ok) {
       const err = await res.json();
@@ -649,10 +787,9 @@ export default function App() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         project,
-        prompt: cursorPrompt,
         runtime: cursorRuntime,
         repoUrl: repoUrl || undefined,
-        useReport: !cursorPrompt.trim(),
+        useReport: true,
       }),
     });
     if (!res.ok) {
@@ -670,6 +807,23 @@ export default function App() {
 
   const replayMode = Boolean(playwrightSession?.frames?.length) && !running;
   const viewingRunLabel = runHistory.find((run) => run.id === viewingRunId)?.label;
+  const viewingRunCanResume = Boolean(
+    viewingRunId && runHistory.find((run) => run.id === viewingRunId)?.canResume && !running,
+  );
+
+  const hasCollaboration = agentCards.length > 0 || Boolean(collaborationResult) || (running && !skipCursor);
+
+  const pipelineUiActive = useMemo(
+    () =>
+      running &&
+      BROWSER_PHASES.some((key) => {
+        const phase = phases[key as keyof PhaseMap];
+        return phase?.status === "running";
+      }),
+    [running, phases],
+  );
+
+  const showLiveSession = replayMode || pipelineUiActive;
 
   return (
     <div className="mx-auto max-w-7xl px-4 py-8">
@@ -677,7 +831,7 @@ export default function App() {
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">AI Assistant Test Runner</h1>
           <p className="mt-1 text-sm text-white/60">
-            Local agent (Ollama → Railway → Playwright) then Cursor SDK handoff
+            Local agent tests the app, helper agent (Cursor) implements — they collaborate until the task is done
           </p>
         </div>
         {view === "run" ? (
@@ -686,6 +840,15 @@ export default function App() {
               <span className="rounded-full bg-violet-500/15 px-2 py-0.5 text-xs text-violet-100">
                 Inspecting: {viewingRunLabel ?? viewingRunId}
               </span>
+            ) : null}
+            {viewingRunCanResume ? (
+              <button
+                type="button"
+                onClick={() => viewingRunId && void resumeFromRun(viewingRunId)}
+                className="rounded-md border border-amber-500/35 bg-amber-950/25 px-3 py-1.5 text-sm text-amber-100 hover:bg-amber-950/40"
+              >
+                Resume from failure
+              </button>
             ) : null}
             <button
               type="button"
@@ -738,7 +901,7 @@ export default function App() {
                 checked={testTargetMode === "local"}
                 onChange={() => setTestTargetMode("local")}
               />
-              Local dev (cheatsheet — starts or reuses local server)
+              Local dev (cheatsheet — no git push or Railway wait)
             </label>
             <label className="flex cursor-pointer items-center gap-2 text-white/80">
               <input
@@ -747,27 +910,69 @@ export default function App() {
                 checked={testTargetMode === "deployed"}
                 onChange={() => setTestTargetMode("deployed")}
               />
-              Deployed (Railway production URL)
+              <span>
+                Deployed (Railway — git push, wait for deploy, then test)
+              </span>
             </label>
           </div>
-          {testTargetMode === "deployed" ? (
-            <label className="flex items-center gap-2 text-sm text-white/70">
-              <input
-                type="checkbox"
-                checked={skipDeployWait}
-                onChange={(e) => setSkipDeployWait(e.target.checked)}
-              />
-              Wait for Railway deploy before testing
-            </label>
+          {testTargetMode === "deployed" && projectEnv ? (
+            <div
+              className={cn(
+                "rounded-md border px-3 py-2 text-xs",
+                projectEnv.has_railway_token
+                  ? "border-green-500/30 bg-green-950/20 text-green-200"
+                  : "border-amber-500/30 bg-amber-950/20 text-amber-200",
+              )}
+            >
+              {projectEnv.has_railway_token ? (
+                <p>
+                  Railway token found in{" "}
+                  <code className="text-white/90">{projectEnv.railway_token_path ?? ".agent/.env"}</code>
+                  {" "}— deploy wait uses the project env.
+                </p>
+              ) : (
+                <p>
+                  No <code className="text-white/90">RAILWAY_TOKEN</code> in project{" "}
+                  <code className="text-white/90">.agent/.env</code>. Add it to wait for Railway deploys.
+                </p>
+              )}
+            </div>
           ) : null}
           <label className="flex items-center gap-2 text-sm text-white/70">
-            <input type="checkbox" checked={push} onChange={(e) => setPush(e.target.checked)} />
-            Git push before deploy wait
-          </label>
-          <label className="flex items-center gap-2 text-sm text-white/70">
             <input type="checkbox" checked={skipCursor} onChange={(e) => setSkipCursor(e.target.checked)} />
-            Skip Cursor step after local run
+            Skip helper agent (Cursor)
           </label>
+          {!skipCursor ? (
+            <div className="space-y-2 rounded-md border border-white/10 bg-black/20 p-3">
+              {!config?.hasCursorApiKey ? (
+                <p className="text-xs text-amber-300/90">
+                  Set <code className="text-white/80">CURSOR_API_KEY</code> in ai-assistant/.env
+                </p>
+              ) : null}
+              <label className="block text-xs text-white/60">Helper runtime</label>
+              <select
+                className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm"
+                value={cursorRuntime}
+                onChange={(e) => setCursorRuntime(e.target.value as "cloud" | "local")}
+              >
+                <option value="cloud">Cloud — visible in Cursor Agents sidebar</option>
+                <option value="local">Local — SDK bridge on this machine</option>
+              </select>
+              {cursorRuntime === "cloud" ? (
+                <>
+                  <label className="block text-xs text-white/60">Git repo URL (for cloud agent)</label>
+                  <input
+                    className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm"
+                    value={repoUrl}
+                    onChange={(e) => setRepoUrl(e.target.value)}
+                    placeholder="https://github.com/you/content-manager"
+                  />
+                </>
+              ) : null}
+            </div>
+          ) : (
+            <p className="text-xs text-white/45">Collaboration loop runs local agent only — no helper handoffs.</p>
+          )}
 
           <hr className="border-white/10" />
           <h3 className="text-sm font-semibold text-white/70">Ollama</h3>
@@ -806,43 +1011,47 @@ export default function App() {
             </div>
           ) : null}
 
-          <hr className="border-white/10" />
-          <h3 className="text-sm font-semibold text-white/70">Cursor SDK</h3>
-          {!config?.hasCursorApiKey ? (
-            <p className="text-xs text-amber-300/90">
-              Set <code className="text-white/80">CURSOR_API_KEY</code> in ai-assistant/.env
-            </p>
+          {!skipCursor ? (
+            <details className="rounded-md border border-white/10 bg-black/20 text-sm">
+              <summary className="cursor-pointer px-3 py-2.5 text-sm font-medium text-white/70">
+                Helper agent context
+                <span className="ml-2 text-xs font-normal text-white/45">
+                  {collabConfig?.helperModel ?? "composer-2.5"}
+                  {helperPromptDraft !== (collabConfig?.helperPrompt ?? "") ? " · unsaved" : ""}
+                </span>
+              </summary>
+              <div className="space-y-3 border-t border-white/10 px-3 py-3">
+                <p className="text-xs text-white/50">
+                  Prepended to every helper prompt. The helper implements code, then requests UI checks via{" "}
+                  <code className="text-white/70">### UI verification request</code> — the local agent runs those
+                  and returns answer + report. Max {collabConfig?.maxTestRetries ?? 3} failed verification retries.
+                </p>
+                <textarea
+                  className="min-h-32 w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 font-mono text-xs leading-relaxed"
+                  value={helperPromptDraft}
+                  onChange={(e) => setHelperPromptDraft(e.target.value)}
+                  placeholder="Explain to the helper agent how the collaboration works…"
+                />
+                <button
+                  type="button"
+                  disabled={savingCollabConfig}
+                  onClick={() => void saveCollabConfig()}
+                  className="rounded-md border border-white/20 px-3 py-1.5 text-xs text-white/90 disabled:opacity-50"
+                >
+                  {savingCollabConfig ? "Saving…" : "Save helper context"}
+                </button>
+              </div>
+            </details>
           ) : null}
-          <label className="block text-xs text-white/60">Runtime</label>
-          <select
-            className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm"
-            value={cursorRuntime}
-            onChange={(e) => setCursorRuntime(e.target.value as "cloud" | "local")}
-          >
-            <option value="cloud">Cloud — visible in Cursor Agents sidebar</option>
-            <option value="local">Local — SDK bridge on this machine</option>
-          </select>
-          {cursorRuntime === "cloud" ? (
-            <>
-              <label className="block text-xs text-white/60">Git repo URL (for cloud agent)</label>
-              <input
-                className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm"
-                value={repoUrl}
-                onChange={(e) => setRepoUrl(e.target.value)}
-                placeholder="https://github.com/you/content-manager"
-              />
-            </>
-          ) : null}
-          <label className="block text-xs text-white/60">Cursor prompt (optional — uses REPORT.md if empty)</label>
-          <textarea
-            className="min-h-20 w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm"
-            value={cursorPrompt}
-            onChange={(e) => setCursorPrompt(e.target.value)}
-            placeholder="Read .agent/current/REPORT.md and implement…"
-          />
 
           <hr className="border-white/10" />
-          <RunHistoryPanel runs={runHistory} loading={historyLoading} onInspect={(runId) => void viewRun(runId)} />
+          <RunHistoryPanel
+            runs={runHistory}
+            loading={historyLoading}
+            running={running}
+            onInspect={(runId) => void viewRun(runId)}
+            onResume={(runId) => void resumeFromRun(runId)}
+          />
 
           <div className="flex flex-col gap-2 pt-2">
             <button
@@ -854,8 +1063,11 @@ export default function App() {
                 running && "opacity-50",
               )}
             >
-              Run full loop
+              Run collaboration loop
             </button>
+            <p className="text-center text-[10px] text-white/40">
+              Triage → hand off or test → verify on live UI (max 3 failures)
+            </p>
             <button
               type="button"
               disabled={running}
@@ -866,9 +1078,9 @@ export default function App() {
             </button>
             <button
               type="button"
-              disabled={running || !config?.hasCursorApiKey}
+              disabled={running || !config?.hasCursorApiKey || skipCursor}
               onClick={startCursorOnly}
-              className="rounded-md border border-violet-400/30 px-4 py-2 text-sm text-violet-100"
+              className="rounded-md border border-violet-400/30 px-4 py-2 text-sm text-violet-100 disabled:opacity-50"
             >
               Cursor agent only
             </button>
@@ -884,12 +1096,52 @@ export default function App() {
         </section>
       ) : (
         <div className="flex min-h-[calc(100vh-10rem)] flex-col gap-4">
-          <div className="grid min-h-0 flex-1 gap-4 lg:grid-cols-[1fr_340px] xl:grid-cols-[1fr_380px]">
-            <section className="surface-card flex min-h-[480px] flex-col p-4 lg:min-h-0">
+          {running ? (
+            <CurrentRunStatus
+              phases={phases}
+              agentCards={agentCards}
+              running={running}
+              showPipelineStrip={hasCollaboration}
+              testTargetMode={testTargetMode}
+              skipDeploy={runApiOptions.skipDeploy}
+            />
+          ) : null}
+
+          {showLiveSession ? (
+            <section className="surface-card shrink-0 p-4">
               <h2 className="mb-3 text-sm font-semibold uppercase tracking-wide text-white/50">
-                {replayMode ? "Recorded session" : "Live page"}
+                {replayMode ? "Recorded session" : "Live page — agent testing"}
               </h2>
-              <div className="min-h-0 flex-1">
+              <PagePreview
+                state={replayMode ? null : browserState}
+                session={playwrightSession}
+                frameIndex={sessionFrameIndex}
+                onFrameIndexChange={setSessionFrameIndex}
+                lastAction={lastActionLine}
+                replayMode={replayMode}
+              />
+            </section>
+          ) : null}
+
+          <div
+            className={cn(
+              "grid min-h-0 flex-1 items-start gap-4",
+              hasCollaboration || showLiveSession ? "lg:grid-cols-[1fr_340px] xl:grid-cols-[1fr_380px]" : "lg:grid-cols-1",
+            )}
+          >
+            {hasCollaboration ? (
+              <section className="surface-card flex min-h-[min(480px,60vh)] flex-col p-4">
+                <CollaborationPanel
+                  agentCards={agentCards}
+                  collaborationResult={collaborationResult}
+                  running={running}
+                />
+              </section>
+            ) : (
+              <section className="surface-card p-4">
+                <h2 className="mb-3 text-sm font-semibold uppercase tracking-wide text-white/50">
+                  {replayMode ? "Recorded session" : "Live page"}
+                </h2>
                 <PagePreview
                   state={replayMode ? null : browserState}
                   session={playwrightSession}
@@ -898,9 +1150,10 @@ export default function App() {
                   lastAction={lastActionLine}
                   replayMode={replayMode}
                 />
-              </div>
-            </section>
-            <section className="surface-card flex min-h-[480px] flex-col p-4 lg:min-h-0">
+              </section>
+            )}
+
+            <section className="surface-card flex max-h-[calc(100vh-10rem)] flex-col p-4 lg:sticky lg:top-4">
               <RunProgressPanel
                 phases={phases}
                 structuredTask={structuredTask}
@@ -913,6 +1166,9 @@ export default function App() {
                 skipDeploy={runApiOptions.skipDeploy}
                 hasTask={Boolean(task.trim())}
                 skipCursor={skipCursor}
+                agentCards={agentCards}
+                collaborationResult={collaborationResult}
+                hideCollaboration={hasCollaboration}
               />
             </section>
           </div>
