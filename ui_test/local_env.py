@@ -53,7 +53,7 @@ def _primary_env_file(env_files: tuple[str, ...]) -> str:
     app_files = [f for f in normalized if ".agent/" not in f]
     if app_files:
         return app_files[-1]
-    return normalized[-1] if normalized else f"{AGENT_DIR}/{ENV_FILE}"
+    return normalized[-1] if normalized else f".agent/{ENV_FILE}"
 
 
 def local_env_status(project: Path) -> dict[str, Any]:

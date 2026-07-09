@@ -23,19 +23,24 @@ def _parse_step_line(line: str) -> dict[str, Any]:
     return {"ok": ok, "line": line, "action": "", "target": "", "page_url": ""}
 
 
-def _report_has_content(page_report: str, page_findings: dict[str, Any] | None) -> bool:
-    if page_findings:
-        if page_findings.get("empty_message"):
-            return True
-        for key in ("tables", "metrics", "lists", "sections"):
-            val = page_findings.get(key)
-            if isinstance(val, list) and val:
-                return True
-    if not page_report.strip():
-        return False
-    lower = page_report.lower()
-    markers = ("## metrics", "## table", "## lists", "## sections", "## empty state", "## visible page text")
-    return any(m in lower for m in markers)
+_AUTH_TARGET_MARKERS = ("sign in", "log in", "#email", "#password", "login")
+
+_INTERACTION_CRITERION_WORDS = ("click", "press", "escape", "modal", "dialog", "dismiss", "toggle", "drag", "hover")
+
+
+def _non_auth_interaction_executed(executed: list[dict[str, Any]]) -> bool:
+    """True if at least one successful click/press/fill step beyond the login flow ran."""
+    for e in executed:
+        if not e.get("ok"):
+            continue
+        action = str(e.get("action") or "").lower()
+        if action not in ("click", "press", "fill"):
+            continue
+        target = str(e.get("target") or "").lower()
+        if any(marker in target for marker in _AUTH_TARGET_MARKERS):
+            continue
+        return True
+    return False
 
 
 def _evaluate_criteria(
@@ -43,77 +48,36 @@ def _evaluate_criteria(
     *,
     overall_ok: bool,
     ui_passed: bool,
-    ui_error: str,
-    final_url: str,
     executed: list[dict[str, Any]],
     exploration_evaluation: dict[str, Any] | None = None,
-    page_report: str = "",
-    page_findings: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     if exploration_evaluation and exploration_evaluation.get("criteria_results"):
         results = list(exploration_evaluation["criteria_results"])
+        interacted = _non_auth_interaction_executed(executed)
         for row in results:
             criterion = str(row.get("criterion") or "")
             lower = criterion.lower()
-            if "report" in lower and ("write" in lower or "produce" in lower or "detail" in lower or "present" in lower):
-                has_content = _report_has_content(page_report, page_findings)
-                row["met"] = has_content and ui_passed
+            # Guard against hallucinated PASSes: an interaction criterion cannot
+            # be met when the run never executed any interaction step.
+            if (
+                row.get("met")
+                and not interacted
+                and any(w in lower for w in _INTERACTION_CRITERION_WORDS)
+            ):
+                row["met"] = False
                 row["note"] = (
-                    "Report captured visible page content"
-                    if has_content
-                    else "Report missing grounded page content"
-                )
-            elif "account" in lower and ("report" in lower or "detail" in lower or "present" in lower):
-                has_content = _report_has_content(page_report, page_findings)
-                tables = (page_findings or {}).get("tables") or []
-                row_count = sum(len(t.get("rows") or []) for t in tables if isinstance(t, dict))
-                row["met"] = has_content and ui_passed
-                row["note"] = (
-                    f"Report includes page data ({row_count} table row(s))"
-                    if has_content and row_count
-                    else (
-                        "Report documents empty or text-only page state"
-                        if has_content
-                        else "Report missing page content"
-                    )
+                    "Not verified — no click/press/fill step beyond login was executed in this run"
                 )
         return results
 
-    results: list[dict[str, Any]] = []
-    login_ok = any(e.get("ok") and e.get("action") == "click" and "Sign in" in str(e.get("target", "")) for e in executed)
-    for criterion in criteria:
-        text = str(criterion).strip()
-        lower = text.lower()
-        met: bool | None = None
-        note = ""
-        if "log in" in lower or "logged in" in lower or "login" in lower:
-            met = login_ok and ui_passed
-            note = "Login steps in UI test" if met else (ui_error or "Login step failed")
-        elif "redirect" in lower or "home" in lower or "page" in lower or "display" in lower:
-            met = ui_passed and bool(final_url) and "/login" not in final_url
-            note = f"Final URL: {final_url or '(none)'}"
-        elif "group" in lower:
-            met = ui_passed and "group" in final_url.lower()
-            note = f"Final URL: {final_url or '(none)'}"
-        elif "report" in lower and ("write" in lower or "produce" in lower):
-            has_content = _report_has_content(page_report, page_findings)
-            met = has_content and ui_passed
-            note = "Report captured visible page content" if has_content else "Report missing grounded content"
-        elif "account" in lower and ("report" in lower or "detail" in lower or "present" in lower):
-            has_content = _report_has_content(page_report, page_findings)
-            tables = (page_findings or {}).get("tables") or []
-            row_count = sum(len(t.get("rows") or []) for t in tables if isinstance(t, dict))
-            met = has_content and ui_passed
-            note = (
-                f"Report includes page data ({row_count} table row(s))"
-                if has_content and row_count
-                else ("Report documents page state" if has_content else "Report missing page content")
-            )
-        else:
-            met = overall_ok if ui_passed else False
-            note = "Inferred from overall run result"
-        results.append({"criterion": text, "met": met, "note": note})
-    return results
+    return [
+        {
+            "criterion": str(criterion).strip(),
+            "met": overall_ok if ui_passed else False,
+            "note": "Inferred from overall run result",
+        }
+        for criterion in criteria
+    ]
 
 
 def _extract_answer(page_report: str) -> str:
@@ -191,12 +155,8 @@ def build_run_report(payload: dict[str, Any]) -> dict[str, Any]:
         criteria,
         overall_ok=overall_ok,
         ui_passed=bool(ui_run.get("passed")),
-        ui_error=str(ui_run.get("error") or ""),
-        final_url=str(ui_run.get("final_url") or ""),
         executed=executed,
         exploration_evaluation=exploration_eval,
-        page_report=page_report,
-        page_findings=page_findings,
     )
 
     phases: list[dict[str, Any]] = []

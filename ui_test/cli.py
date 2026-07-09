@@ -15,7 +15,7 @@ from ui_test.project_setup import ensure_project_setup
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ui_test",
-        description="UI test loop: Railway deploy → structure → Playwright → REPORT.md",
+        description="UI test loop: Railway deploy -> structure -> Playwright -> REPORT.md",
     )
     parser.add_argument("--project", help="Target project root (e.g. content-manager)")
     parser.add_argument("--task", help="Free-text test task")
@@ -32,7 +32,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-structure-block", action="store_true", help="Run UI even when test_ids missing")
     parser.add_argument("--no-ollama", action="store_true", help="Skip Ollama task structuring")
     parser.add_argument("--headed", action="store_true", help="Show browser window")
-    parser.add_argument("--serve", action="store_true", help="Start web UI only")
     parser.add_argument("--init-project", action="store_true", help="Scaffold .agent/ and update .gitignore on target project, then exit")
     parser.add_argument("--emit-events", action="store_true", help="Emit NDJSON events on stdout for the test-runner UI")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -59,11 +58,6 @@ def main(argv: list[str] | None = None) -> int:
         format="%(levelname)s: %(message)s",
     )
     configure_events(emit_json=args.emit_events)
-
-    if args.serve:
-        print("Use .\\run-test-runner.ps1 for the React UI (pnpm dev on :5175).")
-        print("Legacy FastAPI UI removed — engine still works via CLI.")
-        return 0
 
     project = _resolve_project(args.project)
     if not project.is_dir():

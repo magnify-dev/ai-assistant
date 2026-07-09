@@ -153,12 +153,14 @@ function pushEvent(event: StoredEvent) {
   if (event.type === "run_state") {
     runState.running = event.running;
   }
+  // During a collaboration run the python pipeline emits its own done/process_exit
+  // mid-loop — the run is only over when the collaboration loop says so.
   if (event.type === "done") {
-    runState.running = false;
+    if (!collaborationLoop.isActive) runState.running = false;
     runState.lastResult = event;
   }
   if (event.type === "process_exit") {
-    runState.running = false;
+    if (!collaborationLoop.isActive) runState.running = false;
   }
   if (event.type === "browser_state") {
     runState.browserState = {
@@ -626,12 +628,16 @@ app.post("/api/run/stop", (_req, res) => {
     return;
   }
 
+  const collabWasActive = collaborationLoop.isActive;
   collaborationLoop.forceStop();
   pythonRunner.stop();
   cursorRunner.cancel();
   cursorRunner.forceReset();
-  pushEvent({ type: "run_state", running: false });
-  pushEvent({ type: "done", overall_ok: false, error: "Cancelled by user" });
+  // forceStop already emits collaboration_done + run_state for collaboration runs.
+  if (!collabWasActive) {
+    pushEvent({ type: "run_state", running: false });
+    pushEvent({ type: "done", overall_ok: false, error: "Cancelled by user" });
+  }
   res.json({ stopped: true });
 });
 
@@ -711,68 +717,18 @@ app.get("/api/collaboration/config", (_req, res) => {
 });
 
 app.put("/api/collaboration/config", (req, res) => {
-  const { helperPrompt, helperModel, maxTestRetries, maxIterations } = req.body ?? {};
+  const { helperPrompt, helperModel, maxTestRetries, maxIterations, maxQuestionRounds, maxInfoRequests } =
+    req.body ?? {};
+  const current = readCollaborationConfig();
   const updated = writeCollaborationConfig({
-    helperPrompt: typeof helperPrompt === "string" ? helperPrompt : readCollaborationConfig().helperPrompt,
-    helperModel: typeof helperModel === "string" ? helperModel : readCollaborationConfig().helperModel,
-    maxTestRetries: typeof maxTestRetries === "number" ? maxTestRetries : readCollaborationConfig().maxTestRetries,
-    maxIterations: typeof maxIterations === "number" ? maxIterations : readCollaborationConfig().maxIterations,
+    helperPrompt: typeof helperPrompt === "string" ? helperPrompt : current.helperPrompt,
+    helperModel: typeof helperModel === "string" ? helperModel : current.helperModel,
+    maxTestRetries: typeof maxTestRetries === "number" ? maxTestRetries : current.maxTestRetries,
+    maxIterations: typeof maxIterations === "number" ? maxIterations : current.maxIterations,
+    maxQuestionRounds: typeof maxQuestionRounds === "number" ? maxQuestionRounds : current.maxQuestionRounds,
+    maxInfoRequests: typeof maxInfoRequests === "number" ? maxInfoRequests : current.maxInfoRequests,
   });
   res.json(updated);
-});
-
-app.post("/api/run/collaborate", async (req, res) => {
-  const blocked = runStartBlocked();
-  if (blocked) {
-    res.status(409).json({ error: blocked });
-    return;
-  }
-
-  const body = req.body ?? {};
-  const project = typeof body.project === "string" ? body.project : "";
-  if (!project) {
-    res.status(400).json({ error: "project is required" });
-    return;
-  }
-
-  eventLog.length = 0;
-  resetRunStateForNewRun(project);
-  initRunLogs(project);
-
-  const apiKey = process.env.CURSOR_API_KEY;
-  const target = resolveRunTargetOptions(body.testTarget);
-
-  void collaborationLoop
-    .run({
-      project,
-      task: body.task,
-      push: target.push,
-      skipDeploy: target.skipDeploy,
-      testTarget: target.testTarget,
-      skipStructure: body.skipStructure,
-      skipUi: body.skipUi,
-      noOllama: body.noOllama,
-      cursorRuntime: body.cursorRuntime === "local" ? "local" : "cloud",
-      repoUrl: body.repoUrl,
-      apiKey,
-    })
-    .then((result) => {
-      pushEvent({
-        type: "done",
-        overall_ok: result.ok,
-        error: result.error,
-        answer: result.answer,
-      });
-    })
-    .catch((err) => {
-      pushEvent({
-        type: "collaboration_done",
-        ok: false,
-        error: err instanceof Error ? err.message : String(err),
-      });
-    });
-
-  res.json({ started: true });
 });
 
 app.post("/api/run/resume", async (req, res) => {
@@ -817,6 +773,7 @@ app.post("/api/run/resume", async (req, res) => {
       repoUrl: body.repoUrl,
       apiKey,
       resumeFrom: transcript,
+      userNote: typeof body.note === "string" ? body.note : undefined,
     })
     .then((result) => {
       pushEvent({
@@ -846,18 +803,19 @@ app.post("/api/run/full", async (req, res) => {
 
   const body = req.body ?? {};
   const project = typeof body.project === "string" ? body.project : "";
+  if (!project) {
+    res.status(400).json({ error: "project is required" });
+    return;
+  }
   eventLog.length = 0;
-  resetRunStateForNewRun(project || "");
-  initRunLogs(project || undefined);
+  resetRunStateForNewRun(project);
+  initRunLogs(project);
   const target = resolveRunTargetOptions(body.testTarget);
 
   if (body.skipCursor) {
-    pythonRunner.once("event", (event) => {
-      if (event.type !== "done" && event.type !== "process_exit") return;
-    });
     try {
       pythonRunner.start({
-        project: body.project,
+        project,
         task: body.task,
         push: target.push,
         skipDeploy: target.skipDeploy,

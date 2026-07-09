@@ -8,15 +8,9 @@ from pathlib import Path
 
 import httpx
 
+from ui_test.prompts import get_prompt
+
 logger = logging.getLogger(__name__)
-
-COMMIT_PROMPT = """You write concise git commit messages for changes made by an AI coding assistant.
-
-Return ONLY the commit message text:
-- One-line subject in imperative mood (max 72 chars), OR
-- Subject line, blank line, then a short body (max 3 lines)
-
-No markdown fences, no quotes around the message, no prefix like "Commit message:"."""
 
 
 @dataclass(frozen=True)
@@ -90,7 +84,7 @@ def generate_commit_message_with_ollama(
                     "model": model,
                     "stream": False,
                     "messages": [
-                        {"role": "system", "content": COMMIT_PROMPT},
+                        {"role": "system", "content": get_prompt("git.commit")},
                         {"role": "user", "content": user},
                     ],
                 },

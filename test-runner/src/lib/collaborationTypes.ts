@@ -6,14 +6,14 @@ export type AgentCardMessage = {
 
 export type AgentRunCard = {
   id: string;
-  agent: "local" | "helper";
+  agent: "local" | "helper" | "user";
   agentLabel: string;
   iteration: number;
   status: "running" | "done" | "failed";
   startedAt: string;
   completedAt?: string;
   summary?: string;
-  outcomeType?: "answer" | "prompt" | "response";
+  outcomeType?: "answer" | "prompt" | "response" | "note";
   /** Live process text while running; cleared when the card finishes. */
   streamStatus?: string;
   streamText?: string;
@@ -27,6 +27,8 @@ export type CollaborationConfig = {
   helperModel: string;
   maxTestRetries: number;
   maxIterations: number;
+  maxQuestionRounds: number;
+  maxInfoRequests: number;
 };
 
 export type CollaborationResult = {

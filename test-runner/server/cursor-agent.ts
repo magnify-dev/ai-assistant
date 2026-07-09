@@ -1,5 +1,6 @@
 import { EventEmitter } from "node:events";
 import { Agent, CursorAgentError, type Run, type SDKMessage } from "@cursor/sdk";
+import { renderPrompt } from "./prompts.js";
 
 export type CursorRuntime = "local" | "cloud";
 
@@ -238,9 +239,5 @@ export class CursorRunner extends EventEmitter {
 }
 
 export function buildReportPrompt(reportPath: string): string {
-  return [
-    `Read ${reportPath} and implement the fixes described there.`,
-    "Add missing data-testid hooks listed under Structure.",
-    "Keep changes minimal and match acceptance criteria.",
-  ].join("\n");
+  return renderPrompt("cursor.report_prompt", { report_path: reportPath });
 }

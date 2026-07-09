@@ -289,7 +289,3 @@ def finish(*, overall_ok: bool, report_path: str, error: str = "") -> None:
     _run_state["running"] = False
     _run_state["phase"] = Phase.DONE.value if overall_ok else Phase.ERROR.value
     _dispatch({"type": "done", "overall_ok": overall_ok, "report": report_path, "error": error})
-
-
-def cursor_event(**fields: Any) -> None:
-    _dispatch({"type": "cursor", **fields})

@@ -183,7 +183,7 @@ def run_ui_test_loop(
                 model=ollama_model(config),
                 timeout_sec=float(ollama_cfg.get("timeout_sec") or 180),
                 free_text=free_text,
-                app_context=f"Mini admin at {base_url}. Auth via /login.",
+                app_context=f"Web application under test at {base_url}.",
                 spec_summary=spec_summary,
             )
             if structured_task:
@@ -673,12 +673,14 @@ def run_ui_test_loop(
             "overall_ok": overall_ok,
         }
 
+        run_report = build_run_report(payload)
+
         cheatsheet_refine: dict[str, Any] = {"added_learnings": [], "added_notes": []}
         if not no_ollama:
             emit_log("Reviewing cheatsheet learnings (append-only)...", phase=Phase.DONE.value)
             cheatsheet_refine = refine_cheatsheet_from_run(
                 project,
-                run_report={},
+                run_report=run_report,
                 run_payload={
                     "structured_task": structured_task,
                     "ui_run": ui_run_payload,
@@ -703,7 +705,6 @@ def run_ui_test_loop(
                     f"+{len(cheatsheet_refine.get('added_notes') or [])} note(s)",
                 )
         payload["cheatsheet_refine"] = cheatsheet_refine
-
         run_report = build_run_report(payload)
         payload["run_report"] = run_report
         run_report_event(run_report)

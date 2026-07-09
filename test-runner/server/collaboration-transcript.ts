@@ -59,21 +59,33 @@ export function readCollaborationTranscript(projectPath: string, runId: string):
   }
 }
 
+/** Cap each entry so prior turns stay cheap — agents get summaries, not transcripts. */
+const CONTEXT_ENTRY_MAX = 600;
+
+function clip(text: string, max = CONTEXT_ENTRY_MAX): string {
+  const trimmed = text.trim();
+  return trimmed.length <= max ? trimmed : `${trimmed.slice(0, max)}…`;
+}
+
 export function buildConversationContext(cards: AgentCard[]): string {
   if (!cards.length) return "";
   const lines: string[] = [];
   for (const card of cards) {
+    if (card.agent === "user") {
+      if (card.outcomeText) lines.push(`### User intervention\n${card.outcomeText.trim()}`, "");
+      continue;
+    }
     const header = `### ${card.agentLabel} (iteration ${card.iteration}, ${card.status})`;
     lines.push(header);
     if (card.summary) lines.push(`Summary: ${card.summary}`);
     if (card.outcomeType === "answer" && card.outcomeText) {
-      lines.push(`Answer: ${card.outcomeText}`);
+      lines.push(`Answer: ${clip(card.outcomeText)}`);
     }
     if (card.outcomeType === "prompt" && card.outcomeText) {
-      lines.push(`Delegated to helper: ${card.outcomeText}`);
+      lines.push(`Delegated to helper: ${clip(card.outcomeText)}`);
     }
     if (card.outcomeType === "response" && card.outcomeText) {
-      lines.push(`Helper response: ${card.outcomeText}`);
+      lines.push(`Helper response: ${clip(card.outcomeText)}`);
     }
     for (const msg of card.messages ?? []) {
       if (msg.role === "agent") {

@@ -4,7 +4,10 @@ import fs from "node:fs";
 import path from "node:path";
 import { readCollaborationConfig } from "./collaboration-config.js";
 import {
+  buildBestEffortSummary,
+  buildEscalationPrompt,
   buildHelperHandoffAfterPipelineFailure,
+  buildInfoReplyHandoff,
   expandPromptForHelper,
   isGitOrDeployBlockingFailure,
   pipelineFailureSummary,
@@ -13,7 +16,9 @@ import {
   taskRequiresImplementation,
   triageTask,
   verifyAfterTest,
+  extractInfoRequest,
   extractUiVerificationRequest,
+  extractAnswerSection,
 } from "./collaboration-eval.js";
 import {
   buildConversationContext,
@@ -23,6 +28,7 @@ import {
   type ResumePlan,
 } from "./collaboration-transcript.js";
 import { CursorRunner } from "./cursor-agent.js";
+import { getPrompt, renderPrompt } from "./prompts.js";
 import { PythonRunner, type RunOptions } from "./python-runner.js";
 import { resolveCursorRuntime } from "./run-target.js";
 import { HelperStreamAggregator } from "./helper-stream.js";
@@ -30,14 +36,14 @@ import { gitWorktreeChanged, gitWorktreeSnapshot } from "./helper-git.js";
 
 export type AgentCard = {
   id: string;
-  agent: "local" | "helper";
+  agent: "local" | "helper" | "user";
   agentLabel: string;
   iteration: number;
   status: "running" | "done" | "failed";
   startedAt: string;
   completedAt?: string;
   summary?: string;
-  outcomeType?: "answer" | "prompt" | "response";
+  outcomeType?: "answer" | "prompt" | "response" | "note";
   /** Live process text while running; cleared when the card finishes. */
   streamStatus?: string;
   streamText?: string;
@@ -58,6 +64,8 @@ export type CollaborationRunOptions = RunOptions & {
   repoUrl?: string;
   apiKey?: string;
   resumeFrom?: CollaborationTranscript;
+  /** Extra context the user typed when resuming a stopped/failed run. */
+  userNote?: string;
 };
 
 export class CollaborationLoop extends EventEmitter {
@@ -230,10 +238,16 @@ export class CollaborationLoop extends EventEmitter {
     const config = readCollaborationConfig();
     let iteration = 0;
     let testFailures = 0;
+    let helperFailures = 0;
+    let questionRounds = 0;
+    let infoRounds = 0;
+    let escalated = false;
+    let lastFailureNote = "";
     let helperContext = "";
     let helperSucceeded = false;
     let conversationContext = "";
     let resumePlan: ResumePlan | null = null;
+    const userNote = options.userNote?.trim() ?? "";
 
     if (options.resumeFrom) {
       this.cards = options.resumeFrom.agentCards.map((c) => ({ ...c, historical: true }));
@@ -242,6 +256,23 @@ export class CollaborationLoop extends EventEmitter {
       iteration = resumePlan.iteration - 1;
       helperContext = resumePlan.helperContext;
       conversationContext = resumePlan.conversationContext;
+      if (userNote) {
+        const noteCard: AgentCard = {
+          id: randomUUID(),
+          agent: "user",
+          agentLabel: "You",
+          iteration: resumePlan.iteration,
+          status: "done",
+          startedAt: new Date().toISOString(),
+          completedAt: new Date().toISOString(),
+          summary: "Context added on resume",
+          outcomeType: "note",
+          outcomeText: userNote,
+        };
+        this.cards.push(noteCard);
+        this.emitCard(noteCard);
+        conversationContext = buildFullConversationContext(this.cards);
+      }
       this.emit("event", {
         type: "collaboration_start",
         task: taskText,
@@ -256,7 +287,7 @@ export class CollaborationLoop extends EventEmitter {
 
     try {
       if (resumePlan?.nextAction === "helper") {
-        const helperPrompt =
+        let helperPrompt =
           resumePlan.retryHelper && resumePlan.pendingHelperPrompt
             ? resumePlan.pendingHelperPrompt
             : buildHelperPrompt(
@@ -264,6 +295,9 @@ export class CollaborationLoop extends EventEmitter {
                 resumePlan.pendingHelperPrompt ?? "",
                 conversationContext,
               );
+        if (userNote && resumePlan.retryHelper) {
+          helperPrompt = `${helperPrompt}\n\n---\nUser update (added while resuming):\n${userNote}`;
+        }
         const helperResult = await this.runHelperIteration(
           options,
           config,
@@ -305,11 +339,10 @@ export class CollaborationLoop extends EventEmitter {
           message: `Local agent iteration ${iteration} — triaging task…`,
         });
 
-        const triage = await triageTask(taskText, options.project, {
+        const triage = triageTask(taskText, {
           previousHelperResponse: helperContext || undefined,
           helperSucceeded,
         });
-        this.checkCancelled();
         localCard.messages = [
           ...(localCard.messages ?? []),
           { role: "triage", text: `${triage.action.toUpperCase()}: ${triage.reason}`, ts: new Date().toISOString() },
@@ -384,14 +417,34 @@ export class CollaborationLoop extends EventEmitter {
             continue;
           }
 
-          return this.finishCollaboration(options.project, taskText, {
-            ok: false,
-            error: cursorResult.error ?? "Helper agent did not implement code changes",
-            iterations: iteration,
+          // Retryable helper failure on initial handoff: keep collaborating instead of
+          // aborting — the next iteration re-triages and hands off again with the
+          // failure now part of the shared conversation context.
+          helperFailures++;
+          conversationContext = buildFullConversationContext(this.cards);
+          if (helperFailures >= config.maxTestRetries) {
+            return this.finishCollaboration(options.project, taskText, {
+              ok: false,
+              error: buildBestEffortSummary(
+                cursorResult.error ??
+                  `Stopped after ${config.maxTestRetries} failed helper attempts`,
+                conversationContext,
+              ),
+              iterations: iteration,
+            });
+          }
+          this.emit("event", {
+            type: "phase",
+            phase: "collaboration",
+            status: "running",
+            message: `Helper attempt failed (${helperFailures}/${config.maxTestRetries}) — retrying handoff`,
           });
+          continue;
         }
 
-        // --- Test path: run UI pipeline then verify ---
+        // --- Test path: run UI pipeline then verify (or answer the helper's info request) ---
+        const pendingInfoRequest =
+          infoRounds < config.maxInfoRequests ? extractInfoRequest(helperContext) : null;
         const localTask = buildLocalTask(taskText, helperContext, iteration, conversationContext);
 
         const verificationRequest = extractUiVerificationRequest(helperContext);
@@ -399,11 +452,13 @@ export class CollaborationLoop extends EventEmitter {
           type: "phase",
           phase: "collaboration",
           status: "running",
-          message: verificationRequest
-            ? "Running helper's UI verification request on live app…"
-            : helperContext
-              ? `Verifying UI (iteration ${iteration})…`
-              : `Running UI tests (iteration ${iteration})…`,
+          message: pendingInfoRequest
+            ? "Gathering live-app info the helper asked for…"
+            : verificationRequest
+              ? "Running helper's UI verification request on live app…"
+              : helperContext
+                ? `Verifying UI (iteration ${iteration})…`
+                : `Running UI tests (iteration ${iteration})…`,
         });
 
         this.emit("event", {
@@ -418,6 +473,69 @@ export class CollaborationLoop extends EventEmitter {
         if (pythonRun.failedPhases.some((p) => /cancelled/i.test(p))) {
           throw new RunCancelledError();
         }
+
+        // --- Info round-trip: hand the local agent's findings back to the helper ---
+        // (skipped when a git/deploy failure blocks everything — handled below)
+        if (
+          pendingInfoRequest &&
+          (pythonRun.ok ||
+            !isGitOrDeployBlockingFailure(pythonRun.failedPhases, { skipDeploy: options.skipDeploy }))
+        ) {
+          infoRounds++;
+          const report = readLatestReport(options.project);
+          const findings = String(report?.task_answer ?? "").trim();
+          const failureSummary = pythonRun.ok ? undefined : pythonRun.failedPhases.join("\n");
+          const infoReply = buildInfoReplyHandoff(taskText, pendingInfoRequest, findings, failureSummary);
+
+          this.finishCard(localCard, {
+            status: "done",
+            summary: `Gathered live-app info requested by helper (round ${infoRounds}/${config.maxInfoRequests})`,
+            outcomeType: "prompt",
+            outcomeText: infoReply,
+            messages: localCard.messages,
+          });
+
+          const infoPrompt = buildHelperPrompt(config.helperPrompt, infoReply, conversationContext);
+          const infoResult = await this.runHelperIteration(
+            options,
+            config,
+            iteration,
+            infoPrompt,
+            conversationContext,
+            taskText,
+          );
+          if (!infoResult.ok && isNonRetryableHelperError(infoResult.error)) {
+            return this.finishCollaboration(
+              options.project,
+              taskText,
+              abortOnHelperError(
+                options.project,
+                taskText,
+                iteration,
+                infoResult.error ?? "Helper agent failed (non-retryable)",
+              ),
+            );
+          }
+          if (infoResult.succeeded) {
+            helperContext = infoResult.responseText;
+            helperSucceeded = true;
+          } else {
+            helperFailures++;
+          }
+          conversationContext = buildFullConversationContext(this.cards);
+          if (!infoResult.succeeded && helperFailures >= config.maxTestRetries) {
+            return this.finishCollaboration(options.project, taskText, {
+              ok: false,
+              error: buildBestEffortSummary(
+                infoResult.error ?? `Stopped after ${config.maxTestRetries} failed helper attempts`,
+                conversationContext,
+              ),
+              iterations: iteration,
+            });
+          }
+          continue;
+        }
+
         if (!pythonRun.ok) {
           this.checkCancelled();
           const pipelinePayload = readRunPayload(options.project);
@@ -530,7 +648,81 @@ export class CollaborationLoop extends EventEmitter {
           });
         }
 
-        const handoffPrompt =
+        // --- Question path: the live UI didn't contain the answer; the helper can read the code ---
+        if (verification.kind === "question") {
+          const fallbackAnswer = verification.answer || verification.summary;
+          if (!options.apiKey || questionRounds >= config.maxQuestionRounds) {
+            this.finishCard(localCard, {
+              status: "failed",
+              summary: verification.summary,
+              outcomeType: "answer",
+              outcomeText: fallbackAnswer,
+              messages: localCard.messages,
+            });
+            return this.finishCollaboration(options.project, taskText, {
+              ok: false,
+              error: fallbackAnswer,
+              iterations: iteration,
+            });
+          }
+          questionRounds++;
+          this.finishCard(localCard, {
+            status: "done",
+            summary: verification.summary,
+            outcomeType: "prompt",
+            outcomeText: verification.prompt ?? fallbackAnswer,
+            messages: localCard.messages,
+          });
+          const questionPrompt = buildHelperPrompt(
+            config.helperPrompt,
+            verification.prompt ?? fallbackAnswer,
+            conversationContext,
+          );
+          const questionResult = await this.runHelperIteration(
+            options,
+            config,
+            iteration,
+            questionPrompt,
+            conversationContext,
+            taskText,
+          );
+          if (!questionResult.ok) {
+            if (isNonRetryableHelperError(questionResult.error)) {
+              return this.finishCollaboration(options.project, taskText, {
+                ok: false,
+                error: questionResult.error ?? fallbackAnswer,
+                iterations: iteration,
+              });
+            }
+            // Transient helper failure — let the loop re-explore and ask again.
+            conversationContext = buildFullConversationContext(this.cards);
+            if (questionRounds < config.maxQuestionRounds) continue;
+            return this.finishCollaboration(options.project, taskText, {
+              ok: false,
+              error: questionResult.error ?? fallbackAnswer,
+              iterations: iteration,
+            });
+          }
+          const helperAnswer =
+            extractAnswerSection(questionResult.responseText) || questionResult.responseText.trim();
+          if (!helperAnswer && questionRounds < config.maxQuestionRounds) {
+            // Empty answer — keep collaborating instead of failing outright.
+            conversationContext = buildFullConversationContext(this.cards);
+            continue;
+          }
+          return this.finishCollaboration(options.project, taskText, {
+            ok: Boolean(helperAnswer),
+            answer: helperAnswer || undefined,
+            error: helperAnswer ? undefined : fallbackAnswer,
+            iterations: iteration,
+          });
+        }
+
+        const failureNote = verification.failureNote ?? verification.summary;
+        const failureRepeated = sameFailure(lastFailureNote, failureNote);
+        lastFailureNote = failureNote;
+
+        let handoffPrompt =
           verification.prompt ||
           (
             await expandPromptForHelper(taskText, options.project, {
@@ -538,6 +730,11 @@ export class CollaborationLoop extends EventEmitter {
               previousHelperResponse: helperContext || undefined,
             })
           ).expandedPrompt;
+
+        // Stagnation: the exact same failure came back — tell the helper to change approach.
+        if (failureRepeated && !escalated) {
+          handoffPrompt = [handoffPrompt, "", "---", getPrompt("collaboration.repeat_failure_note")].join("\n");
+        }
 
         this.finishCard(localCard, {
           status: "done",
@@ -555,11 +752,29 @@ export class CollaborationLoop extends EventEmitter {
           });
         }
 
-        if (testFailures >= config.maxTestRetries) {
+        if (testFailures > config.maxTestRetries) {
           return this.finishCollaboration(options.project, taskText, {
             ok: false,
-            error: `Stopped after ${config.maxTestRetries} failed verification attempts`,
+            error: buildBestEffortSummary(
+              `Stopped after ${testFailures} failed verification attempts (including a final rethink round)`,
+              conversationContext,
+              failureNote,
+            ),
             iterations: iteration,
+          });
+        }
+
+        // Last regular retry exhausted: give the helper one escalation round with the
+        // full attempt history and an explicit instruction to rethink, instead of
+        // repeating the same delta or giving up.
+        if (testFailures >= config.maxTestRetries && !escalated) {
+          escalated = true;
+          handoffPrompt = buildEscalationPrompt(taskText, conversationContext, failureNote);
+          this.emit("event", {
+            type: "phase",
+            phase: "collaboration",
+            status: "running",
+            message: "Retries exhausted — escalating: asking helper to rethink the approach",
           });
         }
 
@@ -593,7 +808,14 @@ export class CollaborationLoop extends EventEmitter {
         }
         conversationContext = buildFullConversationContext(this.cards);
 
-        if (extractUiVerificationRequest(helperContext)) {
+        if (extractInfoRequest(helperContext)) {
+          this.emit("event", {
+            type: "phase",
+            phase: "collaboration",
+            status: "running",
+            message: "Helper asked for live-app info — local agent will gather it next",
+          });
+        } else if (extractUiVerificationRequest(helperContext)) {
           this.emit("event", {
             type: "phase",
             phase: "collaboration",
@@ -602,12 +824,17 @@ export class CollaborationLoop extends EventEmitter {
           });
         }
 
+        // Helper failures count separately from failed UI verifications.
         if (!cursorResult.succeeded) {
-          testFailures++;
-          if (testFailures >= config.maxTestRetries) {
+          helperFailures++;
+          if (helperFailures >= config.maxTestRetries) {
             return this.finishCollaboration(options.project, taskText, {
               ok: false,
-              error: cursorResult.error ?? `Stopped after ${config.maxTestRetries} failed helper attempts`,
+              error: buildBestEffortSummary(
+                cursorResult.error ?? `Stopped after ${config.maxTestRetries} failed helper attempts`,
+                conversationContext,
+                lastFailureNote || undefined,
+              ),
               iterations: iteration,
             });
           }
@@ -616,7 +843,11 @@ export class CollaborationLoop extends EventEmitter {
 
       return this.finishCollaboration(options.project, taskText, {
         ok: false,
-        error: `Max iterations (${config.maxIterations}) reached`,
+        error: buildBestEffortSummary(
+          `Max iterations (${config.maxIterations}) reached without confirmed success`,
+          conversationContext,
+          lastFailureNote || undefined,
+        ),
         iterations: iteration,
       });
     } catch (err) {
@@ -702,10 +933,13 @@ export class CollaborationLoop extends EventEmitter {
       );
 
       const codeChanged = !needsCode || gitWorktreeChanged(options.project, gitBefore);
+      // A deliberate "### Info needed" reply is collaboration, not a failure —
+      // the helper is asking the local agent for facts before touching code.
+      const infoRequested = Boolean(extractInfoRequest(cursorResult.responseText));
       let ok = cursorResult.ok;
       let error = cursorResult.error;
 
-      if (ok && needsCode && !codeChanged) {
+      if (ok && needsCode && !codeChanged && !infoRequested) {
         ok = false;
         error =
           "Helper finished without editing any project files. Use file tools to implement the fix in the codebase.";
@@ -718,6 +952,9 @@ export class CollaborationLoop extends EventEmitter {
         summary: (() => {
           if (cursorResult.cancelled) return "Cancelled by user";
           if (!ok) return error ?? "Helper agent failed";
+          if (infoRequested && !codeChanged) {
+            return "Helper needs live-app info — local agent will gather it";
+          }
           const request = extractUiVerificationRequest(cursorResult.responseText);
           if (!request) return "Implementation complete — no UI verification request section found";
           const checks = request.split("\n").filter((line) => /^\s*[-*]\s+/.test(line)).length;
@@ -745,23 +982,18 @@ export class CollaborationLoop extends EventEmitter {
         throw new RunCancelledError();
       }
 
-      return { ...cursorResult, ok, error, codeChanged };
+      return { ...cursorResult, ok, error, codeChanged, infoRequested };
     };
 
     let result = await execute(helperPrompt);
     this.checkCancelled();
-    if (!result.ok && needsCode && !result.codeChanged && !result.cancelled) {
+    if (!result.ok && needsCode && !result.codeChanged && !result.infoRequested && !result.cancelled) {
       this.checkCancelled();
-      const retryPrompt = [
-        helperPrompt,
-        "",
-        "---",
-        "Your previous attempt did not modify any files. Edit the project codebase directly (Read/Write/StrReplace tools), then reply with ### Summary and ### UI verification request.",
-      ].join("\n");
+      const retryPrompt = [helperPrompt, "", "---", getPrompt("collaboration.no_edit_retry")].join("\n");
       result = await execute(retryPrompt, " (retry)");
     }
 
-    const succeeded = result.ok && (!needsCode || result.codeChanged);
+    const succeeded = result.ok && (!needsCode || result.codeChanged || result.infoRequested);
 
     return {
       ok: result.ok,
@@ -788,10 +1020,10 @@ export class CollaborationLoop extends EventEmitter {
 
       this.emit("event", { type: "phases_reset" });
 
+      // NOTE: python events already reach the SSE stream via the PythonRunner's own
+      // "event" subscription in index.ts — do not re-emit them here (it duplicated
+      // every pipeline event during collaboration runs).
       const onEvent = (event: Record<string, unknown>) => {
-        const tagged = { ...event, cardId };
-        this.emit("event", tagged);
-
         if (event.type === "phase" && event.status === "failed") {
           const phase = String(event.phase ?? "phase");
           const message = String(event.message ?? "failed").trim();
@@ -935,7 +1167,10 @@ function isNonRetryableHelperError(error?: string): boolean {
     lower.includes("invalid model") ||
     lower.includes("model not found") ||
     lower.includes("unknown model") ||
-    lower.includes("not available") ||
+    // Deliberately narrow: a bare "not available" also matches transient
+    // "service not available" errors, which ARE worth retrying.
+    lower.includes("model not available") ||
+    lower.includes("model is not available") ||
     lower.includes("repourl is required") ||
     lower.includes("repo url") ||
     lower.includes("cursor_api_key") ||
@@ -944,6 +1179,20 @@ function isNonRetryableHelperError(error?: string): boolean {
     lower.includes("unauthorized") ||
     lower.includes("forbidden")
   );
+}
+
+/** Loose comparison of two verification failure notes to detect a stuck loop. */
+function sameFailure(a: string, b: string): boolean {
+  const normalize = (text: string) =>
+    text
+      .toLowerCase()
+      .replace(/[^a-z0-9 ]+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  const na = normalize(a);
+  const nb = normalize(b);
+  if (!na || !nb) return false;
+  return na === nb || na.includes(nb) || nb.includes(na);
 }
 
 function abortOnHelperError(
@@ -965,41 +1214,35 @@ function buildLocalTask(
   iteration: number,
   conversationContext: string,
 ): string {
+  const infoRequest = extractInfoRequest(helperContext);
   const verificationRequest = extractUiVerificationRequest(helperContext);
 
-  const parts = [
-    "You are the local UI testing agent. Explore the live app and return an answer plus a structured report.",
-    "",
-    "Original user task:",
-    task,
-  ];
+  const parts = [renderPrompt("collaboration.local_task.intro", { task })];
 
-  if (verificationRequest) {
+  if (infoRequest) {
+    parts.push("", renderPrompt("collaboration.local_task.info_section", { info_request: infoRequest }));
+  } else if (verificationRequest) {
     parts.push(
       "",
-      "---",
-      "UI verification request from the implementation agent (run these on the live UI):",
-      verificationRequest,
-      "",
-      "Execute each check. For each item, note pass/fail and what you observed on screen.",
-      "Return a clear answer summarizing whether the implementation agent's fix worked.",
+      renderPrompt("collaboration.local_task.verification_section", {
+        verification_request: verificationRequest,
+      }),
     );
   } else if (helperContext && iteration > 1) {
     parts.push(
       "",
-      "---",
-      "The implementation agent made changes. Verify whether the user's task is satisfied on the live page.",
-      "Helper response (no structured ### UI verification request — infer checks from this):",
-      helperContext.slice(0, 2000),
+      renderPrompt("collaboration.local_task.inferred_section", {
+        helper_context: helperContext.slice(0, 2000),
+      }),
     );
   }
 
   if (conversationContext) {
     parts.push(
       "",
-      "---",
-      "Prior collaboration (context only):",
-      conversationContext.slice(0, 4000),
+      renderPrompt("collaboration.local_task.prior_context", {
+        context: conversationContext.slice(0, 4000),
+      }),
     );
   }
 

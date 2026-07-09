@@ -30,6 +30,7 @@ dev_loop/.runs/
 node_modules/
 test-runner/dist/
 test-runner/dist-server/
+*.tsbuildinfo
 
 # Secrets (keep *.example templates committed)
 .webui_secret_key

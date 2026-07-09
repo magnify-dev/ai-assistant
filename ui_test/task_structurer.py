@@ -7,64 +7,14 @@ from typing import Any
 
 import httpx
 
+from ui_test.prompts import get_prompt
+
 logger = logging.getLogger(__name__)
 
 
-STRUCTURE_PROMPT = """You structure free-text UI test tasks into JSON for a browser test runner.
-
-CRITICAL: Preserve the user's full intent. Do NOT replace their goal with a generic "login and land on home page" task.
-If they ask to write a report, discover data via UI, or verify specific pages — that MUST appear in success_criteria and deliverables.
-
-Return ONLY valid JSON:
-{
-  "summary": "one line — must reflect the user's actual goal, not a generic login test",
-  "deliverables": ["concrete outputs the user asked for"],
-  "success_criteria": ["each must map to something the user explicitly or implicitly asked for"],
-  "notes_for_cursor": ["gaps between what user asked and what the existing spec likely covers"],
-  "preserves_intent": true,
-  "intent_gaps": ["only if summary/criteria miss something from the user's prompt — else []"]
-}
-
-Rules:
-- Copy key nouns from the user prompt into summary and success_criteria.
-- If user asks for a report, add deliverable and criterion about producing a report.
-- Do NOT include scope_urls, suggested_steps, or navigation instructions — exploration discovers routes at runtime via site map and navigation tree.
-- Do NOT invent URLs or paths (e.g. /analytics) unless the user literally wrote that path.
-- Do NOT add steps like "navigate to X section" — the agent discovers where data lives."""
-
-
-def _keyword_in(text: str, keyword: str) -> bool:
-    return keyword in text.lower()
-
-
-def validate_task_alignment(source_text: str, structured: dict[str, Any]) -> list[str]:
-    """Heuristic checks — surfaces when Ollama drifted from the user's prompt."""
+def validate_task_alignment(_source_text: str, structured: dict[str, Any]) -> list[str]:
+    """Surface when Ollama drifted from the user's prompt."""
     gaps: list[str] = list(structured.get("intent_gaps") or [])
-    source = source_text.strip().lower()
-    if not source:
-        return gaps
-
-    criteria = " ".join(str(c) for c in (structured.get("success_criteria") or [])).lower()
-    summary = str(structured.get("summary") or "").lower()
-    deliverables = " ".join(str(d) for d in (structured.get("deliverables") or [])).lower()
-    scope = " ".join(str(u) for u in (structured.get("scope_urls") or [])).lower()
-    combined = f"{criteria} {summary} {deliverables}"
-
-    checks: list[tuple[str, str]] = [
-        ("report", "Your prompt asks to write a report — structured task should include that as a deliverable/criterion."),
-        ("discover", "Your prompt asks to discover via the UI — success criteria should mention exploration/discovery."),
-        ("group", "Your prompt mentions groups — scope URLs and criteria should reference groups."),
-    ]
-    for keyword, message in checks:
-        if _keyword_in(source, keyword) and not _keyword_in(combined, keyword):
-            if message not in gaps:
-                gaps.append(message)
-
-    if "write" in source and "report" in source:
-        if not _keyword_in(deliverables, "report") and not _keyword_in(criteria, "report"):
-            msg = "Your prompt asks to write a report — add it as a deliverable, not just verify UI."
-            if msg not in gaps:
-                gaps.append(msg)
 
     if structured.get("preserves_intent") is False:
         gap = "Structured task flagged as not fully preserving your prompt — review success criteria."
@@ -113,7 +63,7 @@ def structure_task_with_ollama(
         "stream": False,
         "format": "json",
         "messages": [
-            {"role": "system", "content": STRUCTURE_PROMPT},
+            {"role": "system", "content": get_prompt("task_structure.system")},
             {"role": "user", "content": user_content},
         ],
     }

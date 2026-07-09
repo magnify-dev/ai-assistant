@@ -34,18 +34,23 @@ export function stripPipelineKeys(
   testTargetMode: "local" | "deployed",
   skipDeploy: boolean,
   hasHelper: boolean,
+  uiPhase: "exploration" | "ui_test" = "exploration",
 ): RunStepKey[] {
   const keys: RunStepKey[] = [];
   if (hasHelper) keys.push("cursor");
   keys.push("git");
   if (testTargetMode === "local") keys.push("local_server");
   else if (!skipDeploy) keys.push("deploy");
-  keys.push("health", "exploration");
+  keys.push("health", uiPhase);
   return keys;
 }
 
+/** Most recent helper card — earlier iterations are history. */
 function helperCardState(agentCards: AgentRunCard[]) {
-  return agentCards.find((c) => c.agent === "helper");
+  for (let i = agentCards.length - 1; i >= 0; i--) {
+    if (agentCards[i].agent === "helper") return agentCards[i];
+  }
+  return undefined;
 }
 
 function localCardState(agentCards: AgentRunCard[]) {

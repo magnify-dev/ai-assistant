@@ -52,24 +52,6 @@ def _graphql(token: str, query: str, variables: dict[str, Any] | None = None) ->
     return body.get("data") or {}
 
 
-def trigger_deploy(token: str, railway: RailwayConfig, service: RailwayService) -> str:
-    query = """
-    mutation Deploy($serviceId: String!, $environmentId: String!) {
-      serviceInstanceDeployV2(serviceId: $serviceId, environmentId: $environmentId)
-    }
-    """
-    data = _graphql(
-        token,
-        query,
-        {"serviceId": service.service_id, "environmentId": railway.environment_id},
-    )
-    deployment_id = data.get("serviceInstanceDeployV2")
-    if not deployment_id:
-        raise RuntimeError(f"Deploy trigger returned no deployment id for {service.name}")
-    logger.info("Triggered deploy for %s → %s", service.name, deployment_id)
-    return str(deployment_id)
-
-
 def latest_deployment_status(
     token: str,
     railway: RailwayConfig,

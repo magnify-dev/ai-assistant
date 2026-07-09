@@ -68,9 +68,10 @@ export function CurrentRunStatus({
     [phases, agentCards, running],
   );
   const hasHelper = Boolean(agentCards.find((c) => c.agent === "helper"));
+  const uiPhase = phases.ui_test ? "ui_test" : "exploration";
   const stripKeys = useMemo(
-    () => stripPipelineKeys(testTargetMode, skipDeploy, hasHelper),
-    [testTargetMode, skipDeploy, hasHelper],
+    () => stripPipelineKeys(testTargetMode, skipDeploy, hasHelper, uiPhase),
+    [testTargetMode, skipDeploy, hasHelper, uiPhase],
   );
 
   if (!status) return null;

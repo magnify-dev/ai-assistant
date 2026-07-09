@@ -131,6 +131,26 @@ def current_page_has_task_data(
     return False, ""
 
 
+_INTERACTION_PATTERN = re.compile(
+    r"\b(click|press|toggle|drag|hover|submit|escape|modal|dialog|dismiss|re-open|reopen)\b",
+    re.IGNORECASE,
+)
+
+
+def task_requires_interaction(task_text: str) -> bool:
+    """True when the task asks for UI interactions (clicking, key presses, modals)
+    rather than just reading data off a page."""
+    return bool(_INTERACTION_PATTERN.search(task_text))
+
+
+def history_has_interaction(step_history: list[str]) -> bool:
+    """True if the exploration loop already performed at least one interaction step."""
+    return any(
+        s.lstrip().lower().startswith(("click", "fill", "press"))
+        for s in step_history
+    )
+
+
 def path_key(url: str) -> str:
     parsed = urlparse(url)
     return (parsed.path or "/").rstrip("/") or "/"

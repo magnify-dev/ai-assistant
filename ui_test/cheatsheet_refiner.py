@@ -11,29 +11,11 @@ import yaml
 
 from ui_test.project_paths import agent_dir
 from ui_test.project_profile import cheatsheet_path, load_cheatsheet
+from ui_test.prompts import get_prompt
 
 logger = logging.getLogger(__name__)
 
 LEARNINGS_FILE = "cheatsheet-learnings.yaml"
-
-REFINE_PROMPT = """You help improve a project's local-dev cheatsheet based on one test run.
-
-Return ONLY valid JSON:
-{
-  "add_learnings": [
-    {"insight": "short factual note", "source": "what run evidence showed"}
-  ],
-  "add_notes": [
-    "optional bullet for cheatsheet notes — only if truly new and important"
-  ]
-}
-
-Rules:
-- NEVER rewrite or replace existing setup — append-only suggestions.
-- Max 2 learnings and max 1 note per run.
-- Skip if nothing new (return empty arrays).
-- Do not duplicate insights already in existing learnings or notes.
-- Focus on: env vars, ports, proxy, Windows/127.0.0.1, startup order, common failures."""
 
 
 def learnings_path(project: Path) -> Path:
@@ -133,7 +115,7 @@ def refine_cheatsheet_from_run(
                     "stream": False,
                     "format": "json",
                     "messages": [
-                        {"role": "system", "content": REFINE_PROMPT},
+                        {"role": "system", "content": get_prompt("cheatsheet.refine")},
                         {"role": "user", "content": user},
                     ],
                 },

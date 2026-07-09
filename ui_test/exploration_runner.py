@@ -12,8 +12,10 @@ from ui_test.exploration_agent import decide_next_action, evaluate_exploration
 from ui_test.exploration_match import (
     current_page_has_task_data,
     find_task_path_in_site_map,
+    history_has_interaction,
     path_key,
     pick_nav_action_to_path,
+    task_requires_interaction,
 )
 from ui_test.nav_registry import (
     load_nav_tree,
@@ -119,6 +121,7 @@ def _assess_exploration_status(
     page: Page,
     state: dict[str, Any],
     task_text: str,
+    step_history: list[str] | None = None,
 ) -> tuple[str, str]:
     visible = state.get("visible_content") if isinstance(state.get("visible_content"), dict) else {}
     semantic = str(state.get("semantic_summary") or "")
@@ -131,6 +134,14 @@ def _assess_exploration_status(
         visible_content=visible,
     )
     if has_data:
+        # Data-lookup heuristics must not short-circuit tasks that ask for
+        # interactions (click a button, press Escape, ...) before any
+        # interaction has been performed.
+        if task_requires_interaction(task_text) and not history_has_interaction(step_history or []):
+            return (
+                "interact",
+                "Task requires UI interactions (click/press) that have not been performed yet",
+            )
         return "report_ready", data_reason
 
     known_path, known_reason = find_task_path_in_site_map(registry, task_text)
@@ -422,6 +433,24 @@ def _execute_agent_action(
         emit_page_state(page, context="explore_fill")
         return True, f"fill {label}"
 
+    if action == "press":
+        key = str(decision.get("value") or decision.get("key") or "")
+        if not key:
+            return False, "press missing key"
+        page.keyboard.press(key)
+        page.wait_for_timeout(500)
+        logger.log(
+            mode=SelectorMode.FUZZY,
+            ephemeral=True,
+            page_url=page.url,
+            action="press",
+            target=key,
+            ok=True,
+            message=decision.get("reason") or "",
+        )
+        emit_page_state(page, context="explore_press")
+        return True, f"press {key}"
+
     if action == "wait":
         ms = int(decision.get("value") or 1000)
         page.wait_for_timeout(ms)
@@ -530,7 +559,7 @@ def run_exploration(
 
                 # 2. Check site map + current page for task data
                 exploration_status, status_detail = _assess_exploration_status(
-                    registry, page, state, task_text
+                    registry, page, state, task_text, step_history
                 )
                 log(f"Step {step_num + 1}: status={exploration_status} — {status_detail}")
 
@@ -681,10 +710,19 @@ def run_exploration(
                     report_markdown=report_markdown,
                 )
                 passed = bool((evaluation or {}).get("passed"))
-                if not passed and report_markdown and "/login" not in _path_key(page.url):
+                interactions_satisfied = not task_requires_interaction(task_text) or history_has_interaction(step_history)
+                if not passed and report_markdown and "/login" not in _path_key(page.url) and interactions_satisfied:
                     passed = True
                     if not evaluation:
                         evaluation = {"passed": True, "summary": "Report written after UI exploration"}
+                elif passed and not interactions_satisfied:
+                    passed = False
+                    evaluation = dict(evaluation or {})
+                    evaluation["passed"] = False
+                    evaluation["summary"] = (
+                        "Task requires UI interactions (click/press) but none were executed — "
+                        "verification claims are ungrounded"
+                    )
                 if evaluation and evaluation.get("report_markdown") and not report_markdown:
                     report_markdown = str(evaluation["report_markdown"])
 

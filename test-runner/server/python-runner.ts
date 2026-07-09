@@ -30,7 +30,9 @@ export class PythonRunner extends EventEmitter {
       throw new Error("A run is already in progress");
     }
 
-    const python = path.join(REPO_ROOT, "voice", ".venv", "Scripts", "python.exe");
+    const python =
+      process.env.UI_TEST_PYTHON?.trim() ||
+      path.join(REPO_ROOT, "voice", ".venv", "Scripts", "python.exe");
     const args = [
       "-m",
       "ui_test",

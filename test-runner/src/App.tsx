@@ -34,6 +34,8 @@ type StoredSettings = {
   cursorRuntime?: "cloud" | "local";
   testTarget?: "local" | "deployed";
   skipCursor?: boolean;
+  /** Legacy setting — migrated to testTarget on load. */
+  skipDeploy?: boolean;
 };
 
 function loadStoredSettings(): StoredSettings {
@@ -99,14 +101,16 @@ function applyStateFromServer(
 ) {
   const protect = options?.protectActiveRun ?? false;
 
-  if (typeof data.running === "boolean") {
-    if (!protect || data.running) {
-      setters.setRunning(data.running);
-    }
+  // While the client believes a run is active, ignore a "not running" snapshot only when
+  // the server has no final result either (start race). If the server has a result, the
+  // run genuinely ended while we were disconnected — accept the full snapshot.
+  const serverHasResult = Boolean(data.collaborationResult) || Boolean(data.lastResult);
+  if (protect && data.running === false && !serverHasResult) {
+    return;
   }
 
-  if (protect && !data.running) {
-    return;
+  if (typeof data.running === "boolean") {
+    setters.setRunning(data.running);
   }
 
   if (data.phase) setters.setActivePhase(data.phase);
@@ -225,9 +229,13 @@ export default function App() {
   const [helperPromptDraft, setHelperPromptDraft] = useState("");
   const [savingCollabConfig, setSavingCollabConfig] = useState(false);
   const [projectEnv, setProjectEnv] = useState<LocalEnvStatus | null>(null);
+  const [interveneNote, setInterveneNote] = useState("");
   const logRef = useRef<HTMLPreElement>(null);
   const runningRef = useRef(running);
   runningRef.current = running;
+  /** True between collaboration_start and collaboration_done — the python pipeline emits
+   * its own done/process_exit mid-loop and those must not end the run in the UI. */
+  const collabActiveRef = useRef(false);
 
   const runApiOptions = useMemo(() => runTargetOptions(testTargetMode), [testTargetMode]);
 
@@ -452,7 +460,10 @@ export default function App() {
       });
     }
     if (event.type === "run_state") {
-      setRunning(Boolean((event as { running?: boolean }).running));
+      const isRunning = Boolean((event as { running?: boolean }).running);
+      if (isRunning || !collabActiveRef.current) {
+        setRunning(isRunning);
+      }
     }
     if (event.type === "step") {
       setLastStep(event);
@@ -499,7 +510,7 @@ export default function App() {
       window.dispatchEvent(new CustomEvent("test-runner-event", { detail: event }));
     }
     if (event.type === "agent_card" && (event as { card?: AgentRunCard }).card) {
-      const card = (event as { card: AgentRunCard }).card;
+      const card = (event as unknown as { card: AgentRunCard }).card;
       setAgentCards((prev) => {
         const idx = prev.findIndex((c) => c.id === card.id);
         if (idx >= 0) {
@@ -511,6 +522,7 @@ export default function App() {
       });
     }
     if (event.type === "collaboration_start") {
+      collabActiveRef.current = true;
       const resumed = Boolean((event as { resumed?: boolean }).resumed);
       if (!resumed) {
         setAgentCards([]);
@@ -526,6 +538,7 @@ export default function App() {
       setLastResult(null);
     }
     if (event.type === "collaboration_done") {
+      collabActiveRef.current = false;
       const e = event as { ok?: boolean; answer?: string; error?: string; iterations?: number };
       setCollaborationResult({ ok: e.ok, answer: e.answer, error: e.error, iterations: e.iterations });
       setRunning(false);
@@ -546,12 +559,12 @@ export default function App() {
       setAgentCards([]);
       setCollaborationResult(null);
     }
-    if (event.type === "done") {
+    if (event.type === "done" && !collabActiveRef.current) {
       setRunning(false);
       setLastResult({ overall_ok: (event as { overall_ok?: boolean }).overall_ok });
       loadRunHistory();
     }
-    if (event.type === "process_exit") {
+    if (event.type === "process_exit" && !collabActiveRef.current) {
       setRunning(false);
     }
   }, [loadRunHistory]);
@@ -693,7 +706,7 @@ export default function App() {
   );
 
   const resumeFromRun = useCallback(
-    async (runId: string) => {
+    async (runId: string, note?: string) => {
       if (!project.trim() || running) return;
       persistSettings();
       void saveProjectToRegistry();
@@ -707,6 +720,7 @@ export default function App() {
         body: JSON.stringify({
           project,
           runId,
+          note: note?.trim() || undefined,
           ...runApiOptions,
           cursorRuntime,
           repoUrl: repoUrl || undefined,
@@ -716,6 +730,8 @@ export default function App() {
         const err = await res.json();
         applyEvent({ type: "log", message: err.error ?? "Failed to resume run", level: "error" });
         setRunning(false);
+      } else {
+        setInterveneNote("");
       }
     },
     [
@@ -742,6 +758,8 @@ export default function App() {
           helperModel: collabConfig?.helperModel ?? "composer-2.5",
           maxTestRetries: collabConfig?.maxTestRetries ?? 3,
           maxIterations: collabConfig?.maxIterations ?? 10,
+          maxQuestionRounds: collabConfig?.maxQuestionRounds ?? 2,
+          maxInfoRequests: collabConfig?.maxInfoRequests ?? 2,
         }),
       });
       const data = (await res.json()) as CollaborationConfig;
@@ -764,6 +782,7 @@ export default function App() {
     } catch {
       applyEvent({ type: "log", message: "Failed to stop run", level: "error" });
     }
+    collabActiveRef.current = false;
     setRunning(false);
   }, [applyEvent]);
 
@@ -843,6 +862,14 @@ export default function App() {
   const viewingRunCanResume = Boolean(
     viewingRunId && runHistory.find((run) => run.id === viewingRunId)?.canResume && !running,
   );
+  const currentRunResumable = runHistory.some((run) => run.id === "current" && run.canResume);
+  const resumeTargetId = !running
+    ? viewingRunId && viewingRunCanResume
+      ? viewingRunId
+      : currentRunResumable
+        ? "current"
+        : null
+    : null;
 
   const hasCollaboration = agentCards.length > 0 || Boolean(collaborationResult) || (running && !skipCursor);
 
@@ -1057,7 +1084,10 @@ export default function App() {
                 <p className="text-xs text-white/50">
                   Prepended to every helper prompt. The helper implements code, then requests UI checks via{" "}
                   <code className="text-white/70">### UI verification request</code> — the local agent runs those
-                  and returns answer + report. Max {collabConfig?.maxTestRetries ?? 3} failed verification retries.
+                  and returns answer + report. If the helper is missing a fact it can ask via{" "}
+                  <code className="text-white/70">### Info needed</code> (max {collabConfig?.maxInfoRequests ?? 2}{" "}
+                  rounds). After {collabConfig?.maxTestRetries ?? 3} failed verifications the helper gets one
+                  escalation round with full history before the run stops.
                 </p>
                 <textarea
                   className="min-h-32 w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 font-mono text-xs leading-relaxed"
@@ -1139,6 +1169,31 @@ export default function App() {
               skipDeploy={runApiOptions.skipDeploy}
               onStop={() => void stopRun()}
             />
+          ) : null}
+
+          {resumeTargetId ? (
+            <section className="surface-card shrink-0 space-y-2 border border-amber-500/20 p-4">
+              <h2 className="text-sm font-semibold uppercase tracking-wide text-amber-200/70">
+                Intervene &amp; resume
+              </h2>
+              <p className="text-xs text-white/55">
+                This run is stopped. Optionally add context or corrections for the agents, then resume where it
+                left off — the note is shown in the conversation and passed to both agents.
+              </p>
+              <textarea
+                className="min-h-20 w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm"
+                value={interveneNote}
+                onChange={(e) => setInterveneNote(e.target.value)}
+                placeholder="e.g. The button belongs on the settings page, not the navbar. Check /settings after the fix."
+              />
+              <button
+                type="button"
+                onClick={() => void resumeFromRun(resumeTargetId, interveneNote)}
+                className="rounded-md border border-amber-500/35 bg-amber-950/25 px-3 py-1.5 text-sm text-amber-100 hover:bg-amber-950/40"
+              >
+                {interveneNote.trim() ? "Resume with added context" : "Resume run"}
+              </button>
+            </section>
           ) : null}
 
           {showLiveSession ? (

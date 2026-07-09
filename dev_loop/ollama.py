@@ -7,19 +7,9 @@ import urllib.error
 import urllib.request
 from typing import Any
 
+from ui_test.prompts import get_prompt
+
 logger = logging.getLogger(__name__)
-
-ANALYZER_SYSTEM = """\
-You analyze software test results for a local coding assistant.
-Your output is consumed by Cursor (a code editor agent) that will implement fixes.
-
-Rules:
-- Base every failure and recommendation on the provided test output and git diff only.
-- Do not invent test names, stack traces, or files that are not supported by the input.
-- Prefer concrete file paths and actionable steps over vague advice.
-- If tests passed, summarize health and note any risky uncommitted changes from git status.
-- Output valid JSON only, matching the requested schema exactly.
-"""
 
 ANALYSIS_SCHEMA = {
     "summary": "One paragraph overview for the coding agent",
@@ -78,7 +68,7 @@ def analyze_test_results(
     payload = {
         "model": model,
         "messages": [
-            {"role": "system", "content": ANALYZER_SYSTEM},
+            {"role": "system", "content": get_prompt("dev_loop.analyzer")},
             {
                 "role": "user",
                 "content": (

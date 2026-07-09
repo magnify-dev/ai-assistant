@@ -2,13 +2,18 @@ import fs from "node:fs";
 import path from "node:path";
 import { readProjectBundle } from "./project-store.js";
 import { readOllamaConfig } from "./ollama.js";
+import { getPrompt, renderPrompt } from "./prompts.js";
 
 export type LocalEvaluation = {
   outcome: "answer" | "delegate";
+  /** delegate kind: "implementation" (default) needs code changes; "question" asks the helper to answer from the codebase. */
+  kind?: "implementation" | "question";
   answer?: string;
   prompt?: string;
   summary: string;
   testsPassed: boolean;
+  /** The concrete reason verification failed — used to detect a stuck loop (same failure repeating). */
+  failureNote?: string;
 };
 
 export type TriageResult = {
@@ -24,51 +29,6 @@ export type ExpandedHandoff = {
 };
 
 type CriterionResult = { criterion?: string; met?: boolean; note?: string };
-
-const TRIAGE_PROMPT = `You triage a user task for a two-agent workflow (local tester + implementation agent).
-
-Return ONLY valid JSON:
-{
-  "action": "test" | "handoff",
-  "reason": "short explanation",
-  "summary": "one line for UI"
-}
-
-Rules:
-- action=test when the user wants INFORMATION from the live app (counts, lists, what's on a page, verify login works) and no code change is requested.
-- action=handoff when the user wants something FIXED, CHANGED, IMPLEMENTED, or UPDATED in the codebase — especially if nothing has been implemented yet.
-- action=test when an implementation agent already made changes and we need to VERIFY on the live UI.
-- When helper_has_responded=false and the task requires code/UI changes, prefer handoff (skip baseline testing).`;
-
-const EXPAND_PROMPT = `You expand a user's task into a clear, rich brief for an implementation agent.
-
-Return ONLY valid JSON:
-{
-  "expanded_prompt": "markdown brief for the coder",
-  "summary": "one line",
-  "success_criteria": ["testable UI outcomes"]
-}
-
-The expanded_prompt should include:
-- Clear restatement of user intent
-- Success criteria (what "done" looks like on the page)
-- Any relevant project hints provided
-- Scope boundaries and acceptance checks
-
-The implementation agent will implement changes, then send back a "### UI verification request" for you to run on the live UI.
-If build, git push, deploy, or local dev setup fails, include those errors clearly — the implementation agent must fix them before UI verification can run.
-Do NOT write step-by-step code instructions or name specific files unless the user explicitly mentioned them.
-The implementation agent decides HOW to build it. Your job is CONTEXT and CLARITY for both coding and later UI verification.`;
-
-const VERIFY_PROMPT = `You verify whether a UI test run shows the user's task is COMPLETE on the live page.
-
-Return ONLY valid JSON:
-{ "verified": true | false, "summary": "one line for the user" }
-
-Rules:
-- verified=true ONLY when the requested change is clearly visible/working on the page.
-- verified=false when the issue still exists or findings describe work remaining.
-- "The task is to fix X" in findings means NOT verified.`;
 
 const UI_CHANGE_NOUNS =
   "button|btn|modal|dialog|popup|component|page|screen|view|tab|link|menu|field|form|input|feature|section|panel|card|banner|toast|notification|icon|tooltip|drawer|sidebar|header|footer|column|row|table|list|item|widget|toggle|switch|checkbox|dropdown|select|picker|editor|toolbar|navbar|layout|style|theme|hook|testid|data-testid";
@@ -204,12 +164,39 @@ function answerImpliesWorkRemaining(text: string): boolean {
   return WORK_REMAINING_PATTERNS.some((p) => p.test(text));
 }
 
+export function extractAnswerSection(helperResponse: string): string | null {
+  if (!helperResponse.trim()) return null;
+  const match = helperResponse.match(/#{1,3}\s*Answer\s*\n([\s\S]*?)(?=\n#{1,3}\s|\s*$)/i);
+  return match?.[1]?.trim() || null;
+}
+
 export function extractUiVerificationRequest(helperResponse: string): string | null {
   if (!helperResponse.trim()) return null;
 
   const patterns = [
     /#{1,3}\s*UI verification request\s*\n([\s\S]*?)(?=\n#{1,3}\s|\n```|\s*$)/i,
     /#{1,3}\s*Verification request\s*\n([\s\S]*?)(?=\n#{1,3}\s|\n```|\s*$)/i,
+  ];
+
+  for (const pattern of patterns) {
+    const match = helperResponse.match(pattern);
+    if (match?.[1]?.trim()) return match[1].trim();
+  }
+
+  return null;
+}
+
+/**
+ * The helper can ask the local agent for facts from the live app instead of guessing
+ * or giving up ("### Info needed"). Returns the question block, or null.
+ */
+export function extractInfoRequest(helperResponse: string): string | null {
+  if (!helperResponse.trim()) return null;
+
+  const patterns = [
+    /#{1,3}\s*Info(?:rmation)?\s+(?:needed|request(?:ed)?)\s*\n([\s\S]*?)(?=\n#{1,3}\s|\n```|\s*$)/i,
+    /#{1,3}\s*Need(?:ed)?\s+info(?:rmation)?\s*\n([\s\S]*?)(?=\n#{1,3}\s|\n```|\s*$)/i,
+    /#{1,3}\s*Questions?\s+for\s+the\s+local\s+agent\s*\n([\s\S]*?)(?=\n#{1,3}\s|\n```|\s*$)/i,
   ];
 
   for (const pattern of patterns) {
@@ -412,7 +399,7 @@ function fallbackExpand(taskText: string, projectPath: string, extra?: { verific
     extra?.reportMd ? `\n## UI test findings\n${extra.reportMd.slice(0, 2500)}` : "",
     ctx ? `\n## Project context\n${ctx}` : "",
     "",
-    "Implement the task. The local testing agent will verify on the live UI when you finish.",
+    getPrompt("collaboration.fallback_expand_footer"),
   ].filter(Boolean);
 
   return {
@@ -422,11 +409,10 @@ function fallbackExpand(taskText: string, projectPath: string, extra?: { verific
   };
 }
 
-export async function triageTask(
+export function triageTask(
   taskText: string,
-  projectPath: string,
   opts?: { previousHelperResponse?: string; helperSucceeded?: boolean },
-): Promise<TriageResult> {
+): TriageResult {
   const needsImpl = taskRequiresImplementation(taskText);
   const previousHelperResponse = opts?.previousHelperResponse;
   const helperSucceeded = opts?.helperSucceeded ?? false;
@@ -502,7 +488,7 @@ export async function expandPromptForHelper(
       body: JSON.stringify({
         model: cfg.model,
         messages: [
-          { role: "system", content: EXPAND_PROMPT },
+          { role: "system", content: getPrompt("collaboration.expand") },
           { role: "user", content: userContent },
         ],
         stream: false,
@@ -572,7 +558,7 @@ async function verifyWithOllama(
       body: JSON.stringify({
         model: cfg.model,
         messages: [
-          { role: "system", content: VERIFY_PROMPT },
+          { role: "system", content: getPrompt("collaboration.verify") },
           { role: "user", content: userContent },
         ],
         stream: false,
@@ -665,10 +651,13 @@ export async function verifyAfterTest(
       };
     }
     if (answerImpliesTaskNotDone(taskAnswer)) {
+      // The live UI did not contain the answer — ask the helper, which can read the codebase.
       return {
-        outcome: "answer",
+        outcome: "delegate",
+        kind: "question",
+        prompt: buildQuestionPrompt(taskText, taskAnswer),
         answer: taskAnswer,
-        summary: "Could not answer from visible UI",
+        summary: "Could not answer from visible UI — asking helper agent",
         testsPassed: false,
       };
     }
@@ -698,6 +687,7 @@ export async function verifyAfterTest(
         prompt: expanded.expandedPrompt,
         summary: "Helper did not provide verifiable UI checks",
         testsPassed: false,
+        failureNote: "Helper response missing a ### UI verification request section",
       };
     }
   }
@@ -716,6 +706,7 @@ export async function verifyAfterTest(
       prompt: expanded.expandedPrompt,
       summary: "UI verification failed",
       testsPassed: false,
+      failureNote: failReason,
     };
   }
 
@@ -741,6 +732,7 @@ export async function verifyAfterTest(
       prompt: expanded.expandedPrompt,
       summary: "UI verification failed",
       testsPassed: false,
+      failureNote: ollamaVerify.summary,
     };
   }
 
@@ -765,15 +757,82 @@ export async function verifyAfterTest(
     prompt: expanded.expandedPrompt,
     summary: "UI verification inconclusive",
     testsPassed: false,
+    failureNote: "Re-test did not clearly confirm the fix.",
   };
 }
 
-/** @deprecated use triageTask + verifyAfterTest */
-export async function evaluateLocalOutcome(
-  projectPath: string,
+/**
+ * Build a question handoff for the helper: the local agent explored the live UI but
+ * could not answer from what is visible. The helper answers from the codebase — no edits.
+ */
+export function buildQuestionPrompt(
   taskText: string,
-  _iteration: number,
-  previousHelperResponse?: string,
-): Promise<LocalEvaluation> {
-  return verifyAfterTest(projectPath, taskText, previousHelperResponse ?? "placeholder");
+  localFindings: string,
+): string {
+  return renderPrompt("collaboration.question_handoff", {
+    task: taskText,
+    findings: localFindings || "(no useful findings on the page)",
+  });
+}
+
+/**
+ * The helper asked for information from the live app ("### Info needed") and the
+ * local agent has now gathered it. Hand the findings back so the helper can implement.
+ */
+export function buildInfoReplyHandoff(
+  taskText: string,
+  infoRequest: string,
+  localFindings: string,
+  pipelineFailure?: string,
+): string {
+  return renderPrompt("collaboration.info_reply_handoff", {
+    task: taskText,
+    info_request: infoRequest,
+    findings:
+      localFindings ||
+      "(the local agent could not gather useful findings — state your best assumption and implement)",
+    pipeline_note: pipelineFailure
+      ? `\nNote: parts of the pipeline failed while gathering this:\n${pipelineFailure}\n`
+      : "",
+  });
+}
+
+/**
+ * Last-resort collaboration prompt before giving up: instead of repeating the same
+ * delta, give the helper the full history of attempts and ask it to rethink.
+ */
+export function buildEscalationPrompt(
+  taskText: string,
+  attemptHistory: string,
+  latestFailure: string,
+): string {
+  return renderPrompt("collaboration.escalation", {
+    task: taskText,
+    attempt_history: attemptHistory || "(no structured history available)",
+    latest_failure: latestFailure || "(see history above)",
+  });
+}
+
+/**
+ * Build a best-effort outcome message when the loop hits an iteration/retry limit,
+ * so the user gets the state of the collaboration instead of a bare error.
+ */
+export function buildBestEffortSummary(
+  reason: string,
+  conversationContext: string,
+  latestFailure?: string,
+): string {
+  const parts = [reason.trim()];
+  if (latestFailure?.trim()) {
+    parts.push("", `Last verification result: ${latestFailure.trim()}`);
+  }
+  if (conversationContext.trim()) {
+    const tail = conversationContext.trim();
+    parts.push(
+      "",
+      "What the agents did (most recent last):",
+      tail.length > 3000 ? `…${tail.slice(-3000)}` : tail,
+    );
+  }
+  return parts.join("\n");
 }

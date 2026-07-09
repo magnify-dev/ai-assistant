@@ -22,7 +22,3 @@ output:
   dir: ".agent/current"
   history_dir: ".agent/history"
   artifacts_dir: "ui-artifacts"
-
-web:
-  host: "127.0.0.1"
-  port: 8767
