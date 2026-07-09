@@ -13,6 +13,16 @@ export type CursorRunOptions = {
   modelId?: string;
 };
 
+const CONNECT_TIMEOUT_MS = 90_000;
+
+function connectionTimeoutMessage(runtime: CursorRuntime): string {
+  const base = `Cursor connection timed out after ${CONNECT_TIMEOUT_MS / 1000}s.`;
+  if (runtime === "cloud") {
+    return `${base} Check CURSOR_API_KEY and the GitHub repo URL, then cancel and re-run.`;
+  }
+  return `${base} Local runtime needs Cursor installed on this machine — open the Cursor app once, then cancel and re-run. Or switch Helper runtime to Cloud in the test-runner UI.`;
+}
+
 function formatToolActivity(name: string, status: string): string {
   if (status === "running") return `Using ${name}…`;
   if (status === "completed") return `${name} done`;
@@ -85,6 +95,7 @@ export class CursorRunner extends EventEmitter {
   private running = false;
   private abortRequested = false;
   private activeRun: Run | null = null;
+  private runGeneration = 0;
 
   get isRunning(): boolean {
     return this.running;
@@ -99,15 +110,80 @@ export class CursorRunner extends EventEmitter {
 
   /** Clear a stuck isRunning flag after force-stop (e.g. hung Agent.create). */
   forceReset(): void {
-    this.abortRequested = false;
+    this.runGeneration += 1;
+    this.abortRequested = true;
     this.activeRun = null;
     this.running = false;
+  }
+
+  private emitConnecting(runtime: CursorRuntime, elapsedSec?: number): void {
+    const suffix = elapsedSec && elapsedSec > 0 ? ` ${elapsedSec}s` : "";
+    this.emit("event", {
+      type: "cursor_activity",
+      activity: `Connecting to Cursor (${runtime})…${suffix}`,
+      kind: "status",
+    });
+  }
+
+  private async createAgent(
+    options: CursorRunOptions,
+    modelId: string,
+    generation: number,
+  ): Promise<AsyncDisposable & { agentId: string; send: (message: string) => Promise<Run> }> {
+    const start = Date.now();
+    const heartbeat = setInterval(() => {
+      if (generation !== this.runGeneration) return;
+      const secs = Math.round((Date.now() - start) / 1000);
+      this.emitConnecting(options.runtime, secs);
+    }, 5000);
+
+    const createPromise =
+      options.runtime === "cloud"
+        ? Agent.create({
+            apiKey: options.apiKey,
+            model: { id: modelId },
+            cloud: {
+              repos: [{ url: options.repoUrl! }],
+            },
+          })
+        : Agent.create({
+            apiKey: options.apiKey,
+            model: { id: modelId },
+            local: {
+              cwd: options.cwd,
+              settingSources: [],
+            },
+          });
+
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const agent = await Promise.race([
+        createPromise,
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => {
+            reject(new Error(connectionTimeoutMessage(options.runtime)));
+          }, CONNECT_TIMEOUT_MS);
+        }),
+      ]);
+
+      if (this.abortRequested || generation !== this.runGeneration) {
+        await agent[Symbol.asyncDispose]();
+        throw new Error("Cancelled by user");
+      }
+
+      return agent;
+    } finally {
+      clearInterval(heartbeat);
+      if (timer) clearTimeout(timer);
+    }
   }
 
   async run(options: CursorRunOptions): Promise<{ ok: boolean; agentId?: string; runId?: string; error?: string; cancelled?: boolean }> {
     if (this.running) {
       throw new Error("Cursor agent already running");
     }
+    const generation = this.runGeneration + 1;
+    this.runGeneration = generation;
     this.running = true;
     this.abortRequested = false;
     this.emit("event", {
@@ -115,75 +191,69 @@ export class CursorRunner extends EventEmitter {
       status: "starting",
       message: `Starting ${options.runtime} Cursor agent…`,
     });
-    this.emit("event", {
-      type: "cursor_activity",
-      activity: `Connecting to Cursor (${options.runtime})…`,
-      kind: "status",
-    });
+    this.emitConnecting(options.runtime);
 
     const modelId = options.modelId || "composer-2.5";
 
     try {
-      if (options.runtime === "cloud") {
-        if (!options.repoUrl) {
-          throw new Error("repoUrl is required for cloud runtime");
-        }
-        return await this.runWithAgent(
-          await Agent.create({
-            apiKey: options.apiKey,
-            model: { id: modelId },
-            cloud: {
-              repos: [{ url: options.repoUrl }],
-            },
-          }),
-          options,
-          {
-            status: "agent_ready",
-            message: "Cloud agent created — open Cursor → Agents sidebar to follow along",
-            cursorUiHint: "cloud_agents_window",
-          },
-        );
+      if (options.runtime === "cloud" && !options.repoUrl) {
+        throw new Error("repoUrl is required for cloud runtime");
+      }
+
+      const agent = await this.createAgent(options, modelId, generation);
+      if (generation !== this.runGeneration) {
+        return { ok: false, cancelled: true, error: "Cancelled by user" };
       }
 
       return await this.runWithAgent(
-        await Agent.create({
-          apiKey: options.apiKey,
-          model: { id: modelId },
-          local: {
-            cwd: options.cwd,
-            settingSources: [],
-          },
-        }),
+        agent,
         options,
-        {
-          status: "agent_ready",
-          message:
-            "Local agent started via SDK bridge. For full IDE visibility, prefer Cloud runtime (shows in Cursor Agents sidebar).",
-          cursorUiHint: "local_bridge",
-        },
+        generation,
+        options.runtime === "cloud"
+          ? {
+              status: "agent_ready",
+              message: "Cloud agent created — open Cursor → Agents sidebar to follow along",
+              cursorUiHint: "cloud_agents_window",
+            }
+          : {
+              status: "agent_ready",
+              message:
+                "Local agent started via SDK bridge. For full IDE visibility, prefer Cloud runtime (shows in Cursor Agents sidebar).",
+              cursorUiHint: "local_bridge",
+            },
       );
     } catch (err) {
+      const cancelled = this.abortRequested || generation !== this.runGeneration;
       const message =
-        err instanceof CursorAgentError
-          ? `${err.message} (retryable=${err.isRetryable})`
-          : err instanceof Error
-            ? err.message
-            : String(err);
-      this.emit("event", { type: "cursor", status: "error", message });
-      return { ok: false, error: message };
+        cancelled && !(err instanceof Error && err.message.includes("timed out"))
+          ? "Cancelled by user"
+          : err instanceof CursorAgentError
+            ? `${err.message} (retryable=${err.isRetryable})`
+            : err instanceof Error
+              ? err.message
+              : String(err);
+      this.emit("event", { type: "cursor", status: cancelled ? "cancelled" : "error", message });
+      return { ok: false, cancelled, error: message };
     } finally {
-      this.running = false;
-      this.activeRun = null;
-      this.abortRequested = false;
+      if (generation === this.runGeneration) {
+        this.running = false;
+        this.activeRun = null;
+        this.abortRequested = false;
+      }
     }
   }
 
   private async runWithAgent(
     agent: AsyncDisposable & { agentId: string; send: (message: string) => Promise<Run> },
     options: CursorRunOptions,
+    generation: number,
     readyEvent: { status: string; message: string; cursorUiHint?: string },
   ): Promise<{ ok: boolean; agentId?: string; runId?: string; error?: string; cancelled?: boolean }> {
     await using _agent = agent;
+
+    if (generation !== this.runGeneration) {
+      return { ok: false, cancelled: true, error: "Cancelled by user" };
+    }
 
     this.emit("event", {
       type: "cursor",
@@ -207,7 +277,7 @@ export class CursorRunner extends EventEmitter {
     const streamTask = (async () => {
       try {
         for await (const event of run.stream()) {
-          if (this.abortRequested) break;
+          if (this.abortRequested || generation !== this.runGeneration) break;
           handleSdkMessage(this, event);
         }
       } catch {
@@ -218,7 +288,8 @@ export class CursorRunner extends EventEmitter {
     const result = await run.wait();
     await streamTask.catch(() => {});
 
-    const cancelled = result.status === "cancelled" || this.abortRequested;
+    const cancelled =
+      result.status === "cancelled" || this.abortRequested || generation !== this.runGeneration;
     const ok = result.status === "finished";
     this.emit("event", {
       type: "cursor",
