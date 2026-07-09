@@ -1,4 +1,4 @@
-export type PhaseStatus = "idle" | "running" | "done" | "failed";
+export type PhaseStatus = "idle" | "running" | "done" | "failed" | "skipped" | "warning";
 
 export type PhaseKey =
   | "ollama"

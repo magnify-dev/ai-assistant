@@ -140,6 +140,18 @@ def set_running(running: bool) -> None:
 def phase_start(phase: Phase, message: str = "") -> None:
     _run_state["phase"] = phase.value
     phases = dict(_run_state.get("phases") or {})
+    for key, entry in list(phases.items()):
+        if key != phase.value and entry.get("status") == "running":
+            prev_msg = str(entry.get("message") or "").strip()
+            phases[key] = {"status": "done", "message": prev_msg}
+            _dispatch(
+                {
+                    "type": "phase",
+                    "phase": key,
+                    "status": "done",
+                    "message": prev_msg,
+                }
+            )
     phases[phase.value] = {"status": "running", "message": message}
     _run_state["phases"] = phases
     _dispatch({"type": "phase", "phase": phase.value, "status": "running", "message": message})

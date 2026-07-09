@@ -16,6 +16,7 @@ class GitDeployState:
     push_attempted: bool
     push_ok: bool
     push_message: str
+    push_sent_commits: bool = False
 
 
 def _git(project: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -68,17 +69,24 @@ def collect_git_deploy_state(project: Path, *, do_push: bool = False) -> GitDepl
     push_attempted = False
     push_ok = False
     push_message = ""
+    push_sent_commits = False
     if do_push:
         push_attempted = True
         if has_uncommitted:
             push_ok = False
             push_message = "Cannot push: uncommitted changes present"
         else:
+            unpushed_at_push = unpushed
             proc = _git(project, "push")
             push_ok = proc.returncode == 0
             push_message = (proc.stderr or proc.stdout or "").strip() or (
                 "Push succeeded" if push_ok else "Push failed"
             )
+            if push_ok and unpushed_at_push > 0:
+                push_sent_commits = True
+            elif push_ok:
+                combined = push_message.lower()
+                push_sent_commits = "everything up-to-date" not in combined and "up to date" not in combined
 
     return GitDeployState(
         is_repo=True,
@@ -90,4 +98,5 @@ def collect_git_deploy_state(project: Path, *, do_push: bool = False) -> GitDepl
         push_attempted=push_attempted,
         push_ok=push_ok,
         push_message=push_message,
+        push_sent_commits=push_sent_commits,
     )

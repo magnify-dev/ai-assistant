@@ -14,6 +14,9 @@ export type AgentRunCard = {
   completedAt?: string;
   summary?: string;
   outcomeType?: "answer" | "prompt" | "response";
+  /** Live process text while running; cleared when the card finishes. */
+  streamStatus?: string;
+  streamText?: string;
   outcomeText?: string;
   messages?: AgentCardMessage[];
   historical?: boolean;

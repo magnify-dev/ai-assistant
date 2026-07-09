@@ -5,6 +5,14 @@ import { PHASES, type PhaseKey, type PhaseMap } from "@/types";
 import { CollaborationPanel } from "@/components/CollaborationPanel";
 import { ExplorationPanel } from "@/components/ExplorationPanel";
 import { ProgressCard, phaseToStatus, type ProgressStatus } from "@/components/ProgressCard";
+import {
+  collaborationPipelineKeys,
+  pipelineCardStatus,
+  pipelineCardSummary,
+  resolveActiveRunStep,
+  stepLabel,
+  type RunStepKey,
+} from "@/lib/runProgress";
 import { cn } from "@/lib/utils";
 
 type Props = {
@@ -54,26 +62,6 @@ function pipelineStepKeys(
   return keys;
 }
 
-/** Git → deploy wait → health → UI test — shown during collaboration verify runs. */
-function deployVerifyStepKeys(
-  testTargetMode: "local" | "deployed",
-  skipDeploy: boolean,
-  hasTask: boolean,
-  runReport: RunReport | null,
-  phases: PhaseMap,
-): PhaseKey[] {
-  const exploration = isExplorationMode(hasTask, runReport, phases);
-  const keys: PhaseKey[] = ["git"];
-  if (testTargetMode === "local") {
-    keys.push("local_server");
-  } else if (!skipDeploy) {
-    keys.push("deploy");
-  }
-  keys.push("health");
-  keys.push(exploration ? "exploration" : "ui_test");
-  return keys;
-}
-
 const PIPELINE_PHASE_KEYS = new Set<PhaseKey>([
   "ollama",
   "task_structure",
@@ -90,20 +78,48 @@ function hasPipelinePhaseActivity(phases: PhaseMap): boolean {
   return Object.keys(phases).some((key) => PIPELINE_PHASE_KEYS.has(key as PhaseKey));
 }
 
+function renderCollaborationPipeline(
+  stepKeys: RunStepKey[],
+  phases: PhaseMap,
+  agentCards: AgentRunCard[],
+  running: boolean,
+  activeKey: RunStepKey | undefined,
+) {
+  return stepKeys.map((key) => {
+    const status = pipelineCardStatus(key, phases, agentCards, activeKey);
+    const summary = pipelineCardSummary(key, phases, agentCards);
+    return (
+      <ProgressCard
+        key={key}
+        title={stepLabel(key)}
+        status={status}
+        summary={
+          summary ||
+          (status === "idle" && running && key !== activeKey ? "Pending…" : undefined)
+        }
+        defaultOpen={status === "failed" || status === "running"}
+        highlight={key === "deploy" || key === "git" || key === "cursor" || key === "exploration" || key === "ui_test"}
+      />
+    );
+  });
+}
+
 function renderStepCards(
   stepKeys: PhaseKey[],
   phases: PhaseMap,
   running: boolean,
   structuredTask: StructuredTask | null,
+  activeKey: PhaseKey | undefined,
 ) {
   return stepKeys.map((key) => {
     const phase = phases[key];
     const isTask = key === "task_structure";
-    const status = stepStatus(key, phase, running, structuredTask);
+    const status = stepStatus(key, phase, activeKey);
     const label = phaseLabel(key);
     const summary =
       phase?.message ||
-      (isTask && running && !structuredTask ? "Structuring…" : status === "idle" && running ? "Pending…" : undefined);
+      (isTask && structuredTask?.summary ? structuredTask.summary : undefined) ||
+      (status === "idle" && running && key !== activeKey ? "Pending…" : undefined);
 
     return (
       <ProgressCard
@@ -161,11 +177,11 @@ function resolveTaskAnswer(runReport: RunReport | null): string {
 function stepStatus(
   key: PhaseKey,
   phase: PhaseMap[string] | undefined,
-  running: boolean,
-  structuredTask: StructuredTask | null,
+  activeKey: PhaseKey | undefined,
 ): ProgressStatus {
+  if (key === activeKey) return "running";
+  if (phase?.status === "skipped") return "done";
   if (phase?.status) return phaseToStatus(phase);
-  if (key === "task_structure" && running && !structuredTask) return "running";
   return "idle";
 }
 
@@ -196,13 +212,28 @@ export function RunProgressPanel({
     [testTargetMode, skipDeploy, hasTask, runReport, phases],
   );
 
-  const deployStepKeys = useMemo(
-    () => deployVerifyStepKeys(testTargetMode, skipDeploy, hasTask, runReport, phases),
-    [testTargetMode, skipDeploy, hasTask, runReport, phases],
-  );
-
   const taskAnswer = useMemo(() => resolveTaskAnswer(runReport), [runReport]);
   const taskAnswerPlain = plainAnswer(taskAnswer);
+
+  const exploration = isExplorationMode(hasTask, runReport, phases);
+
+  const activeStep = useMemo(
+    () => resolveActiveRunStep(phases, agentCards, running),
+    [phases, agentCards, running],
+  );
+  const activeKey = activeStep?.key;
+
+  const collabPipelineKeys = useMemo(
+    () => collaborationPipelineKeys(testTargetMode, skipDeploy, exploration),
+    [testTargetMode, skipDeploy, exploration],
+  );
+
+  const fullPipelineActiveKey = useMemo(() => {
+    for (const key of stepKeys) {
+      if (phases[key]?.status === "running") return key;
+    }
+    return undefined;
+  }, [stepKeys, phases]);
 
   const showCursor = !skipCursor && agentCards.length === 0;
   const showCollaboration = agentCards.length > 0 || Boolean(collaborationResult);
@@ -255,12 +286,12 @@ export function RunProgressPanel({
 
         {showDeployPipeline ? (
           <>
-            <p className="text-[10px] font-semibold uppercase tracking-wide text-white/40">Deploy &amp; verify</p>
-            {renderStepCards(deployStepKeys, phases, running, structuredTask)}
+            <p className="text-[10px] font-semibold uppercase tracking-wide text-white/40">Pipeline</p>
+            {renderCollaborationPipeline(collabPipelineKeys, phases, agentCards, running, activeKey)}
           </>
         ) : null}
 
-        {showFullPipeline ? renderStepCards(stepKeys, phases, running, structuredTask) : null}
+        {showFullPipeline ? renderStepCards(stepKeys, phases, running, structuredTask, fullPipelineActiveKey) : null}
 
         <ProgressCard
           title="Report"

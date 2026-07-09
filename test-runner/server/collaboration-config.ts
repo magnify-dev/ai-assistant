@@ -63,6 +63,16 @@ Do not write unit tests or ask the local agent to read source code — only thin
   maxIterations: 10,
 };
 
+const MODEL_ALIASES: Record<string, string> = {
+  "composer-2.5-fast": "composer-2.5",
+  "composer-2-fast": "composer-2",
+};
+
+export function normalizeHelperModel(model?: string): string {
+  const trimmed = model?.trim() || DEFAULT_CONFIG.helperModel;
+  return MODEL_ALIASES[trimmed] ?? trimmed;
+}
+
 export function readCollaborationConfig(): CollaborationConfig {
   try {
     if (!fs.existsSync(CONFIG_PATH)) {
@@ -72,7 +82,7 @@ export function readCollaborationConfig(): CollaborationConfig {
     const raw = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8")) as Partial<CollaborationConfig>;
     return {
       helperPrompt: raw.helperPrompt ?? DEFAULT_CONFIG.helperPrompt,
-      helperModel: raw.helperModel ?? DEFAULT_CONFIG.helperModel,
+      helperModel: normalizeHelperModel(raw.helperModel),
       maxTestRetries: raw.maxTestRetries ?? DEFAULT_CONFIG.maxTestRetries,
       maxIterations: raw.maxIterations ?? DEFAULT_CONFIG.maxIterations,
     };
@@ -85,7 +95,7 @@ export function writeCollaborationConfig(config: CollaborationConfig): Collabora
   fs.mkdirSync(path.dirname(CONFIG_PATH), { recursive: true });
   const normalized: CollaborationConfig = {
     helperPrompt: config.helperPrompt.trim() || DEFAULT_CONFIG.helperPrompt,
-    helperModel: config.helperModel.trim() || DEFAULT_CONFIG.helperModel,
+    helperModel: normalizeHelperModel(config.helperModel),
     maxTestRetries: Math.max(1, Math.min(10, config.maxTestRetries || DEFAULT_CONFIG.maxTestRetries)),
     maxIterations: Math.max(1, Math.min(20, config.maxIterations || DEFAULT_CONFIG.maxIterations)),
   };

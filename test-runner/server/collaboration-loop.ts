@@ -10,8 +10,10 @@ import {
   pipelineFailureSummary,
   pipelineStopError,
   readRunPayload,
+  taskRequiresImplementation,
   triageTask,
   verifyAfterTest,
+  extractUiVerificationRequest,
 } from "./collaboration-eval.js";
 import {
   buildConversationContext,
@@ -22,6 +24,9 @@ import {
 } from "./collaboration-transcript.js";
 import { CursorRunner } from "./cursor-agent.js";
 import { PythonRunner, type RunOptions } from "./python-runner.js";
+import { resolveCursorRuntime } from "./run-target.js";
+import { HelperStreamAggregator } from "./helper-stream.js";
+import { gitWorktreeChanged, gitWorktreeSnapshot } from "./helper-git.js";
 
 export type AgentCard = {
   id: string;
@@ -33,10 +38,20 @@ export type AgentCard = {
   completedAt?: string;
   summary?: string;
   outcomeType?: "answer" | "prompt" | "response";
+  /** Live process text while running; cleared when the card finishes. */
+  streamStatus?: string;
+  streamText?: string;
   outcomeText?: string;
   messages?: Array<{ role: string; text: string; ts?: string }>;
   historical?: boolean;
 };
+
+class RunCancelledError extends Error {
+  constructor() {
+    super("Run cancelled by user");
+    this.name = "RunCancelledError";
+  }
+}
 
 export type CollaborationRunOptions = RunOptions & {
   cursorRuntime?: "cloud" | "local";
@@ -49,6 +64,10 @@ export class CollaborationLoop extends EventEmitter {
   private pythonRunner: PythonRunner;
   private cursorRunner: CursorRunner;
   private active = false;
+  private cancelled = false;
+  private finished = false;
+  private runProject = "";
+  private runTask = "";
   private cards: AgentCard[] = [];
 
   constructor(pythonRunner: PythonRunner, cursorRunner: CursorRunner) {
@@ -59,6 +78,60 @@ export class CollaborationLoop extends EventEmitter {
 
   get isActive(): boolean {
     return this.active;
+  }
+
+  /** Clear stuck active flag when child runners have already exited. */
+  resetIfStale(): boolean {
+    if (!this.active) return false;
+    if (this.pythonRunner.running || this.cursorRunner.isRunning) return false;
+    this.active = false;
+    this.cancelled = false;
+    this.emit("event", { type: "run_state", running: false });
+    return true;
+  }
+
+  /** Abort an in-flight collaboration loop (python pipeline and/or helper agent). */
+  cancel(): void {
+    this.cancelled = true;
+    this.pythonRunner.stop();
+    this.cursorRunner.cancel();
+  }
+
+  /** Cancel and immediately emit collaboration_done for the UI. */
+  forceStop(): void {
+    this.cancel();
+    this.cursorRunner.forceReset();
+    this.failRunningCards("Cancelled");
+    if (this.finished) return;
+    if (this.active) {
+      this.finishCollaboration(this.runProject, this.runTask, {
+        ok: false,
+        error: "Cancelled by user",
+      });
+    }
+    this.active = false;
+    this.emit("event", { type: "run_state", running: false });
+  }
+
+  private checkCancelled(): void {
+    if (this.cancelled || this.finished) {
+      throw new RunCancelledError();
+    }
+  }
+
+  private failRunningCards(reason: string): void {
+    for (const card of this.cards) {
+      if (card.status !== "running") continue;
+      this.finishCard(card, {
+        status: "failed",
+        summary: reason,
+        outcomeType: card.outcomeType ?? "response",
+        outcomeText: card.outcomeText?.trim() || card.streamText?.trim() || reason,
+        streamStatus: undefined,
+        streamText: undefined,
+        messages: card.messages,
+      });
+    }
   }
 
   get agentCards(): AgentCard[] {
@@ -95,7 +168,9 @@ export class CollaborationLoop extends EventEmitter {
 
   private finishCard(
     card: AgentCard,
-    update: Partial<Pick<AgentCard, "status" | "summary" | "outcomeType" | "outcomeText" | "messages">>,
+    update: Partial<
+      Pick<AgentCard, "status" | "summary" | "outcomeType" | "outcomeText" | "streamStatus" | "streamText" | "messages">
+    >,
   ) {
     this.upsertCard({
       ...card,
@@ -131,6 +206,8 @@ export class CollaborationLoop extends EventEmitter {
     task: string,
     result: { ok: boolean; answer?: string; error?: string; iterations?: number },
   ) {
+    if (this.finished) return result;
+    this.finished = true;
     this.persistTranscript(project, task, result);
     this.emit("event", { type: "collaboration_done", ...result });
     return result;
@@ -145,11 +222,16 @@ export class CollaborationLoop extends EventEmitter {
     }
 
     this.active = true;
+    this.cancelled = false;
+    this.finished = false;
     const taskText = options.resumeFrom?.task ?? options.task ?? "";
+    this.runProject = options.project;
+    this.runTask = taskText;
     const config = readCollaborationConfig();
     let iteration = 0;
     let testFailures = 0;
     let helperContext = "";
+    let helperSucceeded = false;
     let conversationContext = "";
     let resumePlan: ResumePlan | null = null;
 
@@ -170,6 +252,7 @@ export class CollaborationLoop extends EventEmitter {
       this.cards = [];
       this.emit("event", { type: "collaboration_start", task: taskText });
     }
+    this.emit("event", { type: "run_state", running: true });
 
     try {
       if (resumePlan?.nextAction === "helper") {
@@ -187,22 +270,24 @@ export class CollaborationLoop extends EventEmitter {
           resumePlan.iteration,
           helperPrompt,
           conversationContext,
+          taskText,
         );
-        if (!helperResult.ok) {
-          if (isNonRetryableHelperError(helperResult.error)) {
-            return this.finishCollaboration(
+        if (!helperResult.ok && isNonRetryableHelperError(helperResult.error)) {
+          return this.finishCollaboration(
+            options.project,
+            taskText,
+            abortOnHelperError(
               options.project,
               taskText,
-              abortOnHelperError(
-                options.project,
-                taskText,
-                resumePlan.iteration,
-                helperResult.error ?? "Helper agent failed (non-retryable)",
-              ),
-            );
-          }
+              resumePlan.iteration,
+              helperResult.error ?? "Helper agent failed (non-retryable)",
+            ),
+          );
         }
-        helperContext = helperResult.responseText;
+        if (helperResult.succeeded) {
+          helperContext = helperResult.responseText;
+          helperSucceeded = true;
+        }
         conversationContext = buildFullConversationContext(this.cards);
         resumePlan = null;
       }
@@ -210,10 +295,21 @@ export class CollaborationLoop extends EventEmitter {
       while (iteration < config.maxIterations) {
         iteration++;
         resumePlan = null;
+        this.checkCancelled();
 
         const localCard = this.startCard("local", iteration, "Local agent (Ollama)");
+        this.emit("event", {
+          type: "phase",
+          phase: "collaboration",
+          status: "running",
+          message: `Local agent iteration ${iteration} — triaging task…`,
+        });
 
-        const triage = await triageTask(taskText, options.project, helperContext || undefined);
+        const triage = await triageTask(taskText, options.project, {
+          previousHelperResponse: helperContext || undefined,
+          helperSucceeded,
+        });
+        this.checkCancelled();
         localCard.messages = [
           ...(localCard.messages ?? []),
           { role: "triage", text: `${triage.action.toUpperCase()}: ${triage.reason}`, ts: new Date().toISOString() },
@@ -233,6 +329,7 @@ export class CollaborationLoop extends EventEmitter {
             mode: "initial",
             previousHelperResponse: helperContext || undefined,
           });
+          this.checkCancelled();
 
           this.finishCard(localCard, {
             status: "done",
@@ -240,6 +337,13 @@ export class CollaborationLoop extends EventEmitter {
             outcomeType: "prompt",
             outcomeText: expanded.expandedPrompt,
             messages: localCard.messages,
+          });
+
+          this.emit("event", {
+            type: "phase",
+            phase: "collaboration",
+            status: "done",
+            message: "Handoff prompt ready — starting helper agent",
           });
 
           if (!options.apiKey) {
@@ -257,26 +361,34 @@ export class CollaborationLoop extends EventEmitter {
             iteration,
             helperPrompt,
             conversationContext,
+            taskText,
           );
 
-          helperContext = cursorResult.responseText;
-          conversationContext = buildFullConversationContext(this.cards);
-
-          if (!cursorResult.ok) {
-            if (isNonRetryableHelperError(cursorResult.error)) {
-              return this.finishCollaboration(
+          if (!cursorResult.ok && isNonRetryableHelperError(cursorResult.error)) {
+            return this.finishCollaboration(
+              options.project,
+              taskText,
+              abortOnHelperError(
                 options.project,
                 taskText,
-                abortOnHelperError(
-                  options.project,
-                  taskText,
-                  iteration,
-                  cursorResult.error ?? "Helper agent failed (non-retryable)",
-                ),
-              );
-            }
+                iteration,
+                cursorResult.error ?? "Helper agent failed (non-retryable)",
+              ),
+            );
           }
-          continue;
+
+          if (cursorResult.succeeded) {
+            helperContext = cursorResult.responseText;
+            helperSucceeded = true;
+            conversationContext = buildFullConversationContext(this.cards);
+            continue;
+          }
+
+          return this.finishCollaboration(options.project, taskText, {
+            ok: false,
+            error: cursorResult.error ?? "Helper agent did not implement code changes",
+            iterations: iteration,
+          });
         }
 
         // --- Test path: run UI pipeline then verify ---
@@ -294,8 +406,20 @@ export class CollaborationLoop extends EventEmitter {
               : `Running UI tests (iteration ${iteration})…`,
         });
 
+        this.emit("event", {
+          type: "phase",
+          phase: "cursor",
+          status: "done",
+          message: "Helper finished — running deploy & UI pipeline",
+        });
+
         const pythonRun = await this.runPythonOnce({ ...options, task: localTask }, localCard.id);
+        this.checkCancelled();
+        if (pythonRun.failedPhases.some((p) => /cancelled/i.test(p))) {
+          throw new RunCancelledError();
+        }
         if (!pythonRun.ok) {
+          this.checkCancelled();
           const pipelinePayload = readRunPayload(options.project);
 
           localCard.messages = [
@@ -307,7 +431,7 @@ export class CollaborationLoop extends EventEmitter {
             },
           ];
 
-          if (isGitOrDeployBlockingFailure(pythonRun.failedPhases)) {
+          if (isGitOrDeployBlockingFailure(pythonRun.failedPhases, { skipDeploy: options.skipDeploy })) {
             const stopMessage = pipelineStopError(pythonRun.failedPhases, pipelinePayload);
             this.finishCard(localCard, {
               status: "failed",
@@ -353,25 +477,27 @@ export class CollaborationLoop extends EventEmitter {
             iteration,
             helperPrompt,
             conversationContext,
+            taskText,
           );
 
-          helperContext = cursorResult.responseText;
-          conversationContext = buildFullConversationContext(this.cards);
-
-          if (!cursorResult.ok) {
-            if (isNonRetryableHelperError(cursorResult.error)) {
-              return this.finishCollaboration(
+          if (!cursorResult.ok && isNonRetryableHelperError(cursorResult.error)) {
+            return this.finishCollaboration(
+              options.project,
+              taskText,
+              abortOnHelperError(
                 options.project,
                 taskText,
-                abortOnHelperError(
-                  options.project,
-                  taskText,
-                  iteration,
-                  cursorResult.error ?? "Helper agent failed (non-retryable)",
-                ),
-              );
-            }
+                iteration,
+                cursorResult.error ?? "Helper agent failed (non-retryable)",
+              ),
+            );
           }
+
+          if (cursorResult.succeeded) {
+            helperContext = cursorResult.responseText;
+            helperSucceeded = true;
+          }
+          conversationContext = buildFullConversationContext(this.cards);
           continue;
         }
 
@@ -380,6 +506,7 @@ export class CollaborationLoop extends EventEmitter {
           taskText,
           helperContext || undefined,
         );
+        this.checkCancelled();
 
         if (!verification.testsPassed) {
           testFailures++;
@@ -387,16 +514,18 @@ export class CollaborationLoop extends EventEmitter {
 
         if (verification.outcome === "answer") {
           const finalAnswer = verification.answer ?? verification.summary;
+          const passed = verification.testsPassed;
           this.finishCard(localCard, {
-            status: "done",
+            status: passed ? "done" : "failed",
             summary: verification.summary,
             outcomeType: "answer",
             outcomeText: finalAnswer,
             messages: localCard.messages,
           });
           return this.finishCollaboration(options.project, taskText, {
-            ok: true,
-            answer: finalAnswer,
+            ok: passed,
+            answer: passed ? finalAnswer : undefined,
+            error: passed ? undefined : finalAnswer || verification.summary,
             iterations: iteration,
           });
         }
@@ -442,9 +571,26 @@ export class CollaborationLoop extends EventEmitter {
           iteration,
           helperPrompt,
           conversationContext,
+          taskText,
         );
 
-        helperContext = cursorResult.responseText;
+        if (!cursorResult.ok && isNonRetryableHelperError(cursorResult.error)) {
+          return this.finishCollaboration(
+            options.project,
+            taskText,
+            abortOnHelperError(
+              options.project,
+              taskText,
+              iteration,
+              cursorResult.error ?? "Helper agent failed (non-retryable)",
+            ),
+          );
+        }
+
+        if (cursorResult.succeeded) {
+          helperContext = cursorResult.responseText;
+          helperSucceeded = true;
+        }
         conversationContext = buildFullConversationContext(this.cards);
 
         if (extractUiVerificationRequest(helperContext)) {
@@ -456,18 +602,14 @@ export class CollaborationLoop extends EventEmitter {
           });
         }
 
-        if (!cursorResult.ok) {
-          if (isNonRetryableHelperError(cursorResult.error)) {
-            return this.finishCollaboration(
-              options.project,
-              taskText,
-              abortOnHelperError(
-                options.project,
-                taskText,
-                iteration,
-                cursorResult.error ?? "Helper agent failed (non-retryable)",
-              ),
-            );
+        if (!cursorResult.succeeded) {
+          testFailures++;
+          if (testFailures >= config.maxTestRetries) {
+            return this.finishCollaboration(options.project, taskText, {
+              ok: false,
+              error: cursorResult.error ?? `Stopped after ${config.maxTestRetries} failed helper attempts`,
+              iterations: iteration,
+            });
           }
         }
       }
@@ -477,8 +619,22 @@ export class CollaborationLoop extends EventEmitter {
         error: `Max iterations (${config.maxIterations}) reached`,
         iterations: iteration,
       });
+    } catch (err) {
+      if (err instanceof RunCancelledError || this.cancelled) {
+        this.failRunningCards("Cancelled");
+        if (!this.finished) {
+          return this.finishCollaboration(options.project, taskText, {
+            ok: false,
+            error: "Cancelled by user",
+            iterations: iteration,
+          });
+        }
+        return { ok: false, error: "Cancelled by user" };
+      }
+      throw err;
     } finally {
       this.active = false;
+      this.cancelled = false;
       this.emit("event", { type: "run_state", running: false });
     }
   }
@@ -489,54 +645,131 @@ export class CollaborationLoop extends EventEmitter {
     iteration: number,
     helperPrompt: string,
     _conversationContext: string,
-  ): Promise<{ ok: boolean; responseText: string; error?: string }> {
-    const helperCard = this.startCard("helper", iteration, `Helper (${config.helperModel})`);
-    helperCard.messages = [{ role: "user", text: helperPrompt, ts: new Date().toISOString() }];
-    this.upsertCard(helperCard);
+    taskText: string,
+  ): Promise<{
+    ok: boolean;
+    succeeded: boolean;
+    responseText: string;
+    error?: string;
+    cancelled?: boolean;
+  }> {
+    const needsCode = taskRequiresImplementation(taskText);
+    const cursorTarget = resolveCursorRuntime(options.cursorRuntime, options.repoUrl);
 
-    this.emit("event", {
-      type: "phase",
-      phase: "cursor",
-      status: "running",
-      message: `Helper agent iteration ${iteration}…`,
-    });
+    const execute = async (prompt: string, labelSuffix = "") => {
+      const helperCard = this.startCard(
+        "helper",
+        iteration,
+        `Helper (${config.helperModel})${labelSuffix}`,
+      );
+      helperCard.messages = [{ role: "user", text: prompt, ts: new Date().toISOString() }];
+      this.upsertCard(helperCard);
 
-    const cursorResult = await this.runCursorOnce(
-      {
-        prompt: helperPrompt,
-        cwd: options.project,
-        runtime: options.cursorRuntime ?? "local",
-        repoUrl: options.repoUrl,
-        apiKey: options.apiKey!,
-        modelId: config.helperModel,
-      },
-      helperCard,
-    );
+      if (cursorTarget.fallbackReason && !labelSuffix) {
+        this.emit("event", { type: "log", message: cursorTarget.fallbackReason, level: "warn" });
+        helperCard.messages = [
+          ...(helperCard.messages ?? []),
+          { role: "system", text: cursorTarget.fallbackReason, ts: new Date().toISOString() },
+        ];
+        this.upsertCard(helperCard);
+      }
 
-    this.finishCard(helperCard, {
-      status: cursorResult.ok ? "done" : "failed",
-      summary: (() => {
-        if (!cursorResult.ok) return cursorResult.error ?? "Helper agent failed";
-        const request = extractUiVerificationRequest(cursorResult.responseText);
-        if (!request) return "Implementation complete — no UI verification request section found";
-        const checks = request.split("\n").filter((line) => /^\s*[-*]\s+/.test(line)).length;
-        return checks > 0
-          ? `Implementation complete — ${checks} UI check(s) requested for local agent`
-          : "Implementation complete — UI verification request sent to local agent";
-      })(),
-      outcomeType: "response",
-      outcomeText: cursorResult.responseText || cursorResult.error || "(no response)",
-      messages: helperCard.messages,
-    });
+      this.emit("event", {
+        type: "phase",
+        phase: "collaboration",
+        status: "done",
+        message: "Handed off to helper agent",
+      });
+      this.emit("event", {
+        type: "phase",
+        phase: "cursor",
+        status: "running",
+        message: `Helper agent iteration ${iteration}${labelSuffix} (${cursorTarget.runtime})…`,
+      });
 
-    this.emit("event", {
-      type: "phase",
-      phase: "cursor",
-      status: cursorResult.ok ? "done" : "failed",
-      message: cursorResult.ok ? "Helper finished" : cursorResult.error ?? "Helper failed",
-    });
+      this.checkCancelled();
+      const gitBefore = gitWorktreeSnapshot(options.project);
+      const cursorResult = await this.runCursorOnce(
+        {
+          prompt,
+          cwd: options.project,
+          runtime: cursorTarget.runtime,
+          repoUrl: cursorTarget.repoUrl,
+          apiKey: options.apiKey!,
+          modelId: config.helperModel,
+        },
+        helperCard,
+      );
 
-    return cursorResult;
+      const codeChanged = !needsCode || gitWorktreeChanged(options.project, gitBefore);
+      let ok = cursorResult.ok;
+      let error = cursorResult.error;
+
+      if (ok && needsCode && !codeChanged) {
+        ok = false;
+        error =
+          "Helper finished without editing any project files. Use file tools to implement the fix in the codebase.";
+      }
+
+      this.finishCard(helperCard, {
+        status: ok ? "done" : "failed",
+        streamStatus: undefined,
+        streamText: undefined,
+        summary: (() => {
+          if (cursorResult.cancelled) return "Cancelled by user";
+          if (!ok) return error ?? "Helper agent failed";
+          const request = extractUiVerificationRequest(cursorResult.responseText);
+          if (!request) return "Implementation complete — no UI verification request section found";
+          const checks = request.split("\n").filter((line) => /^\s*[-*]\s+/.test(line)).length;
+          return checks > 0
+            ? `Implementation complete — ${checks} UI check(s) requested for local agent`
+            : "Implementation complete — UI verification request sent to local agent";
+        })(),
+        outcomeType: "response",
+        outcomeText: cursorResult.responseText || error || "(no response)",
+        messages: helperCard.messages,
+      });
+
+      this.emit("event", {
+        type: "phase",
+        phase: "cursor",
+        status: ok ? "done" : "failed",
+        message: cursorResult.cancelled
+          ? "Helper cancelled"
+          : ok
+            ? "Helper finished"
+            : error ?? "Helper failed",
+      });
+
+      if (cursorResult.cancelled || this.cancelled) {
+        throw new RunCancelledError();
+      }
+
+      return { ...cursorResult, ok, error, codeChanged };
+    };
+
+    let result = await execute(helperPrompt);
+    this.checkCancelled();
+    if (!result.ok && needsCode && !result.codeChanged && !result.cancelled) {
+      this.checkCancelled();
+      const retryPrompt = [
+        helperPrompt,
+        "",
+        "---",
+        "Your previous attempt did not modify any files. Edit the project codebase directly (Read/Write/StrReplace tools), then reply with ### Summary and ### UI verification request.",
+      ].join("\n");
+      result = await execute(retryPrompt, " (retry)");
+    }
+
+    const succeeded = result.ok && (!needsCode || result.codeChanged);
+
+    return {
+      ok: result.ok,
+      succeeded,
+      responseText: result.responseText,
+      error: result.error,
+      cancelled: result.cancelled,
+    };
   }
 
   private runPythonOnce(
@@ -584,6 +817,11 @@ export class CollaborationLoop extends EventEmitter {
           finish(Boolean(event.overall_ok));
         }
         if (event.type === "process_exit") {
+          if (this.cancelled) {
+            failedPhases.push("cancelled by user");
+            finish(false);
+            return;
+          }
           finish(Number(event.code) === 0);
         }
       };
@@ -608,20 +846,54 @@ export class CollaborationLoop extends EventEmitter {
       modelId: string;
     },
     card: AgentCard,
-  ): Promise<{ ok: boolean; responseText: string; error?: string }> {
+  ): Promise<{ ok: boolean; responseText: string; error?: string; cancelled?: boolean }> {
     return new Promise((resolve) => {
+      let resolved = false;
       let responseText = "";
+      const stream = new HelperStreamAggregator();
+
+      const publishStream = () => {
+        const snap = stream.snapshot();
+        this.upsertCard({
+          ...card,
+          streamStatus: snap.streamStatus,
+          streamText: snap.streamText,
+          outcomeText: undefined,
+        });
+      };
+
+      const finish = (result: { ok: boolean; responseText: string; error?: string; cancelled?: boolean }) => {
+        if (resolved) return;
+        resolved = true;
+        this.cursorRunner.off("event", onEvent);
+        resolve(result);
+      };
+
       const onEvent = (event: Record<string, unknown>) => {
+        stream.push(event);
+        publishStream();
+
         if (event.type === "cursor_text" && event.text) {
           responseText += String(event.text);
-          this.upsertCard({ ...card, outcomeText: responseText });
         }
-        if (event.type === "cursor" && (event.status === "done" || event.status === "failed" || event.status === "error")) {
-          this.cursorRunner.off("event", onEvent);
-          resolve({
+        if (
+          event.type === "cursor" &&
+          (event.status === "done" ||
+            event.status === "failed" ||
+            event.status === "error" ||
+            event.status === "cancelled")
+        ) {
+          const cancelled = event.status === "cancelled";
+          finish({
             ok: event.status === "done",
+            cancelled,
             responseText: responseText.trim(),
-            error: event.status !== "done" ? String(event.message ?? event.status) : undefined,
+            error:
+              event.status === "done"
+                ? undefined
+                : cancelled
+                  ? "Cancelled by user"
+                  : String(event.message ?? event.status),
           });
         }
       };
@@ -637,16 +909,15 @@ export class CollaborationLoop extends EventEmitter {
           modelId: options.modelId,
         })
         .then((result) => {
-          this.cursorRunner.off("event", onEvent);
-          resolve({
+          finish({
             ok: result.ok,
+            cancelled: result.cancelled,
             responseText: responseText.trim() || result.error || "",
             error: result.error,
           });
         })
         .catch((err) => {
-          this.cursorRunner.off("event", onEvent);
-          resolve({
+          finish({
             ok: false,
             responseText: responseText.trim(),
             error: err instanceof Error ? err.message : String(err),
@@ -665,6 +936,8 @@ function isNonRetryableHelperError(error?: string): boolean {
     lower.includes("model not found") ||
     lower.includes("unknown model") ||
     lower.includes("not available") ||
+    lower.includes("repourl is required") ||
+    lower.includes("repo url") ||
     lower.includes("cursor_api_key") ||
     lower.includes("api key") ||
     lower.includes("authentication") ||
@@ -684,22 +957,6 @@ function abortOnHelperError(
 
 function buildFullConversationContext(cards: AgentCard[]): string {
   return buildConversationContext(cards.filter((c) => c.status !== "running"));
-}
-
-function extractUiVerificationRequest(helperResponse: string): string | null {
-  if (!helperResponse.trim()) return null;
-
-  const patterns = [
-    /#{1,3}\s*UI verification request\s*\n([\s\S]*?)(?=\n#{1,3}\s|\n```|\s*$)/i,
-    /#{1,3}\s*Verification request\s*\n([\s\S]*?)(?=\n#{1,3}\s|\n```|\s*$)/i,
-  ];
-
-  for (const pattern of patterns) {
-    const match = helperResponse.match(pattern);
-    if (match?.[1]?.trim()) return match[1].trim();
-  }
-
-  return null;
 }
 
 function buildLocalTask(

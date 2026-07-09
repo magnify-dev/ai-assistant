@@ -24,7 +24,7 @@ from ui_test.page_registry import load_site_map, site_map_delta
 from ui_test.exploration_runner import run_exploration
 from ui_test.git_deploy import collect_git_deploy_state
 from ui_test.git_commit import auto_commit_if_needed
-from ui_test.railway_client import check_health, wait_for_deployments
+from ui_test.railway_client import check_health, snapshot_deployment_baselines, wait_for_deployments
 from ui_test.local_env import format_local_env_hint, local_env_status
 from ui_test.local_server import ensure_local_server, local_run_config, url_is_up, _all_targets_up
 from ui_test.project_profile import ensure_cheatsheet, ensure_profile, local_base_url
@@ -282,6 +282,8 @@ def run_ui_test_loop(
 
         deploy_ok = True
         deploy_message = ""
+        needs_deploy_wait = do_push and git.unpushed_commits > 0
+
         if do_push and git.is_repo:
             git = collect_git_deploy_state(project, do_push=True)
             git_payload = asdict(git)
@@ -289,14 +291,30 @@ def run_ui_test_loop(
             if git.push_attempted and not git.push_ok:
                 deploy_ok = False
                 deploy_message = git.push_message or "Git push failed"
+                needs_deploy_wait = False
+            elif git.push_sent_commits:
+                needs_deploy_wait = True
+            else:
+                needs_deploy_wait = False
 
-        if deploy_ok and token and git.is_repo and (do_push or git.unpushed_commits == 0):
-            if not require_keys(env, ["RAILWAY_TOKEN"]) and affected:
-                emit_log(f"Waiting for Railway deploy ({len(affected)} service(s))...", phase=Phase.DEPLOY.value)
+        if not needs_deploy_wait:
+            emit_log(
+                "No new commits pushed — skipping Railway deploy wait (current deployment is already live)",
+                phase=Phase.DEPLOY.value,
+            )
+            deploy_message = "Skipped — no git changes to push"
+        elif deploy_ok and token and git.is_repo and affected:
+            if not require_keys(env, ["RAILWAY_TOKEN"]):
+                deploy_baselines = snapshot_deployment_baselines(token, railway, affected)
+                emit_log(
+                    f"Pushed new commits — waiting for Railway ({len(affected)} service(s))…",
+                    phase=Phase.DEPLOY.value,
+                )
                 results = wait_for_deployments(
                     token,
                     railway,
                     affected,
+                    baseline_ids=deploy_baselines,
                     timeout_sec=wait_timeout,
                     poll_interval_sec=poll_interval,
                 )
@@ -307,14 +325,23 @@ def run_ui_test_loop(
                 if not deploy_ok:
                     failed = [r for r in results if not r.ok]
                     deploy_message = "; ".join(f"{r.service}: {r.status}" for r in failed[:3])
-        elif not token:
+        elif needs_deploy_wait and not token:
             emit_log(
                 "No RAILWAY_TOKEN in project .agent/.env (or cheatsheet env_files) — skipping deploy wait",
                 phase=Phase.DEPLOY.value,
             )
-        phase_done(Phase.DEPLOY, ok=deploy_ok, message=deploy_message)
+        if not deploy_message and not needs_deploy_wait:
+            deploy_message = "Skipped — no git changes to push"
+        phase_done(
+            Phase.DEPLOY,
+            ok=deploy_ok,
+            message=deploy_message,
+            status="skipped" if deploy_ok and not needs_deploy_wait else None,
+        )
     else:
-        emit_log("Deploy wait skipped", phase=Phase.DEPLOY.value)
+        phase_start(Phase.DEPLOY, "Deploy wait disabled")
+        emit_log("Deploy wait skipped (--skip-deploy)", phase=Phase.DEPLOY.value)
+        phase_done(Phase.DEPLOY, ok=True, status="skipped", message="Skipped (--skip-deploy)")
 
     local_session = None
     local_server_payload: dict[str, Any] = {"skipped": True}

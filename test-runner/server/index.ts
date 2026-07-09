@@ -23,7 +23,7 @@ import {
   type ProjectSettings,
 } from "./project-store.js";
 import { readLocalEnvStatus } from "./local-env.js";
-import { resolveRunTargetOptions } from "./run-target.js";
+import { resolveCursorRuntime, resolveRunTargetOptions } from "./run-target.js";
 import {
   artifactContentType,
   listRunHistory,
@@ -65,6 +65,7 @@ function formatRunnerLogLine(event: StoredEvent): string {
   if (type === "done") return `[done] overall_ok=${String(event.overall_ok)}`;
   if (type === "cursor") return `[cursor] ${event.status ?? ""} ${event.message ?? ""}`.trim();
   if (type === "cursor_text" && event.text) return `[cursor] ${event.text}`;
+  if (type === "cursor_activity" && event.activity) return `[cursor] ${event.activity}`;
   if (type === "browser_state") {
     const count = Array.isArray(event.interactables) ? event.interactables.length : 0;
     const ctx = event.context ? ` (${event.context})` : "";
@@ -132,6 +133,7 @@ function resetRunStateForNewRun(project: string) {
     collaborationResult: null,
   };
   pushEvent({ type: "run_cleared" });
+  pushEvent({ type: "run_state", running: true });
 }
 
 function pushEvent(event: StoredEvent) {
@@ -250,6 +252,14 @@ function pushEvent(event: StoredEvent) {
 pythonRunner.on("event", pushEvent);
 cursorRunner.on("event", pushEvent);
 collaborationLoop.on("event", pushEvent);
+
+function runStartBlocked(): string | null {
+  collaborationLoop.resetIfStale();
+  if (pythonRunner.running || cursorRunner.isRunning || collaborationLoop.isActive) {
+    return "A run is already in progress";
+  }
+  return null;
+}
 
 const app = express();
 app.use(cors());
@@ -563,8 +573,9 @@ app.get("/api/events", (req, res) => {
 });
 
 app.post("/api/run/local", (req, res) => {
-  if (pythonRunner.running || collaborationLoop.isActive) {
-    res.status(409).json({ error: "Local agent run already in progress" });
+  const blocked = runStartBlocked();
+  if (blocked) {
+    res.status(409).json({ error: blocked });
     return;
   }
   const {
@@ -600,6 +611,28 @@ app.post("/api/run/local", (req, res) => {
   } catch (err) {
     res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
   }
+});
+
+app.post("/api/run/stop", (_req, res) => {
+  collaborationLoop.resetIfStale();
+  const wasRunning =
+    collaborationLoop.isActive ||
+    pythonRunner.running ||
+    cursorRunner.isRunning ||
+    Boolean(runState.running);
+
+  if (!wasRunning) {
+    res.status(404).json({ error: "No active run" });
+    return;
+  }
+
+  collaborationLoop.forceStop();
+  pythonRunner.stop();
+  cursorRunner.cancel();
+  cursorRunner.forceReset();
+  pushEvent({ type: "run_state", running: false });
+  pushEvent({ type: "done", overall_ok: false, error: "Cancelled by user" });
+  res.json({ stopped: true });
 });
 
 app.post("/api/run/cursor", async (req, res) => {
@@ -640,11 +673,16 @@ app.post("/api/run/cursor", async (req, res) => {
     return;
   }
 
+  const cursorTarget = resolveCursorRuntime(runtime, repoUrl);
+  if (cursorTarget.fallbackReason) {
+    pushEvent({ type: "log", message: cursorTarget.fallbackReason, level: "warn" });
+  }
+
   pushEvent({
     type: "phase",
     phase: "cursor",
     status: "running",
-    message: "Cursor SDK agent starting…",
+    message: `Cursor SDK agent starting (${cursorTarget.runtime})…`,
   });
   initRunLogs(project);
 
@@ -652,8 +690,8 @@ app.post("/api/run/cursor", async (req, res) => {
     .run({
       prompt: finalPrompt,
       cwd: project,
-      runtime: runtime === "local" ? "local" : "cloud",
-      repoUrl: repoUrl || undefined,
+      runtime: cursorTarget.runtime,
+      repoUrl: cursorTarget.repoUrl,
       apiKey,
     })
     .then((result) => {
@@ -684,8 +722,9 @@ app.put("/api/collaboration/config", (req, res) => {
 });
 
 app.post("/api/run/collaborate", async (req, res) => {
-  if (pythonRunner.running || cursorRunner.isRunning || collaborationLoop.isActive) {
-    res.status(409).json({ error: "A run is already in progress" });
+  const blocked = runStartBlocked();
+  if (blocked) {
+    res.status(409).json({ error: blocked });
     return;
   }
 
@@ -737,8 +776,9 @@ app.post("/api/run/collaborate", async (req, res) => {
 });
 
 app.post("/api/run/resume", async (req, res) => {
-  if (pythonRunner.running || cursorRunner.isRunning || collaborationLoop.isActive) {
-    res.status(409).json({ error: "A run is already in progress" });
+  const blocked = runStartBlocked();
+  if (blocked) {
+    res.status(409).json({ error: blocked });
     return;
   }
 
@@ -798,8 +838,9 @@ app.post("/api/run/resume", async (req, res) => {
 });
 
 app.post("/api/run/full", async (req, res) => {
-  if (pythonRunner.running || cursorRunner.isRunning || collaborationLoop.isActive) {
-    res.status(409).json({ error: "A run is already in progress" });
+  const blocked = runStartBlocked();
+  if (blocked) {
+    res.status(409).json({ error: blocked });
     return;
   }
 

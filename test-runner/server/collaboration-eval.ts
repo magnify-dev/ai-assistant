@@ -70,21 +70,40 @@ Rules:
 - verified=false when the issue still exists or findings describe work remaining.
 - "The task is to fix X" in findings means NOT verified.`;
 
+const UI_CHANGE_NOUNS =
+  "button|btn|modal|dialog|popup|component|page|screen|view|tab|link|menu|field|form|input|feature|section|panel|card|banner|toast|notification|icon|tooltip|drawer|sidebar|header|footer|column|row|table|list|item|widget|toggle|switch|checkbox|dropdown|select|picker|editor|toolbar|navbar|layout|style|theme|hook|testid|data-testid";
+
 const IMPLEMENTATION_PATTERNS = [
   /\bfix(ed|es|ing)?\b/i,
   /\bshould be fixed\b/i,
-  /\bneeds? to be (fixed|changed|updated|implemented|moved)\b/i,
+  /\bneeds? to be (fixed|changed|updated|implemented|moved|built|added|created|removed)\b/i,
   /\bimplement\b/i,
   /\brefactor\b/i,
-  /\bchange (the|how|where|wherever)\b/i,
-  /\bmove .+ (to|inside|elsewhere|within)\b/i,
+  /\bchange (the|how|where|wherever|what)\b/i,
+  /\bmove .+ (to|inside|elsewhere|within|out of)\b/i,
   /\bmake .+ (the )?same\b/i,
   /\balways the same\b/i,
-  /\bsame (length|height|size)\b/i,
+  /\bsame (length|height|size|width)\b/i,
+  new RegExp(`\\badd (a |an |the )?(${UI_CHANGE_NOUNS})\\b`, "i"),
+  new RegExp(`\\badd .+ (to|on|into|at) (the |a |an )?(home|page|screen|ui|app|navbar|header|footer|modal)\\b`, "i"),
+  new RegExp(`\\bcreate (a |an |the )?(${UI_CHANGE_NOUNS})\\b`, "i"),
+  new RegExp(`\\bbuild (a |an |the )?(${UI_CHANGE_NOUNS})\\b`, "i"),
+  new RegExp(`\\bremove (the |a |an )?(${UI_CHANGE_NOUNS})\\b`, "i"),
+  new RegExp(`\\bdelete (the |a |an )?(${UI_CHANGE_NOUNS})\\b`, "i"),
+  new RegExp(`\\binsert (a |an |the )?(${UI_CHANGE_NOUNS})\\b`, "i"),
+  new RegExp(`\\bnew (${UI_CHANGE_NOUNS})\\b`, "i"),
+  new RegExp(`\\bopen(s)? (a |the )?(modal|dialog|popup|drawer|menu|panel)\\b`, "i"),
+  new RegExp(`\\bclose(s)? (the |a )?(modal|dialog|popup|drawer|menu|panel)\\b`, "i"),
   /\badd (a |the )?(missing|data-testid|testid|hook)/i,
-  /\bupdate (the )?(ui|component|code|layout|page|card)/i,
+  /\bupdate (the )?(ui|component|code|layout|page|card|screen|app|frontend)\b/i,
   /\brearrange\b/i,
-  /\bdisplay .+ (elsewhere|inside|within)\b/i,
+  /\bdisplay .+ (elsewhere|inside|within|below|above|under)\b/i,
+  /\b(enable|disable|hide|show) (the |a )?(button|feature|modal|field|section|tab|menu)\b/i,
+  /\bwire up\b/i,
+  /\bhook up\b/i,
+  /\bstyle (the |a )?(button|page|card|modal|component|layout)\b/i,
+  /\bredesign\b/i,
+  /\breplace (the |a )?(button|component|page|layout|modal)\b/i,
 ];
 
 const INFORMATIONAL_PATTERNS = [
@@ -110,6 +129,25 @@ const WORK_REMAINING_PATTERNS = [
   /\bdisplays different\b/i,
 ];
 
+const TASK_NOT_DONE_ANSWER_PATTERNS = [
+  /\bi apologize\b/i,
+  /\bi'?m sorry\b/i,
+  /\bcannot complete\b/i,
+  /\bcan'?t complete\b/i,
+  /\bwould need access\b/i,
+  /\bneed access to\b/i,
+  /\bdoes not include any information\b/i,
+  /\bdoes not (show|contain|include|have)\b/i,
+  /\bno (mention|information|evidence|sign) of\b/i,
+  /\bnot (visible|present|found|shown|displayed|on the page|in the (data|json|report))\b/i,
+  /\bno (button|modal|dialog|element|feature|component)s?\b/i,
+  /\bdon'?t see (a |any |the )?(button|modal|change|feature)\b/i,
+  /\bdo not see (a |any |the )?(button|modal|change|feature)\b/i,
+  /\bbeyond what is currently visible\b/i,
+  /\bnot (yet )?(implemented|built|added|created|deployed)\b/i,
+  /\bunable to (verify|confirm|complete|find)\b/i,
+];
+
 function extractJson(text: string): Record<string, unknown> | null {
   const trimmed = text.trim();
   try {
@@ -125,24 +163,61 @@ function extractJson(text: string): Record<string, unknown> | null {
   }
 }
 
+function textImpliesImplementation(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed) return false;
+  return IMPLEMENTATION_PATTERNS.some((p) => p.test(trimmed));
+}
+
 export function taskRequiresImplementation(taskText: string, report: Record<string, unknown> = {}): boolean {
   const requested = (report.requested as Record<string, unknown> | undefined) ?? {};
   const notes = (requested.notes_for_cursor as string[] | undefined) ?? [];
   if (notes.length > 0) return true;
 
-  const combined = [taskText, String(requested.summary ?? ""), String(requested.source_text ?? "")].join("\n");
-  const hasImplementation = IMPLEMENTATION_PATTERNS.some((p) => p.test(combined));
+  const successCriteria = (requested.success_criteria as string[] | undefined) ?? [];
+  const deliverables = (requested.deliverables as string[] | undefined) ?? [];
+
+  const combined = [
+    taskText,
+    String(requested.summary ?? ""),
+    String(requested.source_text ?? ""),
+    ...successCriteria,
+    ...deliverables,
+  ].join("\n");
+
+  const hasImplementation = textImpliesImplementation(combined);
   const clearlyInformational =
     INFORMATIONAL_PATTERNS.some((p) => p.test(combined)) &&
-    !IMPLEMENTATION_PATTERNS.some((p) => p.test(combined));
+    !textImpliesImplementation(combined);
 
   if (clearlyInformational) return false;
   return hasImplementation;
 }
 
+function answerImpliesTaskNotDone(text: string): boolean {
+  if (!text.trim()) return false;
+  return TASK_NOT_DONE_ANSWER_PATTERNS.some((p) => p.test(text));
+}
+
 function answerImpliesWorkRemaining(text: string): boolean {
   if (!text.trim()) return false;
   return WORK_REMAINING_PATTERNS.some((p) => p.test(text));
+}
+
+export function extractUiVerificationRequest(helperResponse: string): string | null {
+  if (!helperResponse.trim()) return null;
+
+  const patterns = [
+    /#{1,3}\s*UI verification request\s*\n([\s\S]*?)(?=\n#{1,3}\s|\n```|\s*$)/i,
+    /#{1,3}\s*Verification request\s*\n([\s\S]*?)(?=\n#{1,3}\s|\n```|\s*$)/i,
+  ];
+
+  for (const pattern of patterns) {
+    const match = helperResponse.match(pattern);
+    if (match?.[1]?.trim()) return match[1].trim();
+  }
+
+  return null;
 }
 
 function failedCriteriaList(report: Record<string, unknown>): string[] {
@@ -279,8 +354,19 @@ export function pipelineFailureSummary(failedPhases: string[]): string {
   return "Pipeline failed — handing off to helper";
 }
 
-/** Git/deploy failures block UI verification — do not re-handoff to helper. */
-export function isGitOrDeployBlockingFailure(failedPhases: string[]): boolean {
+/** Git/deploy failures block UI verification only when deploying. */
+export function isGitOrDeployBlockingFailure(
+  failedPhases: string[],
+  opts?: { skipDeploy?: boolean },
+): boolean {
+  if (opts?.skipDeploy) {
+    return failedPhases.some((line) => {
+      const lower = line.toLowerCase();
+      if (/^local_server:/i.test(line)) return true;
+      if (lower.includes("build failed") || lower.includes("setup failed")) return true;
+      return false;
+    });
+  }
   return failedPhases.some((line) => {
     const lower = line.toLowerCase();
     if (/^git:/i.test(line)) return true;
@@ -339,9 +425,11 @@ function fallbackExpand(taskText: string, projectPath: string, extra?: { verific
 export async function triageTask(
   taskText: string,
   projectPath: string,
-  previousHelperResponse?: string,
+  opts?: { previousHelperResponse?: string; helperSucceeded?: boolean },
 ): Promise<TriageResult> {
   const needsImpl = taskRequiresImplementation(taskText);
+  const previousHelperResponse = opts?.previousHelperResponse;
+  const helperSucceeded = opts?.helperSucceeded ?? false;
 
   if (!needsImpl) {
     return {
@@ -351,19 +439,18 @@ export async function triageTask(
     };
   }
 
-  if (!previousHelperResponse) {
+  if (!helperSucceeded || !previousHelperResponse?.trim()) {
     return {
       action: "handoff",
       summary: "Expand task and hand off to implementation agent",
-      reason: "Implementation task with no changes yet — skip baseline testing",
+      reason: "Implementation task with no successful helper run yet — skip baseline testing",
     };
   }
 
-  // After helper: always verify on live UI
   return {
     action: "test",
     summary: "Verify the fix on the live UI",
-    reason: "Implementation agent has responded — run UI check",
+    reason: "Helper agent finished — run UI check",
   };
 }
 
@@ -525,8 +612,15 @@ function deterministicVerificationFailed(report: Record<string, unknown>, taskTe
 
   if (taskRequiresImplementation(taskText, report) && taskAnswer) {
     const lower = taskAnswer.toLowerCase();
-    if (lower.includes("different length") || lower.includes("inconsistent") || lower.includes("should be fixed")) {
-      return "Observed UI still matches the pre-fix problem description.";
+    if (
+      lower.includes("different length") ||
+      lower.includes("inconsistent") ||
+      lower.includes("should be fixed") ||
+      answerImpliesTaskNotDone(taskAnswer)
+    ) {
+      return answerImpliesTaskNotDone(taskAnswer)
+        ? "Local agent could not confirm the requested UI change on the live page."
+        : "Observed UI still matches the pre-fix problem description.";
     }
   }
 
@@ -543,8 +637,41 @@ export async function verifyAfterTest(
   const overallOk = Boolean(report.overall_ok);
   const taskAnswer = String(report.task_answer ?? "").trim();
   const needsImplementation = taskRequiresImplementation(taskText, report);
+  const failedCriteria = failedCriteriaList(report);
+  const helperRan = Boolean(previousHelperResponse?.trim());
+
+  // Safety net: implementation task reached verify without helper (mis-triage or explore-only run)
+  if (needsImplementation && !helperRan) {
+    const expanded = await expandPromptForHelper(taskText, projectPath, {
+      mode: "initial",
+      report,
+      reportMd,
+    });
+    return {
+      outcome: "delegate",
+      prompt: expanded.expandedPrompt,
+      summary: "Implementation task — hand off to helper agent",
+      testsPassed: false,
+    };
+  }
 
   if (!needsImplementation) {
+    if (failedCriteria.length > 0) {
+      return {
+        outcome: "answer",
+        answer: taskAnswer || failedCriteria.join("; "),
+        summary: "Some checks failed",
+        testsPassed: false,
+      };
+    }
+    if (answerImpliesTaskNotDone(taskAnswer)) {
+      return {
+        outcome: "answer",
+        answer: taskAnswer,
+        summary: "Could not answer from visible UI",
+        testsPassed: false,
+      };
+    }
     if (taskAnswer && overallOk) {
       return { outcome: "answer", answer: taskAnswer, summary: "Task complete", testsPassed: true };
     }
@@ -552,17 +679,27 @@ export async function verifyAfterTest(
       outcome: "answer",
       answer: taskAnswer || String(report.ui_error ?? "Could not retrieve information from the app."),
       summary: overallOk ? "Task complete" : "UI test failed",
-      testsPassed: overallOk,
+      testsPassed: overallOk && Boolean(taskAnswer),
     };
   }
 
-  if (!previousHelperResponse) {
-    return {
-      outcome: "delegate",
-      prompt: "",
-      summary: "Unexpected: verify called before helper",
-      testsPassed: overallOk,
-    };
+  if (needsImplementation && previousHelperResponse) {
+    if (!extractUiVerificationRequest(previousHelperResponse)) {
+      const expanded = await expandPromptForHelper(taskText, projectPath, {
+        mode: "verification_failed",
+        verificationNote:
+          "Helper response missing a ### UI verification request section — cannot verify without code changes and explicit checks.",
+        report,
+        reportMd,
+        previousHelperResponse,
+      });
+      return {
+        outcome: "delegate",
+        prompt: expanded.expandedPrompt,
+        summary: "Helper did not provide verifiable UI checks",
+        testsPassed: false,
+      };
+    }
   }
 
   const failReason = deterministicVerificationFailed(report, taskText);

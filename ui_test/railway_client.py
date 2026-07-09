@@ -106,11 +106,25 @@ def latest_deployment_status(
     return str(node.get("id") or ""), str(node.get("status") or "UNKNOWN")
 
 
+def snapshot_deployment_baselines(
+    token: str,
+    railway: RailwayConfig,
+    services: list[RailwayService],
+) -> dict[str, str]:
+    """Latest deployment id per service before git push."""
+    baselines: dict[str, str] = {}
+    for svc in services:
+        deployment_id, _status = latest_deployment_status(token, railway, svc)
+        baselines[svc.name] = deployment_id
+    return baselines
+
+
 def wait_for_deployments(
     token: str,
     railway: RailwayConfig,
     services: list[RailwayService],
     *,
+    baseline_ids: dict[str, str] | None = None,
     timeout_sec: float = 600,
     poll_interval_sec: float = 10,
 ) -> list[DeployResult]:
@@ -119,11 +133,46 @@ def wait_for_deployments(
     pending = {svc.name: svc for svc in services}
     results: dict[str, DeployResult] = {}
     deadline = time.time() + timeout_sec
+    saw_active: dict[str, bool] = {svc.name: False for svc in services}
 
     while pending and time.time() < deadline:
         for name, svc in list(pending.items()):
             deployment_id, status = latest_deployment_status(token, railway, svc)
+            baseline_id = (baseline_ids or {}).get(name, "")
             logger.info("Deploy %s: %s (%s)", name, status, deployment_id or "no-id")
+
+            if status in ACTIVE_STATUSES:
+                saw_active[name] = True
+
+            if baseline_ids is not None:
+                if baseline_id and deployment_id == baseline_id and status == "SUCCESS" and not saw_active[name]:
+                    # Old container still serving — wait for Railway to start a new build.
+                    continue
+                if baseline_id and deployment_id != baseline_id:
+                    if status in TERMINAL_STATUSES:
+                        ok = status == "SUCCESS"
+                        results[name] = DeployResult(
+                            service=name,
+                            deployment_id=deployment_id,
+                            status=status,
+                            ok=ok,
+                            message=f"New deployment {status.lower()}",
+                        )
+                        del pending[name]
+                    continue
+                if baseline_id and deployment_id == baseline_id and saw_active[name] and status in TERMINAL_STATUSES:
+                    ok = status == "SUCCESS"
+                    results[name] = DeployResult(
+                        service=name,
+                        deployment_id=deployment_id,
+                        status=status,
+                        ok=ok,
+                        message=f"Redeploy {status.lower()}",
+                    )
+                    del pending[name]
+                    continue
+                continue
+
             if status in TERMINAL_STATUSES:
                 ok = status == "SUCCESS"
                 results[name] = DeployResult(
@@ -144,7 +193,7 @@ def wait_for_deployments(
             deployment_id=deployment_id,
             status=status or "TIMEOUT",
             ok=False,
-            message=f"Timed out waiting for deploy (last status: {status or 'unknown'})",
+            message=f"Timed out waiting for new deploy (last status: {status or 'unknown'})",
         )
     return [results[name] for name in sorted(results)]
 

@@ -1,5 +1,6 @@
 import { EventEmitter } from "node:events";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import process from "node:process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -93,9 +94,18 @@ export class PythonRunner extends EventEmitter {
   }
 
   stop(): void {
-    if (this.proc) {
-      this.proc.kill();
-      this.proc = null;
+    const proc = this.proc;
+    if (!proc) return;
+    this.proc = null;
+    const pid = proc.pid;
+    if (process.platform === "win32" && pid) {
+      spawn("taskkill", ["/T", "/F", "/PID", String(pid)], { windowsHide: true, stdio: "ignore" });
+      return;
+    }
+    try {
+      proc.kill("SIGTERM");
+    } catch {
+      proc.kill();
     }
   }
 }

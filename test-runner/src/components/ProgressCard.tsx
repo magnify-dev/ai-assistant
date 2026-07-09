@@ -79,6 +79,7 @@ export function ProgressCard({ title, status, summary, children, defaultOpen = f
 export function phaseToStatus(phase?: { status?: string }): ProgressStatus {
   const s = phase?.status;
   if (s === "running") return "running";
+  if (s === "skipped") return "done";
   if (s === "done") return "done";
   if (s === "failed") return "failed";
   if (s === "warning") return "warning";

@@ -6,9 +6,9 @@
       "id": "db173deb-348c-4113-80ae-e8c747b97647",
       "name": "content-manager",
       "path": "C:\\Users\\marce\\Documents\\Programming\\content-manager",
-      "lastUsed": "2026-07-08T19:44:01.710Z",
+      "lastUsed": "2026-07-09T11:09:35.970Z",
       "settings": {
-        "task": "Okay on the home page the 2 services we have displayed have diffrent lenghts of cards since the upload service is displaying Oauth issues, this should be fixed so that the cards are always the same lenght, and oAuth issues should appear somewhere else inside the card",
+        "task": "add a button to the home screen at the bottom that opens a small modal that says successful",
         "skipCursor": false,
         "cursorRuntime": "local",
         "repoUrl": "",

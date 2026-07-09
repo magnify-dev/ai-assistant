@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { ChevronDown, ChevronRight } from "lucide-react";
+import { ChevronDown, ChevronRight, Loader2 } from "lucide-react";
 import type { AgentRunCard } from "@/lib/collaborationTypes";
 import { cn } from "@/lib/utils";
 
@@ -112,6 +112,8 @@ export function ConversationThread({ agentCards }: Props) {
         const pipeline = card.messages?.filter((m) => m.role === "pipeline") ?? [];
         const userPrompt = card.agent === "helper" ? extractUserPrompt(card) : null;
         const mainText = card.outcomeText?.trim() ?? "";
+        const liveStatus = card.streamStatus?.trim() ?? "";
+        const liveDraft = card.streamText?.trim() ?? "";
         const showHelperPrompt = Boolean(userPrompt) && !priorLocalHandoff(agentCards, index);
 
         return (
@@ -176,10 +178,28 @@ export function ConversationThread({ agentCards }: Props) {
 
             {card.agent === "helper" && card.status === "running" ? (
               <Bubble side="right" label={card.agentLabel} time={time} tone="helper">
-                {mainText ? (
-                  <div className={SCROLL_BODY}>{mainText}</div>
+                {liveStatus || liveDraft ? (
+                  <div className="space-y-2">
+                    {liveStatus ? (
+                      <p className="text-xs leading-snug text-violet-200/70">{liveStatus}</p>
+                    ) : null}
+                    {liveDraft ? (
+                      <div className={cn(SCROLL_BODY, "max-h-64 text-[13px] leading-relaxed text-violet-50")}>
+                        {liveDraft}
+                        <span className="ml-0.5 inline-block animate-pulse text-violet-200/80">▍</span>
+                      </div>
+                    ) : (
+                      <p className="inline-flex items-center gap-2 text-sm text-white/70">
+                        <Loader2 className="size-3.5 animate-spin" />
+                        Working…
+                      </p>
+                    )}
+                  </div>
                 ) : (
-                  <p className="text-sm text-white/70">Implementing…</p>
+                  <p className="inline-flex items-center gap-2 text-sm text-white/70">
+                    <Loader2 className="size-3.5 animate-spin" />
+                    Starting helper agent…
+                  </p>
                 )}
               </Bubble>
             ) : null}

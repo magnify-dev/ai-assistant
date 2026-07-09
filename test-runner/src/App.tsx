@@ -95,8 +95,20 @@ function applyStateFromServer(
     setAgentCards?: (v: AgentRunCard[]) => void;
     setCollaborationResult?: (v: CollaborationResult | null) => void;
   },
+  options?: { protectActiveRun?: boolean },
 ) {
-  if (typeof data.running === "boolean") setters.setRunning(data.running);
+  const protect = options?.protectActiveRun ?? false;
+
+  if (typeof data.running === "boolean") {
+    if (!protect || data.running) {
+      setters.setRunning(data.running);
+    }
+  }
+
+  if (protect && !data.running) {
+    return;
+  }
+
   if (data.phase) setters.setActivePhase(data.phase);
   if (data.phases) setters.setPhases(data.phases);
   if (Array.isArray(data.events) && data.events.length > 0) {
@@ -184,7 +196,7 @@ export default function App() {
   const [project, setProject] = useState("");
   const [task, setTask] = useState("");
   const [repoUrl, setRepoUrl] = useState("");
-  const [cursorRuntime, setCursorRuntime] = useState<"cloud" | "local">("cloud");
+  const [cursorRuntime, setCursorRuntime] = useState<"cloud" | "local">("local");
   const [testTargetMode, setTestTargetMode] = useState<"local" | "deployed">("local");
   const [skipCursor, setSkipCursor] = useState(false);
   const [running, setRunning] = useState(false);
@@ -284,19 +296,23 @@ export default function App() {
     apiFetch("/api/state")
       .then((r) => r.json())
       .then((data) => {
-        applyStateFromServer(data, {
-          setRunning,
-          setActivePhase,
-          setPhases,
-          setEvents,
-          setLastResult,
-          setBrowserState,
-          setTestTarget,
-          setStructuredTask,
-          setRunReport,
-          setAgentCards,
-          setCollaborationResult,
-        });
+        applyStateFromServer(
+          data,
+          {
+            setRunning,
+            setActivePhase,
+            setPhases,
+            setEvents,
+            setLastResult,
+            setBrowserState,
+            setTestTarget,
+            setStructuredTask,
+            setRunReport,
+            setAgentCards,
+            setCollaborationResult,
+          },
+          { protectActiveRun: runningRef.current },
+        );
       })
       .catch(() => {});
   }, []);
@@ -359,7 +375,7 @@ export default function App() {
   }, [running]);
 
   useEffect(() => {
-    if (view === "run") refreshState();
+    if (view === "run" && !runningRef.current) refreshState();
   }, [view, refreshState]);
 
   useEffect(() => {
@@ -422,10 +438,18 @@ export default function App() {
     setEvents((prev) => [...prev.slice(-800), event]);
     if (event.type === "phase" && event.phase) {
       setActivePhase(event.phase);
-      setPhases((prev) => ({
-        ...prev,
-        [event.phase!]: { status: event.status, message: event.message },
-      }));
+      setPhases((prev) => {
+        const next = { ...prev };
+        if (event.status === "running") {
+          for (const key of Object.keys(next)) {
+            if (key !== event.phase && next[key]?.status === "running") {
+              next[key] = { ...next[key], status: "done" };
+            }
+          }
+        }
+        next[event.phase!] = { status: event.status, message: event.message };
+        return next;
+      });
     }
     if (event.type === "run_state") {
       setRunning(Boolean((event as { running?: boolean }).running));
@@ -492,6 +516,7 @@ export default function App() {
         setAgentCards([]);
       }
       setCollaborationResult(null);
+      setRunning(true);
     }
     if (event.type === "phases_reset") {
       setPhases({});
@@ -549,7 +574,6 @@ export default function App() {
       };
       source.onerror = () => {
         source?.close();
-        setRunning(false);
         refreshState();
         retryTimer = setTimeout(connect, 2000);
       };
@@ -677,7 +701,6 @@ export default function App() {
       setView("run");
       setRunning(true);
       setViewingRunId(null);
-      refreshState();
       const res = await apiFetch("/api/run/resume", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -701,7 +724,6 @@ export default function App() {
       persistSettings,
       saveProjectToRegistry,
       clearRunPanels,
-      refreshState,
       runApiOptions,
       cursorRuntime,
       repoUrl,
@@ -732,6 +754,19 @@ export default function App() {
 
   const logLines = useMemo(() => events.map(formatEventLine).filter(Boolean), [events]);
 
+  const stopRun = useCallback(async () => {
+    try {
+      const res = await apiFetch("/api/run/stop", { method: "POST" });
+      if (!res.ok) {
+        const err = (await res.json()) as { error?: string };
+        applyEvent({ type: "log", message: err.error ?? "Failed to stop run", level: "error" });
+      }
+    } catch {
+      applyEvent({ type: "log", message: "Failed to stop run", level: "error" });
+    }
+    setRunning(false);
+  }, [applyEvent]);
+
   const startFullLoop = async () => {
     if (!project.trim()) return;
     persistSettings();
@@ -739,7 +774,6 @@ export default function App() {
     clearRunPanels();
     setView("run");
     setRunning(true);
-    refreshState();
     const res = await apiFetch("/api/run/full", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -766,7 +800,6 @@ export default function App() {
     clearRunPanels();
     setView("run");
     setRunning(true);
-    refreshState();
     const res = await apiFetch("/api/run/local", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1104,6 +1137,7 @@ export default function App() {
               showPipelineStrip={hasCollaboration}
               testTargetMode={testTargetMode}
               skipDeploy={runApiOptions.skipDeploy}
+              onStop={() => void stopRun()}
             />
           ) : null}
 
