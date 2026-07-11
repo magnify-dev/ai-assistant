@@ -1,5 +1,6 @@
 export type InteractableElement = {
   index: number;
+  id?: string;
   kind: string;
   test_id?: string | null;
   role?: string | null;
@@ -10,6 +11,7 @@ export type InteractableElement = {
   disabled?: boolean;
   name?: string | null;
   placeholder?: string | null;
+  action_hint?: string | null;
 };
 
 export type BrowserState = {
@@ -141,21 +143,31 @@ export type RunReport = {
 export type PlaywrightSessionFrame = {
   step?: number;
   label?: string;
+  title?: string;
   url?: string;
   context?: string;
   screenshot?: string;
   screenshotUrl?: string;
+  interactables?: InteractableElement[];
+  decision?: {
+    action?: string;
+    reason?: string;
+    target_id?: string;
+    target?: Record<string, unknown>;
+    [key: string]: unknown;
+  };
+  selected_interactable_id?: string;
+  selected_interactable?: InteractableElement;
+  action_ok?: boolean;
+  error?: string;
   ts?: string;
 };
 
 export type PlaywrightSession = {
   recorded_at?: string;
   frames?: PlaywrightSessionFrame[];
-  trace?: string;
-  traceUrl?: string;
-  video?: string;
-  videoUrl?: string;
   frame_count?: number;
+  source?: "web" | "ui";
 };
 
 export type RunHistoryEntry = {
@@ -168,4 +180,7 @@ export type RunHistoryEntry = {
   hasSession: boolean;
   frameCount: number;
   canResume?: boolean;
+  runKind?: "ui_test" | "web_research" | "exploration";
+  statusText?: string;
+  sessionSource?: "web" | "ui";
 };

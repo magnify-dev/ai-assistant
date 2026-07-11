@@ -3,6 +3,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import process from "node:process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { stopChildProcess } from "./process-stop.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, "../..");
@@ -99,16 +100,7 @@ export class PythonRunner extends EventEmitter {
     const proc = this.proc;
     if (!proc) return;
     this.proc = null;
-    const pid = proc.pid;
-    if (process.platform === "win32" && pid) {
-      spawn("taskkill", ["/T", "/F", "/PID", String(pid)], { windowsHide: true, stdio: "ignore" });
-      return;
-    }
-    try {
-      proc.kill("SIGTERM");
-    } catch {
-      proc.kill();
-    }
+    stopChildProcess(proc);
   }
 }
 

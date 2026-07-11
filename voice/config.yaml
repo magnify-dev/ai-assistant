@@ -24,6 +24,7 @@ ollama:
     - In always-on mode the user speaks freely and ends each command with "please".
     - Background speech/TV is ignored until the user says the command phrase.
     - Use web_search to search the web, open_url to open a page, and fetch_url to read a public page.
+    - Use web_research for multi-source open-web research (search, fetch, extract, store under .agent/web).
     - For personalized/authenticated Firefox pages, prefer read_browser_context, navigate_browser_context, and click_browser_context.
     - Use the Firefox bridge for real web control: read the page, click visible links/buttons, and navigate the current tab. Use screenshot vision only as a last-resort fallback.
     - Use git_status before git_command when the user asks about a repository.

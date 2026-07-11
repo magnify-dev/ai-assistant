@@ -14,13 +14,17 @@ from ui_test.exploration_match import (
     find_task_path_in_site_map,
     history_has_interaction,
     path_key,
+    pick_button_for_task,
     pick_nav_action_to_path,
+    pick_unexplored_button,
+    task_mentions_hidden_content,
     task_requires_interaction,
 )
 from ui_test.nav_registry import (
     load_nav_tree,
     merge_nav_discovery,
     nav_summary_for_agent,
+    record_interactable_click,
     record_nav_transition,
     save_nav_tree,
 )
@@ -69,7 +73,12 @@ def _unexplored_link_paths(nav_tree: dict[str, Any], current_path: str, interact
     return out
 
 
-def _allowed_navigate_paths(nav_tree: dict[str, Any], interactables: list[dict[str, Any]]) -> set[str]:
+def _allowed_navigate_paths(
+    nav_tree: dict[str, Any],
+    interactables: list[dict[str, Any]],
+    current_path: str | None = None,
+) -> set[str]:
+    """Only paths reachable via on-page links or verified transitions from here."""
     allowed = {"/"}
     for el in interactables:
         if not isinstance(el, dict):
@@ -77,8 +86,11 @@ def _allowed_navigate_paths(nav_tree: dict[str, Any], interactables: list[dict[s
         href = str(el.get("href") or el.get("reaches") or "")
         if href:
             allowed.add(path_key(href))
-    for route_path in (nav_tree.get("routes") or {}):
-        allowed.add(path_key(str(route_path)))
+    if current_path:
+        routes = nav_tree.get("routes") or {}
+        route = routes.get(path_key(current_path)) if isinstance(routes.get(path_key(current_path)), dict) else {}
+        for dst in (route.get("verified_reaches") or {}):
+            allowed.add(path_key(str(dst)))
     for el in nav_tree.get("global_nav") or []:
         if isinstance(el, dict) and el.get("href"):
             allowed.add(path_key(str(el["href"])))
@@ -89,6 +101,7 @@ def _sanitize_navigate_decision(
     decision: dict[str, Any],
     nav_tree: dict[str, Any],
     interactables: list[dict[str, Any]],
+    current_path: str | None = None,
 ) -> dict[str, Any]:
     if str(decision.get("action") or "").lower() != "navigate":
         return decision
@@ -96,7 +109,7 @@ def _sanitize_navigate_decision(
     if not url:
         return decision
     target = path_key(url if url.startswith("/") else urlparse(url).path or url)
-    allowed = _allowed_navigate_paths(nav_tree, interactables)
+    allowed = _allowed_navigate_paths(nav_tree, interactables, current_path)
     if target in allowed:
         return decision
     for i, el in enumerate(interactables):
@@ -146,9 +159,12 @@ def _assess_exploration_status(
 
     known_path, known_reason = find_task_path_in_site_map(registry, task_text)
     if known_path and path_key(known_path) != path_key(page.url):
-        return "go_to_known", f"{known_reason} → go to {known_path}"
+        return "go_to_known", f"{known_reason} → reach {known_path} via on-page link"
 
-    return "explore_next", "Task location unknown — explore another route from navigation tree"
+    if task_mentions_hidden_content(task_text):
+        return "explore_buttons", "Task may need clicking buttons/menus on this page"
+
+    return "explore_next", "Task location unknown — explore links and controls on this page"
 
 
 def _path_key(url: str) -> str:
@@ -344,6 +360,14 @@ def _emit_agent_decision(decision: dict[str, Any]) -> None:
         from ui_test.events import agent_decision_event
 
         agent_decision_event(decision)
+    except ImportError:
+        pass
+    try:
+        from ui_test.playwright_session import get_active_recorder
+
+        recorder = get_active_recorder()
+        if recorder:
+            recorder.record_decision(decision)
     except ImportError:
         pass
 
@@ -575,8 +599,23 @@ def run_exploration(
                         if nav_decision:
                             decision = nav_decision
                         else:
-                            exploration_status = "explore_next"
-                            status_detail = f"Know data is on {known_path} but no link from here — explore"
+                            button_decision = pick_button_for_task(
+                                task_text, interactables, nav_tree, current_path
+                            )
+                            if button_decision:
+                                decision = button_decision
+                                exploration_status = "explore_buttons"
+                            else:
+                                exploration_status = "explore_next"
+                                status_detail = (
+                                    f"Data may be on {known_path} but no link from here — "
+                                    "explore controls on current page"
+                                )
+
+                if decision is None and exploration_status in ("explore_buttons", "interact"):
+                    decision = pick_button_for_task(task_text, interactables, nav_tree, current_path)
+                    if decision is None:
+                        decision = pick_unexplored_button(interactables, nav_tree, current_path)
 
                 if decision is None:
                     unexplored = _unexplored_link_paths(nav_tree, page.url, interactables)
@@ -630,7 +669,7 @@ def run_exploration(
                     if retry:
                         decision = retry
 
-                decision = _sanitize_navigate_decision(decision, nav_tree, interactables)
+                decision = _sanitize_navigate_decision(decision, nav_tree, interactables, current_path)
 
                 _emit_agent_decision(decision)
                 reason = str(decision.get("reason") or "")
@@ -666,8 +705,11 @@ def run_exploration(
                 step_history.append(f"{action} {detail}: {reason}")
                 if ok:
                     path_after = _path_key(page.url)
+                    via = _via_from_decision(decision, interactables)
+                    if str(decision.get("action") or "").lower() == "click":
+                        nav_tree = record_interactable_click(nav_tree, path=path_before, via=via)
+                        save_nav_tree(project, nav_tree)
                     if path_before != path_after:
-                        via = _via_from_decision(decision, interactables)
                         nav_tree, edge_changed = record_nav_transition(
                             nav_tree,
                             from_path=path_before,
@@ -678,6 +720,16 @@ def run_exploration(
                             save_nav_tree(project, nav_tree)
                             _emit_nav_tree(nav_tree, changed=True, new_count=0)
                             log(f"Nav tree: verified {path_before} → {path_after}")
+                    elif str(decision.get("action") or "").lower() == "click":
+                        registry, nav_tree, state, _, site_changed, site_new, nav_changed, nav_new = (
+                            _discover_and_persist(project, registry, nav_tree, page)
+                        )
+                        if site_changed:
+                            _emit_site_map(registry, changed=True, new_count=site_new)
+                        if nav_changed:
+                            _emit_nav_tree(nav_tree, changed=True, new_count=nav_new)
+                        emit_page_state(page, context="explore_click_same_url")
+                        log(f"Re-cataloged page after click on {path_before}")
                 if not ok:
                     final_result = ExplorationResult(
                         False,

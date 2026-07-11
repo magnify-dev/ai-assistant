@@ -18,17 +18,14 @@ export function resolveRunTargetOptions(testTarget?: string) {
 export function resolveCursorRuntime(
   cursorRuntime?: string,
   repoUrl?: string,
-): { runtime: CursorRuntime; repoUrl?: string; fallbackReason?: string } {
+): { runtime: CursorRuntime; repoUrl?: string; error?: string } {
   const wantsCloud = cursorRuntime === "cloud";
   const trimmedRepo = repoUrl?.trim();
+  if (wantsCloud && !trimmedRepo) {
+    return { runtime: "local" };
+  }
   if (wantsCloud && trimmedRepo) {
     return { runtime: "cloud", repoUrl: trimmedRepo };
-  }
-  if (wantsCloud && !trimmedRepo) {
-    return {
-      runtime: "local",
-      fallbackReason: "Cloud runtime requires a GitHub repo URL — using local runtime instead",
-    };
   }
   return { runtime: "local" };
 }

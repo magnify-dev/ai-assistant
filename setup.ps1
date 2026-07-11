@@ -44,6 +44,8 @@ if (-not (Test-Path $OllamaExe)) {
 } else {
     & $OllamaExe pull qwen2.5-coder:14b
     & $OllamaExe pull qwen2.5:14b
+    & $OllamaExe pull qwen3:14b
+    & $OllamaExe pull qwen3:30b
 }
 
 Write-Host "=== Step 4b: Download wake word models ===" -ForegroundColor Cyan

@@ -249,6 +249,39 @@ TOOL_DEFINITIONS = [
     {
         "type": "function",
         "function": {
+            "name": "web_research",
+            "description": (
+                "Search the open web, fetch pages, extract verified facts, and store them "
+                "under .agent/web for later retrieval. Use for research questions that need "
+                "multiple sources, not just reading one known URL."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "What to research on the web",
+                    },
+                    "project_path": {
+                        "type": "string",
+                        "description": (
+                            "Optional project folder for .agent/web storage "
+                            "(default: ai-assistant repo)"
+                        ),
+                    },
+                    "max_pages": {
+                        "type": "integer",
+                        "default": 5,
+                        "description": "Maximum pages to fetch this run",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "fetch_url",
             "description": "Fetch a public web page and return readable text for summarizing.",
             "parameters": {

@@ -14,28 +14,31 @@ class PlaywrightSessionRecorder:
     def __init__(self, session_dir: Path) -> None:
         self.session_dir = session_dir.resolve()
         self.screenshots_dir = self.session_dir / "screenshots"
-        self.video_dir = self.session_dir / "video"
         self.frames: list[dict[str, Any]] = []
         self._step = 0
-        self._context: BrowserContext | None = None
 
     def prepare(self) -> None:
         if self.session_dir.exists():
             shutil.rmtree(self.session_dir)
         self.screenshots_dir.mkdir(parents=True, exist_ok=True)
-        self.video_dir.mkdir(parents=True, exist_ok=True)
 
     def context_options(self) -> dict[str, Any]:
-        return {
-            "record_video_dir": str(self.video_dir),
-            "record_video_size": {"width": 960, "height": 640},
-        }
+        return {}
 
     def attach(self, context: BrowserContext) -> None:
-        self._context = context
-        context.tracing.start(screenshots=True, snapshots=True, sources=False)
+        # Session replay uses explicit screenshots and semantic snapshots only.
+        # Video and Playwright tracing duplicate that evidence at high storage cost.
+        return
 
-    def record_frame(self, page: Page, *, label: str, url: str = "", context: str = "") -> None:
+    def record_frame(
+        self,
+        page: Page,
+        *,
+        label: str,
+        url: str = "",
+        context: str = "",
+        snapshot: dict[str, Any] | None = None,
+    ) -> None:
         self._step += 1
         safe = re.sub(r"[^a-zA-Z0-9._-]+", "_", label or "frame").strip("_")[:40] or "frame"
         filename = f"{self._step:03d}_{safe}.jpg"
@@ -54,41 +57,60 @@ class PlaywrightSessionRecorder:
                 "url": url or page.url,
                 "context": context,
                 "screenshot": screenshot_rel,
+                "interactables": list((snapshot or {}).get("interactables") or []),
                 "ts": datetime.now(timezone.utc).isoformat(),
             }
         )
+        self._persist_manifest()
 
-    def stop_tracing(self) -> None:
-        if not self._context:
+    def record_decision(self, decision: dict[str, Any]) -> None:
+        """Attach the next AI action to the screenshot and controls it used."""
+        if not self.frames:
             return
-        trace_path = self.session_dir / "trace.zip"
-        try:
-            self._context.tracing.stop(path=str(trace_path))
-        except Exception:
-            pass
-        self._context = None
-
-    def finalize(self) -> dict[str, Any]:
-        trace_rel = "trace.zip" if (self.session_dir / "trace.zip").is_file() else None
-        video_rel: str | None = None
-        if self.video_dir.is_dir():
-            for webm in sorted(self.video_dir.glob("*.webm")):
-                video_rel = f"video/{webm.name}"
+        frame = self.frames[-1]
+        target = decision.get("target") if isinstance(decision.get("target"), dict) else {}
+        target_id = str(decision.get("target_id") or target.get("id") or "").strip()
+        selected: dict[str, Any] | None = None
+        index = target.get("index")
+        for item in frame.get("interactables") or []:
+            if not isinstance(item, dict):
+                continue
+            if target_id and str(item.get("id") or "") == target_id:
+                selected = item
                 break
+            if index is not None and item.get("index") == index:
+                selected = item
+                break
+            if target.get("id") and item.get("id") == target["id"]:
+                selected = item
+                break
+            if target.get("text") and item.get("text") == target["text"]:
+                selected = item
+                break
+        frame["decision"] = dict(decision)
+        if selected:
+            frame["selected_interactable_id"] = selected.get("id")
+            frame["selected_interactable"] = selected
+        elif target_id:
+            frame["selected_interactable_id"] = target_id
+        self._persist_manifest()
 
+    def _persist_manifest(self) -> dict[str, Any]:
         manifest = {
             "recorded_at": datetime.now(timezone.utc).isoformat(),
             "frames": self.frames,
-            "trace": trace_rel,
-            "video": video_rel,
             "frame_count": len(self.frames),
         }
         self.session_dir.mkdir(parents=True, exist_ok=True)
-        (self.session_dir / "session.json").write_text(
-            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
+        manifest_path = self.session_dir / "session.json"
+        tmp_path = manifest_path.with_suffix(".json.tmp")
+        payload = json.dumps(manifest, ensure_ascii=False, indent=2) + "\n"
+        tmp_path.write_text(payload, encoding="utf-8")
+        tmp_path.replace(manifest_path)
         return manifest
+
+    def finalize(self) -> dict[str, Any]:
+        return self._persist_manifest()
 
 
 _active_recorder: PlaywrightSessionRecorder | None = None
@@ -105,10 +127,6 @@ def get_active_recorder() -> PlaywrightSessionRecorder | None:
 
 def session_manifest_paths(manifest: dict[str, Any], *, base: str = "ui-artifacts/playwright-session") -> dict[str, Any]:
     out = dict(manifest)
-    if out.get("video"):
-        out["video"] = f"{base}/{out['video']}"
-    if out.get("trace"):
-        out["trace"] = f"{base}/{out['trace']}"
     frames = []
     for frame in out.get("frames") or []:
         if not isinstance(frame, dict):
@@ -119,7 +137,7 @@ def session_manifest_paths(manifest: dict[str, Any], *, base: str = "ui-artifact
         frames.append(item)
     out["frames"] = frames
     return out
-def notify_page_state(page: Page, *, context: str = "") -> None:
+def notify_page_state(page: Page, *, context: str = "", snapshot: dict[str, Any] | None = None) -> None:
     recorder = get_active_recorder()
     if recorder:
-        recorder.record_frame(page, label=context or "state", context=context)
+        recorder.record_frame(page, label=context or "state", context=context, snapshot=snapshot)

@@ -4,6 +4,7 @@ import re
 from typing import Any
 from urllib.parse import urlparse
 
+from ui_test.interactables import element_key
 from ui_test.page_registry import find_known_path
 
 _STOP_WORDS = frozenset(
@@ -36,6 +37,11 @@ _STOP_WORDS = frozenset(
     }
 )
 
+_CONTENT_HINTS = re.compile(
+    r"\b(patch|changelog|release\s*notes?|notes?|version|update)\b",
+    re.IGNORECASE,
+)
+
 
 def task_keywords(task_text: str) -> list[str]:
     words = re.findall(r"[a-z]{4,}", task_text.lower())
@@ -47,6 +53,10 @@ def task_keywords(task_text: str) -> list[str]:
         seen.add(w)
         out.append(w)
     return out
+
+
+def task_mentions_hidden_content(task_text: str) -> bool:
+    return bool(_CONTENT_HINTS.search(task_text))
 
 
 def find_task_path_in_site_map(registry: dict[str, Any], task_text: str) -> tuple[str | None, str]:
@@ -114,7 +124,6 @@ def current_page_has_task_data(
     blob = " ".join(blob_parts)
     hits = [kw for kw in kws if kw in blob]
 
-    # Task asks for views/counts — need a table with rows or numeric content
     wants_metrics = any(w in task_text.lower() for w in ("view", "count", "most", "report", "analytic"))
     has_table = bool(visible.get("tables"))
     has_rows = any(
@@ -156,13 +165,89 @@ def path_key(url: str) -> str:
     return (parsed.path or "/").rstrip("/") or "/"
 
 
+def _route_clicked_keys(nav_tree: dict[str, Any], current_path: str) -> set[str]:
+    routes = nav_tree.get("routes") or {}
+    route = routes.get(path_key(current_path)) if isinstance(routes.get(path_key(current_path)), dict) else {}
+    return {str(k) for k in (route.get("clicked") or []) if k}
+
+
+def pick_button_for_task(
+    task_text: str,
+    interactables: list[dict[str, Any]],
+    nav_tree: dict[str, Any],
+    current_path: str,
+) -> dict[str, Any] | None:
+    """Pick an unexplored button/tab that might reveal task content on the current page."""
+    clicked = _route_clicked_keys(nav_tree, current_path)
+    kws = task_keywords(task_text)
+    candidates: list[tuple[int, int, str]] = []
+
+    for i, el in enumerate(interactables):
+        if not isinstance(el, dict):
+            continue
+        kind = str(el.get("kind") or "").lower()
+        if kind not in ("button", "menuitem", "tab", "input", "link"):
+            continue
+        text = str(el.get("text") or el.get("aria") or "").strip()
+        if not text:
+            continue
+        if element_key(el) in clicked:
+            continue
+        text_l = text.lower()
+        score = 0
+        for kw in kws:
+            if kw in text_l:
+                score += 5
+        if _CONTENT_HINTS.search(text):
+            score += 10
+        if score > 0:
+            candidates.append((score, i, text))
+
+    if not candidates:
+        return None
+
+    candidates.sort(reverse=True)
+    _, index, text = candidates[0]
+    return {
+        "action": "click",
+        "target": {"index": index, "text": text},
+        "reason": f"Explore '{text}' on current page — may reveal task content",
+    }
+
+
+def pick_unexplored_button(
+    interactables: list[dict[str, Any]],
+    nav_tree: dict[str, Any],
+    current_path: str,
+) -> dict[str, Any] | None:
+    """Click the next unexplored button/menu on the current page."""
+    clicked = _route_clicked_keys(nav_tree, current_path)
+    for i, el in enumerate(interactables):
+        if not isinstance(el, dict):
+            continue
+        kind = str(el.get("kind") or "").lower()
+        if kind not in ("button", "menuitem", "tab"):
+            continue
+        text = str(el.get("text") or el.get("aria") or "").strip()
+        if not text:
+            continue
+        if element_key(el) in clicked:
+            continue
+        return {
+            "action": "click",
+            "target": {"index": i, "text": text},
+            "reason": f"Try unexplored control '{text}' on this page",
+        }
+    return None
+
+
 def pick_nav_action_to_path(
     target_path: str,
     current_path: str,
     interactables: list[dict[str, Any]],
     nav_tree: dict[str, Any],
 ) -> dict[str, Any] | None:
-    """Pick a click/navigate action to reach target_path using nav tree + interactables."""
+    """Pick a click action to reach target_path — never invent a URL."""
     target = path_key(target_path)
     current = path_key(current_path)
     if target == current:
@@ -183,7 +268,7 @@ def pick_nav_action_to_path(
                     "text": el.get("text"),
                     "href": el.get("href"),
                 },
-                "reason": f"Nav tree: click to reach {target}",
+                "reason": f"Click link on page to reach {target}",
             }
 
     routes = nav_tree.get("routes") or {}
@@ -202,12 +287,4 @@ def pick_nav_action_to_path(
                             "reason": f"Verified route {current} → {target}",
                         }
 
-    if target.startswith("/"):
-        routes = nav_tree.get("routes") or {}
-        if target in routes or target == "/":
-            return {
-                "action": "navigate",
-                "url": target,
-                "reason": f"Site map cataloged task data on {target} (known route)",
-            }
     return None

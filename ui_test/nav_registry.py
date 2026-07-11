@@ -181,6 +181,26 @@ def record_nav_transition(
     return tree, True
 
 
+def record_interactable_click(
+    tree: dict[str, Any],
+    *,
+    path: str,
+    via: dict[str, Any],
+) -> dict[str, Any]:
+    """Track which controls were clicked on a route (including same-URL reveals)."""
+    key = _path_key(path)
+    routes = dict(tree.get("routes") or {})
+    route = dict(routes.get(key) or {"path": key})
+    clicked = list(route.get("clicked") or [])
+    ek = _via_key(via)
+    if ek and ek not in clicked:
+        clicked.append(ek)
+    route["clicked"] = clicked[-80:]
+    routes[key] = route
+    tree["routes"] = routes
+    return tree
+
+
 def nav_summary_for_agent(tree: dict[str, Any], *, max_routes: int = 25) -> str:
     lines: list[str] = []
     global_nav = tree.get("global_nav") or []

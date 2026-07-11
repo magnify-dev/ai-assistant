@@ -16,6 +16,8 @@ import {
   taskRequiresImplementation,
   triageTask,
   verifyAfterTest,
+  verifyAfterWebResearch,
+  webResearchFindingsText,
   extractInfoRequest,
   extractUiVerificationRequest,
   extractAnswerSection,
@@ -28,9 +30,12 @@ import {
   type ResumePlan,
 } from "./collaboration-transcript.js";
 import { CursorRunner } from "./cursor-agent.js";
+import { classifyTaskRunKind, classifyTaskRunKindAsync } from "./task-router.js";
+import { WebResearchRunner } from "./web-research-runner.js";
 import { getPrompt, renderPrompt } from "./prompts.js";
 import { PythonRunner, type RunOptions } from "./python-runner.js";
 import { resolveCursorRuntime } from "./run-target.js";
+import { preflightCursorHelper } from "./cursor-preflight.js";
 import { HelperStreamAggregator } from "./helper-stream.js";
 import { gitWorktreeChanged, gitWorktreeSnapshot } from "./helper-git.js";
 
@@ -71,6 +76,7 @@ export type CollaborationRunOptions = RunOptions & {
 export class CollaborationLoop extends EventEmitter {
   private pythonRunner: PythonRunner;
   private cursorRunner: CursorRunner;
+  private webResearchRunner: WebResearchRunner;
   private active = false;
   private cancelled = false;
   private finished = false;
@@ -78,10 +84,15 @@ export class CollaborationLoop extends EventEmitter {
   private runTask = "";
   private cards: AgentCard[] = [];
 
-  constructor(pythonRunner: PythonRunner, cursorRunner: CursorRunner) {
+  constructor(
+    pythonRunner: PythonRunner,
+    cursorRunner: CursorRunner,
+    webResearchRunner: WebResearchRunner,
+  ) {
     super();
     this.pythonRunner = pythonRunner;
     this.cursorRunner = cursorRunner;
+    this.webResearchRunner = webResearchRunner;
   }
 
   get isActive(): boolean {
@@ -91,7 +102,7 @@ export class CollaborationLoop extends EventEmitter {
   /** Clear stuck active flag when child runners have already exited. */
   resetIfStale(): boolean {
     if (!this.active) return false;
-    if (this.pythonRunner.running || this.cursorRunner.isRunning) return false;
+    if (this.pythonRunner.running || this.webResearchRunner.running || this.cursorRunner.isRunning) return false;
     this.active = false;
     this.cancelled = false;
     this.emit("event", { type: "run_state", running: false });
@@ -102,6 +113,7 @@ export class CollaborationLoop extends EventEmitter {
   cancel(): void {
     this.cancelled = true;
     this.pythonRunner.stop();
+    this.webResearchRunner.stop();
     this.cursorRunner.cancel();
   }
 
@@ -110,6 +122,17 @@ export class CollaborationLoop extends EventEmitter {
     this.cancel();
     this.cursorRunner.forceReset();
     this.failRunningCards("Cancelled");
+    this.emit("event", {
+      type: "phase",
+      phase: "cursor",
+      status: "failed",
+      message: "Cancelled by user",
+    });
+    this.emit("event", {
+      type: "cursor",
+      status: "cancelled",
+      message: "Cancelled by user",
+    });
     if (this.finished) return;
     if (this.active) {
       this.finishCollaboration(this.runProject, this.runTask, {
@@ -225,7 +248,7 @@ export class CollaborationLoop extends EventEmitter {
     if (this.active) {
       throw new Error("Collaboration loop already running");
     }
-    if (this.pythonRunner.running || this.cursorRunner.isRunning) {
+    if (this.pythonRunner.running || this.cursorRunner.isRunning || this.webResearchRunner.running) {
       throw new Error("Another run is already in progress");
     }
 
@@ -248,6 +271,22 @@ export class CollaborationLoop extends EventEmitter {
     let conversationContext = "";
     let resumePlan: ResumePlan | null = null;
     const userNote = options.userNote?.trim() ?? "";
+    this.emit("event", { type: "run_state", running: true });
+    this.emit("event", {
+      type: "phase",
+      phase: "collaboration",
+      status: "running",
+      message: "Classifying task…",
+    });
+    const taskRunKind = await classifyTaskRunKindAsync(taskText, Boolean(options.noOllama));
+    this.emit("event", {
+      type: "log",
+      message:
+        taskRunKind === "web_research"
+          ? "Task classified as web research — local agent will search the web and escalate to helper if needed"
+          : "Task classified as UI test — local agent will run the app pipeline and escalate to helper if needed",
+      level: "info",
+    });
 
     if (options.resumeFrom) {
       this.cards = options.resumeFrom.agentCards.map((c) => ({ ...c, historical: true }));
@@ -281,9 +320,8 @@ export class CollaborationLoop extends EventEmitter {
       });
     } else {
       this.cards = [];
-      this.emit("event", { type: "collaboration_start", task: taskText });
     }
-    this.emit("event", { type: "run_state", running: true });
+    // run_state already emitted before classification
 
     try {
       if (resumePlan?.nextAction === "helper") {
@@ -442,54 +480,118 @@ export class CollaborationLoop extends EventEmitter {
           continue;
         }
 
-        // --- Test path: run UI pipeline then verify (or answer the helper's info request) ---
+        // --- Test path: run local work (web research or UI pipeline) then verify ---
         const pendingInfoRequest =
           infoRounds < config.maxInfoRequests ? extractInfoRequest(helperContext) : null;
         const localTask = buildLocalTask(taskText, helperContext, iteration, conversationContext);
 
         const verificationRequest = extractUiVerificationRequest(helperContext);
+        const infoNeedsWebResearch =
+          Boolean(pendingInfoRequest) &&
+          classifyTaskRunKind(pendingInfoRequest ?? "", Boolean(options.noOllama)) === "web_research";
+        const useWebResearch =
+          !verificationRequest && (taskRunKind === "web_research" || infoNeedsWebResearch);
         this.emit("event", {
           type: "phase",
           phase: "collaboration",
           status: "running",
           message: pendingInfoRequest
-            ? "Gathering live-app info the helper asked for…"
+            ? useWebResearch
+              ? "Researching the web for info the helper asked for…"
+              : "Gathering live-app info the helper asked for…"
             : verificationRequest
               ? "Running helper's UI verification request on live app…"
-              : helperContext
-                ? `Verifying UI (iteration ${iteration})…`
-                : `Running UI tests (iteration ${iteration})…`,
+              : useWebResearch
+                ? `Researching the web (iteration ${iteration})…`
+                : helperContext
+                  ? `Verifying UI (iteration ${iteration})…`
+                  : `Running UI tests (iteration ${iteration})…`,
         });
 
         this.emit("event", {
           type: "phase",
           phase: "cursor",
           status: "done",
-          message: "Helper finished — running deploy & UI pipeline",
+          message: useWebResearch ? "Running open-web research" : "Helper finished — running deploy & UI pipeline",
         });
 
-        const pythonRun = await this.runPythonOnce({ ...options, task: localTask }, localCard.id);
-        this.checkCancelled();
-        if (pythonRun.failedPhases.some((p) => /cancelled/i.test(p))) {
-          throw new RunCancelledError();
+        let pythonRun: { ok: boolean; failedPhases: string[] } | null = null;
+        let webRun: {
+          ok: boolean;
+          failedPhases: string[];
+          result: import("./collaboration-eval.js").WebResearchEvaluationInput;
+        } | null = null;
+
+        if (useWebResearch) {
+          webRun = await this.runWebResearchOnce(
+            options.project,
+            localTask,
+            localCard.id,
+            Boolean(options.noOllama),
+            async (request) => {
+              const guidancePrompt = [
+                "## Web exploration guidance request",
+                "",
+                "The local browser agent is blocked and needs one concise next-step instruction.",
+                "Use only the supplied page state. Do not edit files or claim to browse.",
+                "Return plain guidance naming one visible element/action, or explain that the site should be abandoned.",
+                "",
+                `Original task:\n${taskText}`,
+                "",
+                `Browser request:\n${JSON.stringify(request, null, 2).slice(0, 12000)}`,
+              ].join("\n");
+              const helperResult = await this.runHelperIteration(
+                options,
+                config,
+                iteration,
+                guidancePrompt,
+                conversationContext,
+                "Provide read-only web navigation guidance; do not modify project files.",
+              );
+              return helperResult.succeeded
+                ? { ok: true, content: helperResult.responseText }
+                : { ok: false, error: helperResult.error ?? "Helper did not return guidance" };
+            },
+          );
+          this.checkCancelled();
+          if (webRun.failedPhases.some((p) => /cancelled/i.test(p))) {
+            throw new RunCancelledError();
+          }
+        } else {
+          pythonRun = await this.runPythonOnce({ ...options, task: localTask }, localCard.id);
+          this.checkCancelled();
+          if (pythonRun.failedPhases.some((p) => /cancelled/i.test(p))) {
+            throw new RunCancelledError();
+          }
         }
 
+        const localWorkOk = useWebResearch ? Boolean(webRun?.ok) : Boolean(pythonRun?.ok);
+
+        const infoFindings = useWebResearch
+          ? webResearchFindingsText(webRun?.result ?? {})
+          : String(readLatestReport(options.project)?.task_answer ?? "").trim();
+
         // --- Info round-trip: hand the local agent's findings back to the helper ---
-        // (skipped when a git/deploy failure blocks everything — handled below)
         if (
           pendingInfoRequest &&
-          (pythonRun.ok ||
-            !isGitOrDeployBlockingFailure(pythonRun.failedPhases, { skipDeploy: options.skipDeploy }))
+          (localWorkOk ||
+            Boolean(infoFindings.trim()) ||
+            (pythonRun &&
+              !isGitOrDeployBlockingFailure(pythonRun.failedPhases, { skipDeploy: options.skipDeploy })))
         ) {
           infoRounds++;
-          const report = readLatestReport(options.project);
-          const findings = String(report?.task_answer ?? "").trim();
-          const failureSummary = pythonRun.ok ? undefined : pythonRun.failedPhases.join("\n");
+          const findings = infoFindings;
+          const failureSummary =
+            localWorkOk || useWebResearch
+              ? undefined
+              : pythonRun?.failedPhases.join("\n");
           const infoReply = buildInfoReplyHandoff(taskText, pendingInfoRequest, findings, failureSummary);
 
           this.finishCard(localCard, {
             status: "done",
-            summary: `Gathered live-app info requested by helper (round ${infoRounds}/${config.maxInfoRequests})`,
+            summary: useWebResearch
+              ? `Gathered web research for helper (round ${infoRounds}/${config.maxInfoRequests})`
+              : `Gathered live-app info requested by helper (round ${infoRounds}/${config.maxInfoRequests})`,
             outcomeType: "prompt",
             outcomeText: infoReply,
             messages: localCard.messages,
@@ -536,7 +638,7 @@ export class CollaborationLoop extends EventEmitter {
           continue;
         }
 
-        if (!pythonRun.ok) {
+        if (!useWebResearch && pythonRun && !pythonRun.ok) {
           this.checkCancelled();
           const pipelinePayload = readRunPayload(options.project);
 
@@ -619,11 +721,9 @@ export class CollaborationLoop extends EventEmitter {
           continue;
         }
 
-        const verification = await verifyAfterTest(
-          options.project,
-          taskText,
-          helperContext || undefined,
-        );
+        const verification = useWebResearch
+          ? verifyAfterWebResearch(webRun?.result ?? {}, taskText)
+          : await verifyAfterTest(options.project, taskText, helperContext || undefined);
         this.checkCancelled();
 
         if (!verification.testsPassed) {
@@ -887,6 +987,28 @@ export class CollaborationLoop extends EventEmitter {
     const needsCode = taskRequiresImplementation(taskText);
     const cursorTarget = resolveCursorRuntime(options.cursorRuntime, options.repoUrl);
 
+    if (!options.apiKey?.trim()) {
+      return {
+        ok: false,
+        succeeded: false,
+        responseText: "",
+        error: "CURSOR_API_KEY not set in ai-assistant/.env — helper agent cannot connect",
+      };
+    }
+    if (cursorTarget.error) {
+      return { ok: false, succeeded: false, responseText: "", error: cursorTarget.error };
+    }
+
+    const preflight = preflightCursorHelper(cursorTarget.runtime, options.apiKey, options.project);
+    for (const warning of preflight.warnings) {
+      this.emit("event", { type: "log", message: warning, level: "warn" });
+    }
+    if (!preflight.ok) {
+      const message = preflight.errors.join(" ");
+      this.emit("event", { type: "log", message, level: "error" });
+      return { ok: false, succeeded: false, responseText: "", error: message };
+    }
+
     const execute = async (prompt: string, labelSuffix = "") => {
       const helperCard = this.startCard(
         "helper",
@@ -895,15 +1017,6 @@ export class CollaborationLoop extends EventEmitter {
       );
       helperCard.messages = [{ role: "user", text: prompt, ts: new Date().toISOString() }];
       this.upsertCard(helperCard);
-
-      if (cursorTarget.fallbackReason && !labelSuffix) {
-        this.emit("event", { type: "log", message: cursorTarget.fallbackReason, level: "warn" });
-        helperCard.messages = [
-          ...(helperCard.messages ?? []),
-          { role: "system", text: cursorTarget.fallbackReason, ts: new Date().toISOString() },
-        ];
-        this.upsertCard(helperCard);
-      }
 
       this.emit("event", {
         type: "phase",
@@ -1004,6 +1117,88 @@ export class CollaborationLoop extends EventEmitter {
     };
   }
 
+  private runWebResearchOnce(
+    project: string,
+    query: string,
+    cardId: string,
+    noOllama = false,
+    helpResponder?: (
+      request: Record<string, unknown>,
+    ) => Promise<string | { ok: boolean; content?: string; error?: string }>,
+  ): Promise<{
+    ok: boolean;
+    failedPhases: string[];
+    result: import("./collaboration-eval.js").WebResearchEvaluationInput;
+  }> {
+    return new Promise((resolve) => {
+      let resolved = false;
+      const failedPhases: string[] = [];
+      let result: import("./collaboration-eval.js").WebResearchEvaluationInput = {};
+
+      const finish = (ok: boolean) => {
+        if (resolved) return;
+        resolved = true;
+        this.webResearchRunner.off("event", onEvent);
+        resolve({ ok, failedPhases, result });
+      };
+
+      this.emit("event", { type: "phases_reset" });
+
+      const onEvent = (event: Record<string, unknown>) => {
+        if (event.type === "phase" && event.status === "failed") {
+          const phase = String(event.phase ?? "phase");
+          const message = String(event.message ?? "failed").trim();
+          failedPhases.push(message ? `${phase}: ${message}` : phase);
+        }
+
+        if (event.type === "web_research_result") {
+          result = {
+            query: String(event.query ?? ""),
+            answer: String(event.answer ?? ""),
+            pages_fetched: Number(event.pages_fetched ?? 0),
+            facts_added: Number(event.facts_added ?? 0),
+            goal_met: Boolean(event.goal_met),
+            errors: Array.isArray(event.errors) ? event.errors.map(String) : [],
+            facts: Array.isArray(event.facts)
+              ? (event.facts as import("./collaboration-eval.js").WebResearchEvaluationInput["facts"])
+              : [],
+          };
+        }
+
+        if (event.type === "log" && event.level === "error") {
+          const message = String(event.message ?? "").trim();
+          if (message) failedPhases.push(message);
+        }
+
+        if (event.type === "done") {
+          const err = String(event.error ?? "").trim();
+          if (err) failedPhases.push(`error: ${err}`);
+          finish(Boolean(event.overall_ok));
+        }
+        if (event.type === "process_exit") {
+          if (this.cancelled) {
+            failedPhases.push("cancelled by user");
+            finish(false);
+            return;
+          }
+          finish(Number(event.code) === 0 && Boolean(result.answer));
+        }
+      };
+
+      this.webResearchRunner.on("event", onEvent);
+      try {
+        this.webResearchRunner.start({ project, query, noOllama, helpResponder });
+      } catch (err) {
+        this.webResearchRunner.off("event", onEvent);
+        resolve({
+          ok: false,
+          failedPhases: [err instanceof Error ? err.message : "web research failed to start"],
+          result: {},
+        });
+      }
+    });
+  }
+
   private runPythonOnce(
     options: RunOptions,
     cardId: string,
@@ -1085,9 +1280,12 @@ export class CollaborationLoop extends EventEmitter {
       const stream = new HelperStreamAggregator();
 
       const publishStream = () => {
+        if (resolved || this.cancelled) return;
+        const current = this.cards.find((c) => c.id === card.id);
+        if (!current || current.status !== "running") return;
         const snap = stream.snapshot();
         this.upsertCard({
-          ...card,
+          ...current,
           streamStatus: snap.streamStatus,
           streamText: snap.streamText,
           outcomeText: undefined,
@@ -1102,6 +1300,7 @@ export class CollaborationLoop extends EventEmitter {
       };
 
       const onEvent = (event: Record<string, unknown>) => {
+        if (resolved || this.cancelled) return;
         stream.push(event);
         publishStream();
 

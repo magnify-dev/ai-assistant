@@ -775,6 +775,81 @@ export function buildQuestionPrompt(
   });
 }
 
+export type WebResearchEvaluationInput = {
+  query?: string;
+  answer?: string;
+  pages_fetched?: number;
+  facts_added?: number;
+  errors?: string[];
+  goal_met?: boolean;
+  facts?: Array<{ field?: string; value?: string; source_url?: string; quote?: string }>;
+};
+
+export function webResearchFindingsText(result: WebResearchEvaluationInput): string {
+  const lines: string[] = [];
+  if (result.answer?.trim()) lines.push(`Answer: ${result.answer.trim()}`);
+  if (result.errors?.length) lines.push(`Errors: ${result.errors.join("; ")}`);
+  for (const fact of result.facts ?? []) {
+    if (fact.field && fact.value) {
+      lines.push(`- ${fact.field}: ${fact.value}${fact.source_url ? ` (${fact.source_url})` : ""}`);
+    }
+  }
+  return lines.join("\n").trim();
+}
+
+export function buildWebResearchQuestionPrompt(taskText: string, findings: string): string {
+  return renderPrompt("collaboration.web_research_question_handoff", {
+    task: taskText,
+    findings: findings || "(web research returned no usable data)",
+  });
+}
+
+/** After a web research run — decide if we can answer or need the helper. */
+export function verifyAfterWebResearch(
+  result: WebResearchEvaluationInput,
+  taskText: string,
+): LocalEvaluation {
+  const answer = String(result.answer ?? "").trim();
+  const findings = webResearchFindingsText(result);
+  const pagesFetched = Number(result.pages_fetched ?? 0);
+  const factsAdded = Number(result.facts_added ?? 0);
+  const errors = result.errors ?? [];
+  const goalMet = Boolean(result.goal_met);
+
+  if (goalMet && pagesFetched > 0) {
+    return {
+      outcome: "answer",
+      answer: answer || findings,
+      summary: `Research goal met via browser exploration (${pagesFetched} page(s))`,
+      testsPassed: true,
+    };
+  }
+
+  const insufficient =
+    !answer ||
+    pagesFetched === 0 ||
+    factsAdded === 0 ||
+    answerImpliesTaskNotDone(answer);
+
+  if (!insufficient) {
+    return {
+      outcome: "answer",
+      answer,
+      summary: `Web research complete (${pagesFetched} page(s), ${factsAdded} fact(s))`,
+      testsPassed: true,
+    };
+  }
+
+  return {
+    outcome: "delegate",
+    kind: "question",
+    prompt: buildWebResearchQuestionPrompt(taskText, findings || answer || errors.join("; ")),
+    answer: answer || errors.join("; ") || "Web research did not produce a reliable answer.",
+    summary: "Web research insufficient — asking helper agent",
+    testsPassed: false,
+  };
+}
+
 /**
  * The helper asked for information from the live app ("### Info needed") and the
  * local agent has now gathered it. Hand the findings back so the helper can implement.

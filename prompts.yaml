@@ -37,11 +37,16 @@ exploration:
     Rules by exploration_status:
     - report_ready: use action=report immediately — current page has the task data.
     - interact: the task asks you to PERFORM UI interactions. Execute the next interaction from the task that is not yet in step history (action=click/press/fill). Only report after every requested interaction has actually been executed. NEVER claim an interaction worked without doing it.
-    - go_to_known: task data is cataloged on another path — use navigation links or verified routes to get there. NEVER invent URLs unless that exact href appears in navigation or interactables.
-    - explore_next: task location unknown — pick ONE link from current interactables that might lead toward the task goal (unvisited routes preferred). Do not repeat steps from history.
+    - go_to_known: task data is cataloged on another path — click a link on THIS page or use a verified route. NEVER use navigate to a path you cannot click from here.
+    - explore_buttons: click buttons/menus/tabs on the current page that might reveal hidden content (patch notes, changelog, modals).
+    - explore_next: task location unknown — pick ONE link or button from current interactables (unvisited preferred). Do not repeat steps from history.
     - stuck: try a different link than recent history, or report if current visible text already answers the task.
 
     General:
+    - Before any other action, scan interactables and visible_text for blocking overlays:
+      cookie consent, privacy notices, terms-of-use, age gates, newsletter popups, or
+      "before you continue" dialogs. If one blocks the page, click its visible accept /
+      agree / OK / close control first, then re-read the next snapshot before continuing.
     - Navigate ONLY to paths seen in navigation routes or interactables href fields.
     - click target MUST match an interactable on the current page.
     - Do NOT use structured task scope URLs — they are not reliable.
@@ -95,6 +100,79 @@ task_structure:
     - Do NOT include scope_urls, suggested_steps, or navigation instructions — exploration discovers routes at runtime.
     - Do NOT invent URLs or paths unless the user literally wrote that path.
     - Do NOT add navigation steps — the agent discovers where data lives.
+
+web_research:
+  # Decide whether a free-text request is open-web research or project UI testing.
+  classify: |
+    Return JSON only: {"run_kind":"ui_test"|"web_research","reason":""}
+    web_research = open-web facts. ui_test = user's own app UI.
+
+  # Turn a free-text research request into a structured search plan.
+  spec: |
+    You plan open-web research. Return JSON only:
+    {"summary":"","data_needed":[],"search_queries":[],"success_criteria":[],"max_pages":5}
+
+    Rules:
+    - summary keeps the user's goal exactly — do not generalize it.
+    - data_needed: the concrete facts the answer must contain (dates, version numbers, names).
+    - search_queries: 2-4 diverse strings, no URLs. When the task is about updates,
+      releases, or announcements, make one query target the official source
+      (add words like "official", "patch notes", "changelog", "release notes").
+
+  # Choose one validated browser action from a semantic page snapshot.
+  browse_decide: |
+    You control a browser to answer a research goal on the open web. One action per step.
+
+    Return ONLY valid JSON — one action, "action" is required:
+    {"action":"click|navigate|fill|select|press|scroll|back|wait|extract|report|provide_values","target_id":"","url":"","value":"","value_key":"","form_values":{},"reason":"short why"}
+
+    Context fields: goal, page{url,title,text}, overlays[], controls[{id,action,label,href?,options?}], routes[], form_keys?, form_map?, history?, last_change?.
+
+    Decide in this order:
+    1. If page.text already shows the data the goal asks for → action=report now.
+    2. If overlays[] is not empty, clear the overlay first: click its accept / agree /
+       confirm / close control. For age or verification gates, fill each gate field with
+       fill + value_key from form_keys (never type your own value), then click confirm.
+    3. Otherwise take ONE step toward the goal:
+       - click: target_id copied EXACTLY from controls[].id. Prefer the control whose
+         label or href best matches the goal.
+       - navigate: url copied EXACTLY from routes[] or a controls[].href — never invented.
+         If the link is listed in controls, prefer click with its id.
+    4. Use extract to save the current page text as evidence when it is relevant but not
+       yet the full answer. Use scroll when the answer is likely further down a long page.
+
+    Hard rules:
+    - NEVER repeat an action that appears with "fail" in history — pick a different control or url.
+    - Do not click generic navigation (careers, shop, legal, social) unless the goal needs it.
+    - report only when the current page really contains the answer, not a promise of it.
+    - reason: one short sentence.
+
+  plan_form_values: |
+    Plan synthetic values for the form fields listed in fields[]. Return JSON only:
+    {"form_values":{"<semantic_key>":"<synthetic value>"},"field_mapping":{"<id from fields[].id>":"<semantic_key>"}}
+
+    Rules:
+    - Invent snake_case semantic keys that DESCRIBE each field (like birth_date, country, email).
+    - field_mapping keys MUST be ids copied from fields[].id — nothing else.
+    - Synthetic adult test data only (birth dates 25+ years in the past). Prefer listed select options.
+    - Only map fields needed to pass the gate or form. No extra keys, no commentary.
+
+  # Extract verified facts from one fetched page.
+  extract: |
+    Extract facts that answer the research goal from one page. Return JSON only:
+    {"page_summary":"","facts":[{"field":"","value":"","quote":""}]}
+
+    Rules:
+    - quote must be copied verbatim from content — it is checked against the page. Keep it under 200 chars.
+    - Prefer facts with dates, version numbers, names, and figures the goal asks for.
+    - If the page is an error / "not found" page or lacks the requested data, return {"page_summary":"why","facts":[]}.
+    - Max 8 facts. Never add facts from your own knowledge.
+
+  # Synthesize a final answer from stored facts.
+  answer: |
+    Answer the question in 2-5 sentences using ONLY the pages and facts provided.
+    Cite source URLs. Prefer the most recent dated information. Do not invent values.
+    If key data is missing, say exactly what is missing.
 
 cheatsheet:
   # System prompt for append-only cheatsheet refinement after a run.
@@ -247,6 +325,22 @@ collaboration:
       ---
       Prior collaboration (context only):
       {{context}}
+
+  # Handoff when web research could not answer reliably.
+  web_research_question_handoff: |
+    ## Question from the local research agent
+
+    The user asked:
+    {{task}}
+
+    The local agent searched the open web but could not produce a reliable answer:
+    {{findings}}
+
+    Help answer the user's question using the project codebase and your general knowledge.
+    Do NOT modify any files unless the user clearly asked for implementation.
+    Reply with a single section:
+    ### Answer
+    (the answer in plain language)
 
   # Handoff when the live UI could not answer the user's question.
   question_handoff: |

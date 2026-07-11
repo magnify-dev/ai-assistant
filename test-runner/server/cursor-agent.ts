@@ -20,7 +20,7 @@ function connectionTimeoutMessage(runtime: CursorRuntime): string {
   if (runtime === "cloud") {
     return `${base} Check CURSOR_API_KEY and the GitHub repo URL, then cancel and re-run.`;
   }
-  return `${base} Local runtime needs Cursor installed on this machine — open the Cursor app once, then cancel and re-run. Or switch Helper runtime to Cloud in the test-runner UI.`;
+  return `${base} For local runtime: (1) open the Cursor desktop app on this machine, (2) confirm CURSOR_API_KEY in ai-assistant/.env, (3) cancel and re-run.`;
 }
 
 function formatToolActivity(name: string, status: string): string {
@@ -96,6 +96,7 @@ export class CursorRunner extends EventEmitter {
   private abortRequested = false;
   private activeRun: Run | null = null;
   private runGeneration = 0;
+  private createAbortReject: ((err: Error) => void) | null = null;
 
   get isRunning(): boolean {
     return this.running;
@@ -103,6 +104,7 @@ export class CursorRunner extends EventEmitter {
 
   cancel(): void {
     this.abortRequested = true;
+    this.createAbortReject?.(new Error("Cancelled by user"));
     if (this.activeRun?.supports("cancel")) {
       void this.activeRun.cancel();
     }
@@ -112,8 +114,14 @@ export class CursorRunner extends EventEmitter {
   forceReset(): void {
     this.runGeneration += 1;
     this.abortRequested = true;
+    this.createAbortReject?.(new Error("Cancelled by user"));
     this.activeRun = null;
     this.running = false;
+    this.emit("event", {
+      type: "cursor",
+      status: "cancelled",
+      message: "Cancelled by user",
+    });
   }
 
   private emitConnecting(runtime: CursorRuntime, elapsedSec?: number): void {
@@ -156,9 +164,13 @@ export class CursorRunner extends EventEmitter {
           });
 
     let timer: ReturnType<typeof setTimeout> | undefined;
+    const abortPromise = new Promise<never>((_, reject) => {
+      this.createAbortReject = (err: Error) => reject(err);
+    });
     try {
       const agent = await Promise.race([
         createPromise,
+        abortPromise,
         new Promise<never>((_, reject) => {
           timer = setTimeout(() => {
             reject(new Error(connectionTimeoutMessage(options.runtime)));
@@ -173,6 +185,7 @@ export class CursorRunner extends EventEmitter {
 
       return agent;
     } finally {
+      this.createAbortReject = null;
       clearInterval(heartbeat);
       if (timer) clearTimeout(timer);
     }

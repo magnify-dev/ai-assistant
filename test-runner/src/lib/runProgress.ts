@@ -92,6 +92,14 @@ export function resolveActiveRunStep(
     };
   }
 
+  if (phases.web_research?.status === "running") {
+    return {
+      key: "web_research",
+      label: "Web research",
+      message: phases.web_research.message?.trim() || "Searching the web…",
+    };
+  }
+
   const pipelineOrder: PhaseKey[] = [
     "ollama",
     "task_structure",

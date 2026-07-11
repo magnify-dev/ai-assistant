@@ -24,6 +24,7 @@ from jarvis_tools.pc_ops import (
     _run_powershell,
     _web_search,
 )
+from jarvis_tools.web_research import _web_research
 from jarvis_tools.vision import _describe_screen
 from jarvis_tools.windows import get_active_window_title
 
@@ -76,6 +77,12 @@ def execute_tool(name: str, arguments: dict) -> str:
             return _run_powershell(f"Start-Process '{target}'")
         if name == "web_search":
             return _web_search(arguments["query"])
+        if name == "web_research":
+            return _web_research(
+                arguments["query"],
+                project_path=str(arguments.get("project_path") or ""),
+                max_pages=int(arguments.get("max_pages", 5)),
+            )
         if name == "open_url":
             return _open_url(arguments["url"])
         if name == "fetch_url":

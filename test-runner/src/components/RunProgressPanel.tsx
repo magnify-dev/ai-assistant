@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 import type { RunReport, StructuredTask, TestTarget } from "@/lib/projectTypes";
 import type { AgentRunCard, CollaborationResult } from "@/lib/collaborationTypes";
+import type { WebResearchState } from "@/lib/webResearchTypes";
 import { PHASES, type PhaseKey, type PhaseMap } from "@/types";
 import { CollaborationPanel } from "@/components/CollaborationPanel";
 import { ExplorationPanel } from "@/components/ExplorationPanel";
@@ -26,10 +27,10 @@ type Props = {
   testTargetMode: "local" | "deployed";
   skipDeploy: boolean;
   hasTask: boolean;
-  skipCursor?: boolean;
   agentCards?: AgentRunCard[];
   collaborationResult?: CollaborationResult | null;
   hideCollaboration?: boolean;
+  webResearch?: WebResearchState | null;
 };
 
 function isExplorationMode(
@@ -72,6 +73,7 @@ const PIPELINE_PHASE_KEYS = new Set<PhaseKey>([
   "structure",
   "exploration",
   "ui_test",
+  "web_research",
 ]);
 
 function hasPipelinePhaseActivity(phases: PhaseMap): boolean {
@@ -200,10 +202,10 @@ export function RunProgressPanel({
   testTargetMode,
   skipDeploy,
   hasTask,
-  skipCursor,
   agentCards = [],
   collaborationResult = null,
   hideCollaboration = false,
+  webResearch = null,
 }: Props) {
   const [inspectExploration, setInspectExploration] = useState(false);
 
@@ -216,6 +218,10 @@ export function RunProgressPanel({
   const taskAnswerPlain = plainAnswer(taskAnswer);
 
   const exploration = isExplorationMode(hasTask, runReport, phases);
+  const webResearchActive =
+    Boolean(phases.web_research) ||
+    Boolean(webResearch?.answer) ||
+    Boolean(webResearch?.controller || webResearch?.currentUrl);
 
   const activeStep = useMemo(
     () => resolveActiveRunStep(phases, agentCards, running),
@@ -235,7 +241,7 @@ export function RunProgressPanel({
     return undefined;
   }, [stepKeys, phases]);
 
-  const showCursor = !skipCursor && agentCards.length === 0;
+  const showCursor = agentCards.length === 0;
   const showCollaboration = agentCards.length > 0 || Boolean(collaborationResult);
   const pipelineActive = running || lastResult !== null || hasPipelinePhaseActivity(phases);
   const showFullPipeline = pipelineActive && !showCollaboration;
@@ -292,6 +298,77 @@ export function RunProgressPanel({
         ) : null}
 
         {showFullPipeline ? renderStepCards(stepKeys, phases, running, structuredTask, fullPipelineActiveKey) : null}
+
+        {webResearchActive ? (
+          <ProgressCard
+            title="Web research"
+            status={
+              phases.web_research?.status === "failed"
+                ? "failed"
+                : webResearch?.answer
+                  ? "done"
+                  : running
+                    ? "running"
+                    : "idle"
+            }
+            summary={
+              webResearch?.progress?.step
+                ? `${webResearch.progress.step}${webResearch.progress.url ? `: ${webResearch.progress.url}` : ""}${
+                    webResearch.progress.index && webResearch.progress.total
+                      ? ` (${webResearch.progress.index}/${webResearch.progress.total})`
+                      : ""
+                  }`
+                : webResearch?.decision?.action
+                  ? `${webResearch.decision.action}${webResearch.decision.target ? `: ${webResearch.decision.target}` : ""}`
+                  : webResearch?.controller?.status || webResearch?.controller?.phase
+                    ? String(webResearch.controller.status ?? webResearch.controller.phase)
+                : phases.web_research?.message ||
+                  (webResearch?.pages_fetched
+                    ? `${webResearch.pages_fetched} page(s), ${webResearch.facts_added ?? 0} fact(s)`
+                    : running
+                      ? "Searching and extracting…"
+                      : undefined)
+            }
+            defaultOpen
+            highlight
+          >
+            {webResearch?.progress?.message ? (
+              <p className="text-xs text-white/60">{webResearch.progress.message}</p>
+            ) : null}
+            {(webResearch?.indexPages?.length ?? 0) > 0 ? (
+              <section className="mt-2">
+                <p className="mb-1 text-[10px] uppercase tracking-wide text-white/40">Pages indexed</p>
+                <ul className="max-h-32 space-y-0.5 overflow-y-auto text-xs text-white/70">
+                  {webResearch!.indexPages!.map((page, index) => (
+                    <li key={`${page.url}-${index}`} className="truncate">
+                      {page.title ? `${page.title} — ` : ""}
+                      <span className="font-mono text-white/50">{page.url}</span>
+                    </li>
+                  ))}
+                </ul>
+              </section>
+            ) : null}
+            {webResearch?.answer ? (
+              <p className="mt-2 text-sm leading-relaxed text-sky-100/95">{webResearch.answer}</p>
+            ) : null}
+            {((webResearch?.liveFacts?.length ?? 0) > 0 || (webResearch?.facts?.length ?? 0) > 0) ? (
+              <ul className="mt-3 max-h-48 space-y-1 overflow-y-auto text-xs text-white/75">
+                {(webResearch!.liveFacts ?? webResearch!.facts)!.slice(0, 12).map((fact, index) => (
+                  <li key={index}>
+                    <span className="font-medium text-white/85">{fact.field}:</span> {fact.value}
+                  </li>
+                ))}
+              </ul>
+            ) : null}
+            {(webResearch?.errors?.length ?? 0) > 0 ? (
+              <ul className="mt-2 space-y-1 text-xs text-amber-200/80">
+                {webResearch!.errors!.map((err, index) => (
+                  <li key={index}>{err}</li>
+                ))}
+              </ul>
+            ) : null}
+          </ProgressCard>
+        ) : null}
 
         <ProgressCard
           title="Report"
@@ -426,7 +503,7 @@ export function RunProgressPanel({
             ) : null}
         </ProgressCard>
 
-        {taskAnswerPlain ? (
+        {taskAnswerPlain && !webResearch?.answer ? (
           <ProgressCard
             title="Answer"
             status={runReport?.overall_ok ? "done" : running ? "running" : "idle"}

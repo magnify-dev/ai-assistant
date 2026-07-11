@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { parse as parseYaml } from "yaml";
 import { canResumeTranscript, readCollaborationTranscript } from "./collaboration-transcript.js";
+import { classifyTaskRunKindHeuristic } from "./task-router.js";
 
 type ExplorationDoc = {
   version?: number;
@@ -9,6 +10,24 @@ type ExplorationDoc = {
   navigation?: Record<string, unknown>;
   pages?: Record<string, unknown>;
 };
+
+type WebResearchDoc = {
+  version?: number;
+  updated_at?: string;
+  pages?: Record<string, unknown>;
+  facts?: Array<Record<string, unknown>>;
+};
+
+function readYamlFile(filePath: string): Record<string, unknown> | null {
+  if (!fs.existsSync(filePath)) return null;
+  try {
+    const raw = fs.readFileSync(filePath, "utf8");
+    const data = parseYaml(raw);
+    return data && typeof data === "object" ? (data as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}
 
 function agentPath(projectPath: string, ...parts: string[]) {
   return path.join(path.resolve(projectPath), ".agent", ...parts);
@@ -36,15 +55,425 @@ function formatRunLabel(runId: string) {
 }
 
 function readSessionManifest(runRootDir: string) {
-  const candidates = [
-    path.join(runRootDir, "ui-artifacts", "playwright-session", "session.json"),
-    path.join(runRootDir, "playwright-session", "session.json"),
-  ];
-  for (const file of candidates) {
-    const data = readJsonFile<Record<string, unknown>>(file);
-    if (data) return { manifest: data, base: path.relative(runRootDir, path.dirname(file)).replace(/\\/g, "/") };
+  const resolved = resolvePlaywrightSession("", runRootDir);
+  return { manifest: resolved.manifest, base: resolved.base };
+}
+
+function synthesizeSessionFromScreenshots(
+  runRootDir: string,
+  baseRel: string,
+): Record<string, unknown> | null {
+  const screenshotsDir = path.join(runRootDir, baseRel, "screenshots");
+  if (!fs.existsSync(screenshotsDir)) return null;
+  let files: string[] = [];
+  try {
+    files = fs
+      .readdirSync(screenshotsDir)
+      .filter((name) => /\.(png|jpe?g|webp)$/i.test(name))
+      .sort();
+  } catch {
+    return null;
   }
-  return { manifest: null, base: "ui-artifacts/playwright-session" };
+  if (!files.length) return null;
+
+  const frames = files.map((file, index) => {
+    const match = file.match(/^(\d+)_(.+)\.(png|jpe?g|webp)$/i);
+    const step = match ? Number(match[1]) : index + 1;
+    const label = match?.[2] ?? file.replace(/\.[^.]+$/, "");
+    let ts = new Date().toISOString();
+    try {
+      ts = fs.statSync(path.join(screenshotsDir, file)).mtime.toISOString();
+    } catch {
+      /* ignore */
+    }
+    return {
+      step,
+      label,
+      url: "",
+      context: "web_exploration",
+      screenshot: `screenshots/${file}`,
+      interactables: [],
+      ts,
+    };
+  });
+
+  return {
+    recorded_at: frames[frames.length - 1]?.ts ?? new Date().toISOString(),
+    frames,
+    frame_count: frames.length,
+  };
+}
+
+function readWebSessionStateForRun(
+  projectPath: string,
+  manifest: Record<string, unknown> | null,
+  transcriptSavedAt?: string,
+): Record<string, unknown> | null {
+  const sessionsDir = agentPath(projectPath, "web", "sessions");
+  if (!fs.existsSync(sessionsDir)) return null;
+
+  const frameLabels = new Set(
+    (Array.isArray(manifest?.frames) ? manifest.frames : [])
+      .map((frame) =>
+        frame && typeof frame === "object" ? String((frame as Record<string, unknown>).label ?? "") : "",
+      )
+      .filter(Boolean),
+  );
+  const targetTime = parseTimestamp(transcriptSavedAt);
+
+  let best: { state: Record<string, unknown>; score: number; mtime: number } | null = null;
+  for (const entry of fs.readdirSync(sessionsDir, { withFileTypes: true })) {
+    if (!entry.isFile() || !/\.ya?ml$/i.test(entry.name)) continue;
+    const file = path.join(sessionsDir, entry.name);
+    const state = readYamlFile(file);
+    if (!state) continue;
+    let mtime = 0;
+    try {
+      mtime = fs.statSync(file).mtimeMs;
+    } catch {
+      mtime = 0;
+    }
+
+    const sessionId = String(state.session_id ?? entry.name.replace(/\.ya?ml$/i, ""));
+    if (manifest?.session_id && sessionId === String(manifest.session_id)) {
+      return state;
+    }
+
+    const history = Array.isArray(state.history) ? state.history : [];
+    const matchScore = history.reduce((count, item) => {
+      if (!item || typeof item !== "object") return count;
+      const stepId = String((item as Record<string, unknown>).step_id ?? "");
+      return frameLabels.has(stepId) ? count + 1 : count;
+    }, 0);
+
+    const timeScore =
+      targetTime > 0 ? -Math.abs(mtime - targetTime) : mtime;
+    const score = matchScore * 1_000_000_000_000 + timeScore;
+    if (!best || score > best.score) {
+      best = { state, score, mtime };
+    }
+  }
+
+  return best?.state ?? null;
+}
+
+function enrichSessionFromWebState(
+  manifest: Record<string, unknown>,
+  webState: Record<string, unknown> | null,
+): Record<string, unknown> {
+  if (!webState) return manifest;
+  const history = Array.isArray(webState.history) ? webState.history : [];
+  const snapshots = Array.isArray(webState.snapshots) ? webState.snapshots : [];
+  if (!history.length && !snapshots.length) return manifest;
+
+  const historyByStep = new Map<string, Record<string, unknown>>();
+  for (const item of history) {
+    if (!item || typeof item !== "object") continue;
+    const row = item as Record<string, unknown>;
+    const stepId = String(row.step_id ?? "");
+    if (stepId) historyByStep.set(stepId, row);
+  }
+
+  const snapshotsByStep = new Map<string, Record<string, unknown>>();
+  const snapshotsById = new Map<string, Record<string, unknown>>();
+  for (const item of snapshots) {
+    if (!item || typeof item !== "object") continue;
+    const row = item as Record<string, unknown>;
+    const stepId = String(row.step_id ?? "");
+    const snapshotId = String(row.snapshot_id ?? "");
+    if (stepId) snapshotsByStep.set(stepId, row);
+    if (snapshotId) snapshotsById.set(snapshotId, row);
+  }
+
+  const frames = Array.isArray(manifest.frames) ? manifest.frames : [];
+  const enrichedFrames = frames.map((frame, frameIndex) => {
+    if (!frame || typeof frame !== "object") return frame;
+    const item = { ...(frame as Record<string, unknown>) };
+    const stepId = String(item.label ?? "");
+    const hist =
+      historyByStep.get(stepId) ??
+      (Array.isArray(webState.history) ? (webState.history as Record<string, unknown>[])[frameIndex] : undefined);
+    const snap =
+      snapshotsByStep.get(stepId) ??
+      (hist?.snapshot_id ? snapshotsById.get(String(hist.snapshot_id)) : undefined) ??
+      (Array.isArray(webState.snapshots)
+        ? (webState.snapshots as Record<string, unknown>[])[frameIndex]
+        : undefined);
+
+    if (snap?.url) item.url = snap.url;
+    if (snap?.title) item.title = snap.title;
+    if (Array.isArray(snap?.interactables) && snap.interactables.length) {
+      item.interactables = snap.interactables;
+    }
+
+    if (hist) {
+      const action = String(hist.action ?? "");
+      const reason = String(hist.reason ?? "");
+      const targetId = String(hist.target_id ?? "");
+      if (action || reason || targetId) {
+        item.decision = {
+          action,
+          reason,
+          ...(targetId ? { target_id: targetId } : {}),
+          ...(typeof item.decision === "object" && item.decision ? item.decision : {}),
+        };
+      }
+      if (targetId) {
+        const controls = Array.isArray(item.interactables) ? item.interactables : [];
+        const selected = controls.find(
+          (control) =>
+            control &&
+            typeof control === "object" &&
+            String((control as Record<string, unknown>).id ?? "") === targetId,
+        );
+        if (selected && typeof selected === "object") {
+          item.selected_interactable_id = targetId;
+          item.selected_interactable = selected;
+        } else {
+          item.selected_interactable_id = targetId;
+        }
+      }
+      if (typeof hist.ok === "boolean") item.action_ok = hist.ok;
+      if (hist.error) item.error = String(hist.error);
+      if (hist.ok === false && !item.error) {
+        item.error = String(hist.error ?? "Action failed");
+      }
+    }
+
+    return item;
+  });
+
+  return {
+    ...manifest,
+    frames: enrichedFrames,
+    frame_count: enrichedFrames.length,
+    session_id: webState.session_id,
+    query: webState.query,
+  };
+}
+
+type SessionResolution = {
+  manifest: Record<string, unknown> | null;
+  base: string;
+  source: "web" | "ui";
+};
+
+function resolvePlaywrightSession(
+  projectPath: string,
+  runRootDir: string,
+  hints?: {
+    preferWeb?: boolean;
+    runKind?: "ui_test" | "web_research" | "exploration";
+    transcriptSavedAt?: string;
+  },
+): SessionResolution {
+  const webBase = "web-artifacts/playwright-session";
+  const uiBase = "ui-artifacts/playwright-session";
+  const webManifestPath = path.join(runRootDir, webBase, "session.json");
+  const uiManifestPath = path.join(runRootDir, uiBase, "session.json");
+
+  const webManifest = readJsonFile<Record<string, unknown>>(webManifestPath);
+  const uiManifest = readJsonFile<Record<string, unknown>>(uiManifestPath);
+  const webScreenshots = countScreenshotFrames(runRootDir);
+  const preferWeb =
+    hints?.preferWeb === true ||
+    hints?.runKind === "web_research" ||
+    (webScreenshots.sessionSource === "web" && webScreenshots.hasSession);
+
+  let webMtime = 0;
+  let uiMtime = 0;
+  if (fs.existsSync(webManifestPath)) {
+    try {
+      webMtime = fs.statSync(webManifestPath).mtimeMs;
+    } catch {
+      webMtime = 0;
+    }
+  }
+  if (fs.existsSync(uiManifestPath)) {
+    try {
+      uiMtime = fs.statSync(uiManifestPath).mtimeMs;
+    } catch {
+      uiMtime = 0;
+    }
+  }
+  const webShotDir = path.join(runRootDir, webBase, "screenshots");
+  const uiShotDir = path.join(runRootDir, uiBase, "screenshots");
+  if (fs.existsSync(webShotDir)) {
+    try {
+      webMtime = Math.max(webMtime, fs.statSync(webShotDir).mtimeMs);
+    } catch {
+      /* ignore */
+    }
+  }
+  if (fs.existsSync(uiShotDir)) {
+    try {
+      uiMtime = Math.max(uiMtime, fs.statSync(uiShotDir).mtimeMs);
+    } catch {
+      /* ignore */
+    }
+  }
+
+  let chosen: SessionResolution;
+  if (preferWeb || (webMtime >= uiMtime && (webManifest || webScreenshots.hasSession))) {
+    chosen = {
+      manifest: webManifest ?? synthesizeSessionFromScreenshots(runRootDir, webBase),
+      base: webBase,
+      source: "web",
+    };
+  } else if (uiManifest || countScreenshotFrames(runRootDir).sessionSource === "ui") {
+    const uiShots = countScreenshotFrames(runRootDir);
+    chosen = {
+      manifest: uiManifest ?? (uiShots.hasSession ? synthesizeSessionFromScreenshots(runRootDir, uiBase) : null),
+      base: uiBase,
+      source: "ui",
+    };
+  } else {
+    chosen = { manifest: null, base: uiBase, source: "ui" };
+  }
+
+  if (chosen.source === "web" && chosen.manifest && projectPath) {
+    chosen = {
+      ...chosen,
+      manifest: enrichSessionFromWebState(
+        chosen.manifest,
+        readWebSessionStateForRun(projectPath, chosen.manifest, hints?.transcriptSavedAt),
+      ),
+    };
+  }
+
+  return chosen;
+}
+
+function parseTimestamp(value: unknown): number {
+  if (typeof value !== "string" || !value.trim()) return 0;
+  const ms = Date.parse(value);
+  return Number.isFinite(ms) ? ms : 0;
+}
+
+function countScreenshotFrames(runRootDir: string): {
+  frameCount: number;
+  hasSession: boolean;
+  sessionSource?: "web" | "ui";
+} {
+  const candidates: { rel: string; source: "web" | "ui" }[] = [
+    { rel: "web-artifacts/playwright-session/screenshots", source: "web" },
+    { rel: "ui-artifacts/playwright-session/screenshots", source: "ui" },
+  ];
+  let best: { frameCount: number; sessionSource: "web" | "ui"; mtime: number } | null = null;
+  for (const { rel, source } of candidates) {
+    const dir = path.join(runRootDir, rel);
+    if (!fs.existsSync(dir)) continue;
+    let files: string[] = [];
+    try {
+      files = fs.readdirSync(dir);
+    } catch {
+      continue;
+    }
+    const count = files.filter((name) => /\.(png|jpe?g|webp)$/i.test(name)).length;
+    if (!count) continue;
+    let mtime = 0;
+    try {
+      mtime = fs.statSync(dir).mtimeMs;
+    } catch {
+      mtime = 0;
+    }
+    if (!best || mtime >= best.mtime) {
+      best = { frameCount: count, sessionSource: source, mtime };
+    }
+  }
+  if (!best) return { frameCount: 0, hasSession: false };
+  return {
+    frameCount: best.frameCount,
+    hasSession: true,
+    sessionSource: best.sessionSource,
+  };
+}
+
+function resolveSessionInfo(
+  runRootDir: string,
+  manifest: Record<string, unknown> | null,
+): { frameCount: number; hasSession: boolean; sessionSource?: "web" | "ui" } {
+  const screenshotInfo = countScreenshotFrames(runRootDir);
+  const manifestFrames = Array.isArray(manifest?.frames)
+    ? manifest.frames.length
+    : Number(manifest?.frame_count ?? 0);
+
+  if (manifest && manifestFrames > 0) {
+    let manifestMtime = 0;
+    const manifestPaths = [
+      path.join(runRootDir, "web-artifacts", "playwright-session", "session.json"),
+      path.join(runRootDir, "ui-artifacts", "playwright-session", "session.json"),
+      path.join(runRootDir, "playwright-session", "session.json"),
+    ];
+    for (const file of manifestPaths) {
+      if (!fs.existsSync(file)) continue;
+      try {
+        manifestMtime = Math.max(manifestMtime, fs.statSync(file).mtimeMs);
+      } catch {
+        /* ignore */
+      }
+    }
+    const screenshotDir =
+      screenshotInfo.sessionSource === "web"
+        ? path.join(runRootDir, "web-artifacts", "playwright-session", "screenshots")
+        : screenshotInfo.sessionSource === "ui"
+          ? path.join(runRootDir, "ui-artifacts", "playwright-session", "screenshots")
+          : "";
+    let screenshotMtime = 0;
+    if (screenshotDir && fs.existsSync(screenshotDir)) {
+      try {
+        screenshotMtime = fs.statSync(screenshotDir).mtimeMs;
+      } catch {
+        screenshotMtime = 0;
+      }
+    }
+    if (screenshotInfo.hasSession && screenshotMtime > manifestMtime) {
+      return screenshotInfo;
+    }
+    const base = String(manifest.video ?? manifest.trace ?? "");
+    const sessionSource = base.includes("web-artifacts/") ? "web" : "ui";
+    return { frameCount: manifestFrames, hasSession: true, sessionSource };
+  }
+  return screenshotInfo;
+}
+
+function inferRunKind(
+  report: Record<string, unknown> | null,
+  transcript: ReturnType<typeof readCollaborationTranscript>,
+  root: string,
+  transcriptPreferred: boolean,
+): "ui_test" | "web_research" | "exploration" {
+  if (transcriptPreferred && transcript?.task) {
+    const fromTask = classifyTaskRunKindHeuristic(transcript.task);
+    if (fromTask) return fromTask;
+  }
+  const webArtifacts = path.join(root, "web-artifacts");
+  if (fs.existsSync(webArtifacts)) {
+    try {
+      const stat = fs.statSync(webArtifacts);
+      const reportAt = parseTimestamp(
+        (report as { generated_at?: string } | null)?.generated_at,
+      );
+      if (!report || stat.mtimeMs >= reportAt) return "web_research";
+    } catch {
+      return "web_research";
+    }
+  }
+  if (report?.mode === "exploration") return "exploration";
+  if (transcript?.task) {
+    const fromTask = classifyTaskRunKindHeuristic(transcript.task);
+    if (fromTask) return fromTask;
+  }
+  return "ui_test";
+}
+
+function lastAgentSummary(transcript: ReturnType<typeof readCollaborationTranscript>): string {
+  if (!transcript?.agentCards?.length) return "";
+  for (let i = transcript.agentCards.length - 1; i >= 0; i--) {
+    const card = transcript.agentCards[i];
+    if (card.summary?.trim()) return card.summary.trim();
+  }
+  return "";
 }
 
 export type RunSummary = {
@@ -57,6 +486,9 @@ export type RunSummary = {
   hasSession: boolean;
   frameCount: number;
   canResume: boolean;
+  runKind: "ui_test" | "web_research" | "exploration";
+  statusText: string;
+  sessionSource?: "web" | "ui";
 };
 
 export function readRunBundle(projectPath: string, runId: string) {
@@ -72,12 +504,23 @@ export function readRunBundle(projectPath: string, runId: string) {
       pageReport = "";
     }
   }
-  const { manifest: playwrightSession } = readSessionManifest(root);
+  const collaborationTranscript = readCollaborationTranscript(projectPath, runId);
+  const reportAt = parseTimestamp(
+    readJsonFile<Record<string, unknown>>(path.join(root, "status.json"))?.generated_at ??
+      (report as { generated_at?: string } | null)?.generated_at,
+  );
+  const transcriptAt = parseTimestamp(collaborationTranscript?.savedAt);
+  const transcriptPreferred = Boolean(collaborationTranscript && (!report || transcriptAt >= reportAt));
+  const runKind = inferRunKind(report, collaborationTranscript, root, transcriptPreferred);
+  const session = resolvePlaywrightSession(projectPath, root, {
+    preferWeb: transcriptPreferred || runKind === "web_research",
+    runKind,
+    transcriptSavedAt: collaborationTranscript?.savedAt,
+  });
   const structuredTask =
     (task?.structured_task as Record<string, unknown> | undefined) ??
     (report?.requested as Record<string, unknown> | undefined);
   const status = readJsonFile<Record<string, unknown>>(path.join(root, "status.json"));
-  const collaborationTranscript = readCollaborationTranscript(projectPath, runId);
   return {
     runId,
     root,
@@ -85,35 +528,134 @@ export function readRunBundle(projectPath: string, runId: string) {
     task,
     pageReport,
     structuredTask,
-    playwrightSession,
+    playwrightSession: session.manifest,
+    sessionBase: session.base,
+    sessionSource: session.source,
     status,
-    hasRun: Boolean(report),
+    hasRun: Boolean(report || collaborationTranscript || session.manifest),
     collaborationTranscript,
   };
 }
 
+function hasRunArtifacts(bundle: ReturnType<typeof readRunBundle>): boolean {
+  if (bundle.report || bundle.collaborationTranscript || bundle.playwrightSession) return true;
+  return resolveSessionInfo(bundle.root, null).hasSession;
+}
+
+function historyStamp(): string {
+  const now = new Date();
+  const y = now.getUTCFullYear();
+  const mo = String(now.getUTCMonth() + 1).padStart(2, "0");
+  const d = String(now.getUTCDate()).padStart(2, "0");
+  const h = String(now.getUTCHours()).padStart(2, "0");
+  const mi = String(now.getUTCMinutes()).padStart(2, "0");
+  const s = String(now.getUTCSeconds()).padStart(2, "0");
+  return `${y}${mo}${d}T${h}${mi}${s}Z`;
+}
+
+/** Copy `.agent/current` to `.agent/history/<stamp>` when it contains run artifacts. */
+export function archiveCurrentRun(projectPath: string): string | null {
+  const currentDir = agentPath(projectPath, "current");
+  if (!fs.existsSync(currentDir)) return null;
+  let hasEntries = false;
+  try {
+    hasEntries = fs.readdirSync(currentDir).length > 0;
+  } catch {
+    return null;
+  }
+  if (!hasEntries) return null;
+
+  const bundle = readRunBundle(projectPath, "current");
+  if (!hasRunArtifacts(bundle)) return null;
+
+  const historyDir = agentPath(projectPath, "history");
+  fs.mkdirSync(historyDir, { recursive: true });
+  const stamp = historyStamp();
+  const target = path.join(historyDir, stamp);
+  if (fs.existsSync(target)) {
+    fs.rmSync(target, { recursive: true, force: true });
+  }
+  fs.cpSync(currentDir, target, { recursive: true });
+  return stamp;
+}
+
+/** Archive the latest run, then clear `.agent/current` before starting a new one. */
+export function prepareCurrentForNewRun(projectPath: string): string | null {
+  const stamp = archiveCurrentRun(projectPath);
+  const currentDir = agentPath(projectPath, "current");
+  fs.mkdirSync(currentDir, { recursive: true });
+  for (const entry of fs.readdirSync(currentDir, { withFileTypes: true })) {
+    fs.rmSync(path.join(currentDir, entry.name), { recursive: true, force: true });
+  }
+  return stamp;
+}
+
 function summarizeRun(runId: string, bundle: ReturnType<typeof readRunBundle>): RunSummary {
   const report = bundle.report;
+  const transcript = bundle.collaborationTranscript;
   const requested = (report?.requested as Record<string, unknown> | undefined) ?? {};
-  const session = bundle.playwrightSession as { frame_count?: number; frames?: unknown[] } | null;
-  const frames = Array.isArray(session?.frames) ? session.frames.length : Number(session?.frame_count ?? 0);
+  const reportAt = parseTimestamp(bundle.status?.generated_at ?? (report as { generated_at?: string } | null)?.generated_at);
+  const transcriptAt = parseTimestamp(transcript?.savedAt);
+  const transcriptPreferred = Boolean(transcript && (!report || transcriptAt >= reportAt));
+
+  let summary = String(requested.summary ?? report?.mode ?? "Run");
+  if (transcript?.task?.trim()) {
+    if (transcriptPreferred || !requested.summary) summary = transcript.task.trim();
+  }
+
+  let overallOk: boolean | null = typeof report?.overall_ok === "boolean" ? report.overall_ok : null;
+  if (transcript?.collaborationResult && (transcriptPreferred || overallOk === null)) {
+    if (typeof transcript.collaborationResult.ok === "boolean") {
+      overallOk = transcript.collaborationResult.ok;
+    }
+  }
+
+  const generatedAt =
+    transcriptPreferred && transcript?.savedAt
+      ? transcript.savedAt
+      : String(bundle.status?.generated_at ?? (report as { generated_at?: string } | null)?.generated_at ?? transcript?.savedAt ?? runId);
+
+  const sessionInfo = bundle.sessionSource
+    ? {
+        hasSession: Boolean(bundle.playwrightSession && (bundle.playwrightSession.frame_count || (bundle.playwrightSession.frames as unknown[] | undefined)?.length)),
+        frameCount: Array.isArray(bundle.playwrightSession?.frames)
+          ? bundle.playwrightSession.frames.length
+          : Number(bundle.playwrightSession?.frame_count ?? 0),
+        sessionSource: bundle.sessionSource,
+      }
+    : resolveSessionInfo(bundle.root, bundle.playwrightSession);
+  const runKind = inferRunKind(report, transcript, bundle.root, transcriptPreferred);
+
+  const result = transcript?.collaborationResult;
+  let statusText = "";
+  if (result?.answer?.trim()) {
+    statusText = result.answer.trim();
+  } else if (result?.error?.trim()) {
+    statusText = result.error.trim();
+  } else {
+    statusText = lastAgentSummary(transcript);
+  }
+
   return {
     id: runId,
     label: formatRunLabel(runId),
-    overallOk: typeof report?.overall_ok === "boolean" ? report.overall_ok : null,
-    summary: String(requested.summary ?? report?.mode ?? "Run"),
-    finalUrl: String(report?.final_url ?? ""),
-    generatedAt: String(bundle.status?.generated_at ?? (report as { generated_at?: string } | null)?.generated_at ?? runId),
-    hasSession: Boolean(session && (frames > 0 || session.frame_count)),
-    frameCount: frames,
-    canResume: canResumeTranscript(bundle.collaborationTranscript),
+    overallOk,
+    summary,
+    finalUrl: transcriptPreferred ? "" : String(report?.final_url ?? ""),
+    generatedAt,
+    hasSession: sessionInfo.hasSession,
+    frameCount: sessionInfo.frameCount,
+    canResume: canResumeTranscript(transcript),
+    runKind,
+    statusText,
+    sessionSource: sessionInfo.sessionSource,
   };
 }
 
 export function listRunHistory(projectPath: string) {
   const runs: RunSummary[] = [];
   const current = readRunBundle(projectPath, "current");
-  if (current.hasRun) runs.push(summarizeRun("current", current));
+  if (hasRunArtifacts(current)) runs.push(summarizeRun("current", current));
 
   const historyDir = agentPath(projectPath, "history");
   if (fs.existsSync(historyDir)) {
@@ -123,7 +665,9 @@ export function listRunHistory(projectPath: string) {
       .map((e) => e.name)
       .sort((a, b) => b.localeCompare(a));
     for (const id of entries) {
-      runs.push(summarizeRun(id, readRunBundle(projectPath, id)));
+      const bundle = readRunBundle(projectPath, id);
+      if (!hasRunArtifacts(bundle)) continue;
+      runs.push(summarizeRun(id, bundle));
     }
   }
 
@@ -202,6 +746,19 @@ export function readExploration(projectPath: string): { exploration: Exploration
     pages: legacyPages ?? {},
   };
   return { exploration, file: yamlFile };
+}
+
+export function readWebResearch(projectPath: string): {
+  index: Record<string, unknown> | null;
+  facts: Record<string, unknown> | null;
+  webDir: string;
+} {
+  const webDir = agentPath(projectPath, "web");
+  const indexFile = path.join(webDir, "index.yaml");
+  const factsFile = path.join(webDir, "facts.yaml");
+  const index = readYamlFile(indexFile);
+  const facts = readYamlFile(factsFile);
+  return { index, facts, webDir };
 }
 
 function readLegacyNav(projectPath: string): Record<string, unknown> | null {
@@ -308,11 +865,26 @@ export function sessionWithArtifactUrls(
   projectPath: string,
   runId: string,
   manifest: Record<string, unknown> | null,
+  baseHint?: string,
 ) {
   if (!manifest) return null;
-  const base = "ui-artifacts/playwright-session";
-  const toUrl = (fileRel: string) =>
-    buildArtifactUrl(projectPath, runId, fileRel.startsWith("ui-artifacts/") ? fileRel : `${base}/${fileRel}`);
+  const probePaths = [
+    manifest.video,
+    manifest.trace,
+    ...(Array.isArray(manifest.frames)
+      ? manifest.frames.map((frame) =>
+          frame && typeof frame === "object" ? (frame as Record<string, unknown>).screenshot : undefined,
+        )
+      : []),
+  ].filter((value): value is string => typeof value === "string");
+  const detectedBase = probePaths.find((value) => value.includes("/"))?.split("/").slice(0, 2).join("/");
+  const base = baseHint || detectedBase || "ui-artifacts/playwright-session";
+  const toUrl = (fileRel: string) => {
+    if (fileRel.startsWith("web-artifacts/") || fileRel.startsWith("ui-artifacts/")) {
+      return buildArtifactUrl(projectPath, runId, fileRel);
+    }
+    return buildArtifactUrl(projectPath, runId, `${base}/${fileRel}`);
+  };
   const out = { ...manifest } as Record<string, unknown>;
   if (typeof out.video === "string") {
     out.videoUrl = toUrl(out.video);

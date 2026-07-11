@@ -7,6 +7,7 @@ import { PagePreview } from "@/components/PagePreview";
 import { ProjectSelector } from "@/components/ProjectSelector";
 import { RunHistoryPanel } from "@/components/RunHistoryPanel";
 import { RunProgressPanel } from "@/components/RunProgressPanel";
+import { WebResearchPanel } from "@/components/WebResearchPanel";
 import { cn } from "@/lib/utils";
 import { apiFetch, eventsUrl } from "@/lib/api";
 import { runTargetOptions } from "@/lib/runTarget";
@@ -21,9 +22,14 @@ import type {
   TestTarget,
 } from "@/lib/projectTypes";
 import type { AgentRunCard, CollaborationConfig, CollaborationResult } from "@/lib/collaborationTypes";
+import {
+  applyWebResearchEvent,
+  isWebResearchEvent,
+  type WebResearchState,
+} from "@/lib/webResearchTypes";
 import type { PhaseMap, RunEvent } from "@/types";
 
-const BROWSER_PHASES = ["exploration", "ui_test"] as const;
+const BROWSER_PHASES = ["exploration", "ui_test", "web_research"] as const;
 
 const SETTINGS_KEY = "test_runner_settings_v2";
 
@@ -33,7 +39,7 @@ type StoredSettings = {
   repoUrl?: string;
   cursorRuntime?: "cloud" | "local";
   testTarget?: "local" | "deployed";
-  skipCursor?: boolean;
+  skipCursor?: boolean; // legacy — ignored; collaboration always runs
   /** Legacy setting — migrated to testTarget on load. */
   skipDeploy?: boolean;
 };
@@ -55,6 +61,23 @@ function saveStoredSettings(settings: StoredSettings) {
   if (settings.project) localStorage.setItem("test_runner_project", settings.project);
 }
 
+type OllamaModelOption = {
+  id: string;
+  label: string;
+  description: string;
+  installed: boolean;
+};
+
+type OllamaSwitchUiState = {
+  active: boolean;
+  step?: string;
+  message?: string;
+  progress?: number;
+  fromModel?: string;
+  toModel?: string;
+  error?: string;
+};
+
 type OllamaStatus = {
   url: string;
   model: string;
@@ -62,13 +85,39 @@ type OllamaStatus = {
   modelAvailable: boolean;
   modelLoaded: boolean;
   loadedModels: string[];
+  modelOptions?: OllamaModelOption[];
+  switch?: OllamaSwitchUiState;
+};
+
+type CursorHelperStatus = {
+  ok: boolean;
+  runtime: "local" | "cloud";
+  errors: string[];
+  warnings: string[];
+  cursorInstalled: boolean;
+  cursorRunning: boolean;
+  hasApiKey: boolean;
+  projectPathOk: boolean;
 };
 
 type Config = {
   defaultProject: string;
   hasCursorApiKey: boolean;
+  cursorHelper?: CursorHelperStatus;
   ollama?: OllamaStatus;
 };
+
+function optimisticStartCard(): AgentRunCard {
+  return {
+    id: "optimistic-start",
+    agent: "local",
+    agentLabel: "Local agent",
+    iteration: 1,
+    status: "running",
+    startedAt: new Date().toISOString(),
+    summary: "Classifying task and starting…",
+  };
+}
 
 function applyStateFromServer(
   data: {
@@ -82,7 +131,10 @@ function applyStateFromServer(
     structuredTask?: StructuredTask;
     runReport?: RunReport;
     agentCards?: AgentRunCard[];
+    collaborationActive?: boolean;
     collaborationResult?: CollaborationResult | null;
+    webResearch?: WebResearchState | null;
+    playwrightSession?: PlaywrightSession | null;
   },
   setters: {
     setRunning: (v: boolean) => void;
@@ -96,10 +148,13 @@ function applyStateFromServer(
     setRunReport?: (v: RunReport | null) => void;
     setAgentCards?: (v: AgentRunCard[]) => void;
     setCollaborationResult?: (v: CollaborationResult | null) => void;
+    setWebResearch?: (v: WebResearchState | null) => void;
+    setPlaywrightSession?: (v: PlaywrightSession | null) => void;
   },
-  options?: { protectActiveRun?: boolean },
+  options?: { protectActiveRun?: boolean; protectInspectedSession?: boolean },
 ) {
   const protect = options?.protectActiveRun ?? false;
+  const protectSession = options?.protectInspectedSession ?? false;
 
   // While the client believes a run is active, ignore a "not running" snapshot only when
   // the server has no final result either (start race). If the server has a result, the
@@ -114,7 +169,10 @@ function applyStateFromServer(
   }
 
   if (data.phase) setters.setActivePhase(data.phase);
-  if (data.phases) setters.setPhases(data.phases);
+  if (data.phases) {
+    const hasPhases = Object.keys(data.phases).length > 0;
+    if (!protect || hasPhases) setters.setPhases(data.phases);
+  }
   if (Array.isArray(data.events) && data.events.length > 0) {
     setters.setEvents(data.events);
   }
@@ -132,10 +190,22 @@ function applyStateFromServer(
     setters.setRunReport(data.runReport as RunReport);
   }
   if (Array.isArray(data.agentCards) && setters.setAgentCards) {
-    setters.setAgentCards(data.agentCards as AgentRunCard[]);
+    if (!protect || data.agentCards.length > 0) {
+      setters.setAgentCards(data.agentCards as AgentRunCard[]);
+    }
   }
   if (data.collaborationResult !== undefined && setters.setCollaborationResult) {
     setters.setCollaborationResult(data.collaborationResult as CollaborationResult | null);
+  }
+  if (data.webResearch !== undefined && setters.setWebResearch) {
+    setters.setWebResearch(data.webResearch as WebResearchState | null);
+  }
+  if (
+    data.playwrightSession !== undefined &&
+    setters.setPlaywrightSession &&
+    !(protectSession && data.playwrightSession === null)
+  ) {
+    setters.setPlaywrightSession(data.playwrightSession as PlaywrightSession | null);
   }
 }
 
@@ -173,6 +243,14 @@ function formatEventLine(event: RunEvent): string {
     const e = event as { ok?: boolean; error?: string; answer?: string };
     return `[collaboration] ok=${String(e.ok)} ${e.error ?? e.answer ?? ""}`.trim();
   }
+  if (event.type === "web_research_progress") {
+    const e = event as { step?: string; url?: string; message?: string };
+    return `[web] ${e.step ?? ""} ${e.url ?? e.message ?? ""}`.trim();
+  }
+  if (event.type === "web_research_result") {
+    const e = event as { pages_fetched?: number; facts_added?: number };
+    return `[web] ${e.pages_fetched ?? 0} page(s), ${e.facts_added ?? 0} fact(s)`;
+  }
   if (event.type === "cursor") {
     return `[cursor] ${event.status ?? ""} ${event.message ?? ""}`.trim();
   }
@@ -181,6 +259,11 @@ function formatEventLine(event: RunEvent): string {
   }
   if (event.type === "log") {
     return event.message ?? "";
+  }
+  if (event.type === "ollama_switch") {
+    const e = event as { step?: string; progress?: number; message?: string };
+    const progress = typeof e.progress === "number" ? ` ${e.progress}%` : "";
+    return `[ollama] ${e.step ?? ""}${progress} ${e.message ?? ""}`.trim();
   }
   if (event.type === "done") {
     return `[done] overall_ok=${String(event.ok ?? (event as { overall_ok?: boolean }).overall_ok)}`;
@@ -202,13 +285,15 @@ export default function App() {
   const [repoUrl, setRepoUrl] = useState("");
   const [cursorRuntime, setCursorRuntime] = useState<"cloud" | "local">("local");
   const [testTargetMode, setTestTargetMode] = useState<"local" | "deployed">("local");
-  const [skipCursor, setSkipCursor] = useState(false);
   const [running, setRunning] = useState(false);
   const [phases, setPhases] = useState<PhaseMap>({});
   const [activePhase, setActivePhase] = useState<string>();
   const [events, setEvents] = useState<RunEvent[]>([]);
   const [ollamaStatus, setOllamaStatus] = useState<OllamaStatus | null>(null);
   const [preloadingOllama, setPreloadingOllama] = useState(false);
+  const [pullingOllamaModel, setPullingOllamaModel] = useState<string | null>(null);
+  const [changingOllamaModel, setChangingOllamaModel] = useState(false);
+  const [ollamaSwitch, setOllamaSwitch] = useState<OllamaSwitchUiState | null>(null);
   const [lastResult, setLastResult] = useState<{ overall_ok?: boolean } | null>(null);
   const [browserState, setBrowserState] = useState<BrowserState | null>(null);
   const [testTarget, setTestTarget] = useState<TestTarget | null>(null);
@@ -225,6 +310,7 @@ export default function App() {
   const [sessionFrameIndex, setSessionFrameIndex] = useState(0);
   const [agentCards, setAgentCards] = useState<AgentRunCard[]>([]);
   const [collaborationResult, setCollaborationResult] = useState<CollaborationResult | null>(null);
+  const [webResearch, setWebResearch] = useState<WebResearchState | null>(null);
   const [collabConfig, setCollabConfig] = useState<CollaborationConfig | null>(null);
   const [helperPromptDraft, setHelperPromptDraft] = useState("");
   const [savingCollabConfig, setSavingCollabConfig] = useState(false);
@@ -233,9 +319,13 @@ export default function App() {
   const logRef = useRef<HTMLPreElement>(null);
   const runningRef = useRef(running);
   runningRef.current = running;
+  /** True from Run click until the server acknowledges start — avoids refreshState clobbering UI. */
+  const startingRunRef = useRef(false);
   /** True between collaboration_start and collaboration_done — the python pipeline emits
    * its own done/process_exit mid-loop and those must not end the run in the UI. */
   const collabActiveRef = useRef(false);
+  const viewingRunIdRef = useRef<string | null>(null);
+  viewingRunIdRef.current = viewingRunId;
 
   const runApiOptions = useMemo(() => runTargetOptions(testTargetMode), [testTargetMode]);
 
@@ -254,6 +344,7 @@ export default function App() {
     setSessionFrameIndex(0);
     setAgentCards([]);
     setCollaborationResult(null);
+    setWebResearch(null);
   }, []);
 
   const persistSettings = useCallback(() => {
@@ -263,9 +354,8 @@ export default function App() {
       repoUrl,
       cursorRuntime,
       testTarget: testTargetMode,
-      skipCursor,
     });
-  }, [project, task, repoUrl, cursorRuntime, testTargetMode, skipCursor]);
+  }, [project, task, repoUrl, cursorRuntime, testTargetMode]);
 
   const saveProjectToRegistry = useCallback(async () => {
     if (!project.trim()) return;
@@ -275,35 +365,39 @@ export default function App() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         path: project,
-        settings: { task, testTarget: testTargetMode, skipCursor, cursorRuntime, repoUrl },
+        settings: { task, testTarget: testTargetMode, cursorRuntime, repoUrl },
       }),
     });
-  }, [project, task, testTargetMode, skipCursor, cursorRuntime, repoUrl, persistSettings]);
+  }, [project, task, testTargetMode, cursorRuntime, repoUrl, persistSettings]);
 
   const applyProjectSettings = useCallback((settings?: ProjectsRegistry["projects"][0]["settings"]) => {
     if (!settings) return;
     if (settings.task !== undefined) setTask(settings.task);
     if (settings.testTarget) setTestTargetMode(settings.testTarget);
     else if (settings.skipDeploy !== undefined) setTestTargetMode(settings.skipDeploy ? "local" : "deployed");
-    if (settings.skipCursor !== undefined) setSkipCursor(settings.skipCursor);
     if (settings.cursorRuntime) setCursorRuntime(settings.cursorRuntime);
     if (settings.repoUrl !== undefined) setRepoUrl(settings.repoUrl);
   }, []);
 
   const refreshConfig = useCallback(() => {
-    apiFetch("/api/config")
+    const query = project.trim() ? `?project=${encodeURIComponent(project)}` : "";
+    apiFetch(`/api/config${query}`)
       .then((r) => r.json())
       .then((data: Config) => {
         setConfig(data);
-        if (data.ollama) setOllamaStatus(data.ollama);
+        if (data.ollama) {
+          setOllamaStatus(data.ollama);
+          if (data.ollama.switch) setOllamaSwitch(data.ollama.switch);
+        }
       })
       .catch(() => {});
-  }, []);
+  }, [project]);
 
   const refreshState = useCallback(() => {
     apiFetch("/api/state")
       .then((r) => r.json())
       .then((data) => {
+        if (data.collaborationActive) collabActiveRef.current = true;
         applyStateFromServer(
           data,
           {
@@ -318,8 +412,13 @@ export default function App() {
             setRunReport,
             setAgentCards,
             setCollaborationResult,
+            setWebResearch,
+            setPlaywrightSession,
           },
-          { protectActiveRun: runningRef.current },
+          {
+            protectActiveRun: runningRef.current,
+            protectInspectedSession: Boolean(viewingRunIdRef.current),
+          },
         );
       })
       .catch(() => {});
@@ -352,6 +451,7 @@ export default function App() {
       .then((r) => r.json())
       .then((data: { report?: RunReport | null; pageReport?: string; hasRun?: boolean; playwrightSession?: PlaywrightSession | null }) => {
         if (runningRef.current) return;
+        if (viewingRunIdRef.current && viewingRunIdRef.current !== "current") return;
         if (data.report) {
           const report = data.report;
           if (!report.page_report && data.pageReport) {
@@ -363,15 +463,15 @@ export default function App() {
           setRunReport(report);
           if (!running && data.playwrightSession) {
             setPlaywrightSession(data.playwrightSession);
-            if (!viewingRunId) setViewingRunId("current");
-          } else if (!running && viewingRunId === "current") {
+            if (!viewingRunIdRef.current) setViewingRunId("current");
+          } else if (!running && viewingRunIdRef.current === "current") {
             setPlaywrightSession(data.playwrightSession ?? report.playwright_session ?? null);
           }
         }
         setHasLatestRun(Boolean(data.hasRun));
       })
       .catch(() => setHasLatestRun(false));
-  }, [project, running, viewingRunId]);
+  }, [project, running]);
 
   useEffect(() => {
     if (!running) loadRunReport();
@@ -383,8 +483,12 @@ export default function App() {
   }, [running]);
 
   useEffect(() => {
-    if (view === "run" && !runningRef.current) refreshState();
+    if (view === "run" && !runningRef.current && !startingRunRef.current) refreshState();
   }, [view, refreshState]);
+
+  useEffect(() => {
+    if (project.trim()) refreshConfig();
+  }, [project, refreshConfig]);
 
   useEffect(() => {
     const stored = loadStoredSettings();
@@ -392,14 +496,16 @@ export default function App() {
       .then((r) => r.json())
       .then((data: Config) => {
         setConfig(data);
-        if (data.ollama) setOllamaStatus(data.ollama);
+        if (data.ollama) {
+          setOllamaStatus(data.ollama);
+          if (data.ollama.switch) setOllamaSwitch(data.ollama.switch);
+        }
         setProject(stored.project || data.defaultProject || "");
         if (stored.task) setTask(stored.task);
         if (stored.repoUrl) setRepoUrl(stored.repoUrl);
         if (stored.cursorRuntime) setCursorRuntime(stored.cursorRuntime);
         if (stored.testTarget) setTestTargetMode(stored.testTarget);
         else if (stored.skipDeploy !== undefined) setTestTargetMode(stored.skipDeploy ? "local" : "deployed");
-        if (stored.skipCursor !== undefined) setSkipCursor(stored.skipCursor);
       })
       .catch(() => {});
 
@@ -461,12 +567,20 @@ export default function App() {
     }
     if (event.type === "run_state") {
       const isRunning = Boolean((event as { running?: boolean }).running);
-      if (isRunning || !collabActiveRef.current) {
-        setRunning(isRunning);
+      if (!isRunning) {
+        collabActiveRef.current = false;
+        setRunning(false);
+      } else if (!collabActiveRef.current) {
+        setRunning(true);
       }
     }
     if (event.type === "step") {
       setLastStep(event);
+      if (event.mode === "web") {
+        setWebResearch((prev) =>
+          applyWebResearchEvent(prev, { ...event, type: "web_step", step: event }),
+        );
+      }
     }
     if (event.type === "browser_state" && event.url) {
       setBrowserState({
@@ -479,6 +593,15 @@ export default function App() {
         screenshot_b64: (event as { screenshot_b64?: string }).screenshot_b64,
         error: (event as { error?: string }).error,
       });
+      if (String(event.context ?? "").startsWith("web_")) {
+        setWebResearch((prev) =>
+          applyWebResearchEvent(prev, {
+            ...event,
+            type: "web_page_snapshot",
+            snapshot: event,
+          }),
+        );
+      }
     }
     if (event.type === "structured_task") {
       setStructuredTask({
@@ -502,12 +625,61 @@ export default function App() {
         ts: event.ts,
       });
     }
+    if (event.type === "playwright_session") {
+      const session = (event as { session?: PlaywrightSession }).session;
+      const source = (event as { source?: PlaywrightSession["source"] }).source ?? "web";
+      if (session) {
+        setPlaywrightSession({ ...session, source });
+        setSessionFrameIndex(0);
+      }
+    }
     if (event.type === "run_report" && (event as { report?: RunReport }).report) {
       const report = (event as unknown as { report: RunReport }).report;
       setRunReport(report);
+      const incoming = report.playwright_session;
+      if (incoming) {
+        setPlaywrightSession((prev) => {
+          const incomingUrl = incoming.frames?.[0]?.url ?? "";
+          const prevIsWeb = prev?.source === "web";
+          const incomingIsLocal =
+            incomingUrl.includes("localhost") || incomingUrl.includes("127.0.0.1");
+          if (prevIsWeb && incomingIsLocal) return prev;
+          return { ...incoming, source: prevIsWeb ? "web" : "ui" };
+        });
+      }
     }
     if (event.type === "site_map" || event.type === "nav_tree" || event.type === "agent_decision") {
       window.dispatchEvent(new CustomEvent("test-runner-event", { detail: event }));
+    }
+    if (isWebResearchEvent(event)) {
+      setWebResearch((prev) => applyWebResearchEvent(prev, event));
+      if (
+        event.type === "web_page_snapshot" ||
+        event.type === "web_snapshot" ||
+        event.type === "web_semantic_snapshot"
+      ) {
+        const e = event as RunEvent & {
+          snapshot?: Partial<BrowserState>;
+          page?: Partial<BrowserState>;
+        };
+        const snapshot: Partial<BrowserState> =
+          e.snapshot ?? e.page ?? (e as unknown as Partial<BrowserState>);
+        if (snapshot.url) {
+          setBrowserState({
+            url: snapshot.url,
+            title: snapshot.title,
+            interactables: snapshot.interactables ?? [],
+            context: snapshot.context ?? "web_exploration",
+            node_url: snapshot.node_url,
+            ts: event.ts,
+            screenshot_b64: snapshot.screenshot_b64,
+            error: snapshot.error,
+          });
+        }
+      }
+      if (event.type === "web_research_progress" || event.type === "web_help_request") {
+        setLogOpen(true);
+      }
     }
     if (event.type === "agent_card" && (event as { card?: AgentRunCard }).card) {
       const card = (event as unknown as { card: AgentRunCard }).card;
@@ -525,7 +697,7 @@ export default function App() {
       collabActiveRef.current = true;
       const resumed = Boolean((event as { resumed?: boolean }).resumed);
       if (!resumed) {
-        setAgentCards([]);
+        setAgentCards((prev) => (prev.some((c) => c.status === "running") ? prev : [optimisticStartCard()]));
       }
       setCollaborationResult(null);
       setRunning(true);
@@ -541,10 +713,36 @@ export default function App() {
       collabActiveRef.current = false;
       const e = event as { ok?: boolean; answer?: string; error?: string; iterations?: number };
       setCollaborationResult({ ok: e.ok, answer: e.answer, error: e.error, iterations: e.iterations });
+      setAgentCards((prev) =>
+        prev.map((c) =>
+          c.status === "running"
+            ? {
+                ...c,
+                status: "failed" as const,
+                summary: e.error?.toLowerCase().includes("cancel") ? "Cancelled" : "Stopped",
+                completedAt: new Date().toISOString(),
+                streamStatus: undefined,
+              }
+            : c,
+        ),
+      );
       setRunning(false);
       loadRunHistory();
     }
     if (event.type === "run_cleared") {
+      if (runningRef.current || collabActiveRef.current) {
+        setStructuredTask(null);
+        setRunReport(null);
+        setTestTarget(null);
+        setBrowserState(null);
+        setLastStep(null);
+        setLastResult(null);
+        setPhases({});
+        setActivePhase(undefined);
+        setViewingRunId(null);
+        setWebResearch(null);
+        return;
+      }
       setStructuredTask(null);
       setRunReport(null);
       setTestTarget(null);
@@ -558,6 +756,7 @@ export default function App() {
       setSessionFrameIndex(0);
       setAgentCards([]);
       setCollaborationResult(null);
+      setWebResearch(null);
     }
     if (event.type === "done" && !collabActiveRef.current) {
       setRunning(false);
@@ -566,6 +765,36 @@ export default function App() {
     }
     if (event.type === "process_exit" && !collabActiveRef.current) {
       setRunning(false);
+    }
+    if (event.type === "ollama_switch") {
+      const e = event as RunEvent & {
+        step?: string;
+        message?: string;
+        progress?: number;
+        fromModel?: string;
+        toModel?: string;
+        ollama?: OllamaStatus;
+      };
+      const active = e.step !== "done" && e.step !== "error";
+      setOllamaSwitch({
+        active,
+        step: e.step,
+        message: e.message,
+        progress: e.progress,
+        fromModel: e.fromModel,
+        toModel: e.toModel,
+        error: e.step === "error" ? e.message : undefined,
+      });
+      if (e.ollama) {
+        setOllamaStatus(e.ollama);
+      } else if (e.toModel) {
+        setOllamaStatus((prev) => (prev ? { ...prev, model: e.toModel! } : prev));
+      }
+      if (e.step === "done" || e.step === "error") {
+        setChangingOllamaModel(false);
+        setPullingOllamaModel(null);
+        setPreloadingOllama(false);
+      }
     }
   }, [loadRunHistory]);
 
@@ -600,13 +829,28 @@ export default function App() {
   }, [applyEvent, refreshState]);
 
   const preloadOllama = async () => {
+    if (ollamaSwitch?.active) return;
     setPreloadingOllama(true);
+    setOllamaSwitch({
+      active: true,
+      step: "loading",
+      message: `Loading ${ollamaStatus?.model ?? "model"} into VRAM…`,
+      progress: 10,
+      toModel: ollamaStatus?.model,
+    });
     try {
       const res = await apiFetch("/api/ollama/preload", { method: "POST" });
-      const body = await res.json();
+      const body = (await res.json()) as { error?: string; message?: string; ollama?: OllamaStatus };
       if (!res.ok) {
+        setOllamaSwitch({
+          active: false,
+          step: "error",
+          message: body.error ?? "Ollama preload failed",
+          error: body.error ?? "Ollama preload failed",
+        });
         applyEvent({ type: "log", message: body.error ?? "Ollama preload failed", level: "error" });
       } else {
+        applyOllamaFromResponse(body.ollama);
         applyEvent({ type: "log", message: body.message ?? "Ollama model ready", level: "info" });
       }
       refreshConfig();
@@ -615,9 +859,120 @@ export default function App() {
     }
   };
 
+  const applyOllamaFromResponse = (ollama?: OllamaStatus) => {
+    if (!ollama) return;
+    setOllamaStatus(ollama);
+    if (ollama.switch) setOllamaSwitch(ollama.switch);
+  };
+
+  const changeOllamaModel = async (model: string, opts?: { forceSwitch?: boolean }) => {
+    if (!model || ollamaSwitch?.active) return;
+    const selected = ollamaStatus?.modelOptions?.find((opt) => opt.id === model);
+    if (selected && !selected.installed) {
+      setOllamaStatus((prev) =>
+        prev ? { ...prev, model, modelAvailable: false, modelLoaded: false } : prev,
+      );
+      return;
+    }
+    if (
+      !opts?.forceSwitch &&
+      model === ollamaStatus?.model &&
+      ollamaStatus.modelAvailable &&
+      ollamaStatus.modelLoaded
+    ) {
+      return;
+    }
+    const previousModel = ollamaStatus?.model;
+    setChangingOllamaModel(true);
+    setOllamaSwitch({
+      active: true,
+      step: "checking",
+      message: `Switching to ${model}…`,
+      progress: 0,
+      fromModel: previousModel,
+      toModel: model,
+    });
+    setOllamaStatus((prev) => (prev ? { ...prev, model } : prev));
+    try {
+      const res = await apiFetch("/api/ollama/model", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model }),
+      });
+      const body = (await res.json()) as { error?: string; message?: string; ollama?: OllamaStatus };
+      if (!res.ok) {
+        if (previousModel) {
+          setOllamaStatus((prev) => (prev ? { ...prev, model: previousModel } : prev));
+        }
+        setOllamaSwitch({
+          active: false,
+          step: "error",
+          message: body.error ?? "Failed to switch model",
+          error: body.error ?? "Failed to switch model",
+        });
+        applyEvent({ type: "log", message: body.error ?? "Failed to switch model", level: "error" });
+        if (body.ollama) applyOllamaFromResponse(body.ollama);
+        return;
+      }
+      applyOllamaFromResponse(body.ollama);
+      applyEvent({ type: "log", message: body.message ?? `Switched to ${model}`, level: "info" });
+    } catch (err) {
+      if (previousModel) {
+        setOllamaStatus((prev) => (prev ? { ...prev, model: previousModel } : prev));
+      }
+      const message = err instanceof Error ? err.message : "Failed to switch model";
+      setOllamaSwitch({ active: false, step: "error", message, error: message });
+      applyEvent({ type: "log", message, level: "error" });
+    } finally {
+      setChangingOllamaModel(false);
+      refreshConfig();
+    }
+  };
+
+  const pullOllamaModel = async (model: string) => {
+    if (ollamaSwitch?.active) return;
+    setPullingOllamaModel(model);
+    setOllamaSwitch({
+      active: true,
+      step: "downloading",
+      message: `Downloading ${model}…`,
+      progress: 0,
+      toModel: model,
+    });
+    try {
+      const res = await apiFetch("/api/ollama/pull", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model }),
+      });
+      const body = (await res.json()) as { error?: string; message?: string; ollama?: OllamaStatus };
+      if (!res.ok) {
+        setOllamaSwitch({
+          active: false,
+          step: "error",
+          message: body.error ?? "Model download failed",
+          error: body.error ?? "Model download failed",
+        });
+        applyEvent({ type: "log", message: body.error ?? "Model download failed", level: "error" });
+        if (body.ollama) applyOllamaFromResponse(body.ollama);
+        return;
+      }
+      applyOllamaFromResponse(body.ollama);
+      applyEvent({ type: "log", message: body.message ?? `${model} downloaded`, level: "info" });
+      if (ollamaStatus?.model === model) {
+        await changeOllamaModel(model, { forceSwitch: true });
+      }
+    } finally {
+      setPullingOllamaModel(null);
+      refreshConfig();
+    }
+  };
+
   const viewRun = useCallback(
     async (runId: string) => {
       if (!project.trim()) return;
+      setView("run");
+      setViewingRunId(runId);
       try {
         const res = await apiFetch(
           `/api/project/run?path=${encodeURIComponent(project)}&runId=${encodeURIComponent(runId)}`,
@@ -633,71 +988,106 @@ export default function App() {
             collaborationResult?: CollaborationResult;
           } | null;
         };
-        if (!data.report) return;
-        const report = { ...data.report };
-        if (!report.page_report && data.pageReport) {
-          report.page_report = data.pageReport;
-        }
-        if (data.playwrightSession) {
-          report.playwright_session = data.playwrightSession;
-        }
-        setRunReport(report);
-        setPlaywrightSession(data.playwrightSession ?? report.playwright_session ?? null);
+        const transcript = data.collaborationTranscript;
+        const hasSession = Boolean(data.playwrightSession?.frames?.length);
+        if (!data.report && !transcript?.agentCards?.length && !hasSession) return;
+
+        const transcriptSavedAt = (transcript as { savedAt?: string } | undefined)?.savedAt;
+        const reportGeneratedAt = (data.report as { generated_at?: string } | undefined)?.generated_at;
+        const transcriptPreferred = Boolean(
+          transcript &&
+            (!data.report ||
+              (transcriptSavedAt &&
+                Date.parse(transcriptSavedAt) >= Date.parse(String(reportGeneratedAt ?? 0)))),
+        );
+
+        setPlaywrightSession(data.playwrightSession ?? null);
         setSessionFrameIndex(0);
-        setViewingRunId(runId);
-        if (data.structuredTask) {
-          setStructuredTask(data.structuredTask as StructuredTask);
-        } else if (report.requested) {
-          setStructuredTask({
-            summary: report.requested.summary,
-            source_text: report.requested.source_text,
-            success_criteria: report.requested.success_criteria,
-            scope_urls: report.requested.scope_urls,
-            deliverables: report.requested.deliverables,
-            intent_gaps: report.requested.intent_gaps,
-          });
-        }
-        const target = report.test_target as { url?: string; source?: string; local_url?: string } | undefined;
-        if (target?.url) {
-          setTestTarget({ url: target.url, source: target.source ?? "unknown", local_url: target.local_url });
-        }
-        setLastResult({ overall_ok: report.overall_ok });
-        const phaseMap: PhaseMap = {};
-        if (report.mode === "exploration") {
-          phaseMap.exploration = {
-            status: report.overall_ok ? "done" : "failed",
-            message: report.ui_error || "Exploration complete",
-          };
-        } else {
-          phaseMap.ui_test = {
-            status: report.overall_ok ? "done" : "failed",
-            message: report.ui_error || "UI test complete",
-          };
-        }
-        for (const phase of report.phases ?? []) {
-          const key =
-            phase.name === "Local dev"
-              ? "local_server"
-              : phase.name === "Exploration"
-                ? "exploration"
-                : phase.name === "UI test"
-                  ? "ui_test"
-                  : undefined;
-          if (key) {
-            phaseMap[key] = { status: phase.ok ? "done" : "failed", message: phase.detail };
+
+        if (data.report) {
+          const report = { ...data.report };
+          if (!report.page_report && data.pageReport) {
+            report.page_report = data.pageReport;
           }
+          setRunReport(report);
+          if (!transcriptPreferred) {
+            if (data.structuredTask) {
+              setStructuredTask(data.structuredTask as StructuredTask);
+            } else if (report.requested) {
+              setStructuredTask({
+                summary: report.requested.summary,
+                source_text: report.requested.source_text,
+                success_criteria: report.requested.success_criteria,
+                scope_urls: report.requested.scope_urls,
+                deliverables: report.requested.deliverables,
+                intent_gaps: report.requested.intent_gaps,
+              });
+            }
+            const target = report.test_target as { url?: string; source?: string; local_url?: string } | undefined;
+            if (target?.url) {
+              setTestTarget({ url: target.url, source: target.source ?? "unknown", local_url: target.local_url });
+            }
+            setLastResult({ overall_ok: report.overall_ok });
+            const phaseMap: PhaseMap = {};
+            if (report.mode === "exploration") {
+              phaseMap.exploration = {
+                status: report.overall_ok ? "done" : "failed",
+                message: report.ui_error || "Exploration complete",
+              };
+            } else {
+              phaseMap.ui_test = {
+                status: report.overall_ok ? "done" : "failed",
+                message: report.ui_error || "UI test complete",
+              };
+            }
+            for (const phase of report.phases ?? []) {
+              const key =
+                phase.name === "Local dev"
+                  ? "local_server"
+                  : phase.name === "Exploration"
+                    ? "exploration"
+                    : phase.name === "UI test"
+                      ? "ui_test"
+                      : undefined;
+              if (key) {
+                phaseMap[key] = { status: phase.ok ? "done" : "failed", message: phase.detail };
+              }
+            }
+            setPhases(phaseMap);
+          }
+        } else {
+          setRunReport(null);
         }
-        setPhases(phaseMap);
-        if (data.collaborationTranscript?.agentCards?.length) {
-          setAgentCards(
-            data.collaborationTranscript.agentCards.map((c) => ({ ...c, historical: true })),
+
+        if (transcriptPreferred || !data.report) {
+          setStructuredTask(
+            transcript?.task
+              ? { summary: transcript.task, source_text: transcript.task }
+              : null,
           );
-          setCollaborationResult(data.collaborationTranscript.collaborationResult ?? null);
+          setTestTarget(null);
+          setLastResult({
+            overall_ok: transcript?.collaborationResult?.ok ?? data.report?.overall_ok ?? false,
+          });
+          setPhases((prev) =>
+            Object.keys(prev).length
+              ? prev
+              : {
+                  web_research: {
+                    status: transcript?.collaborationResult?.ok ? "done" : "failed",
+                    message: transcript?.collaborationResult?.error ?? transcript?.collaborationResult?.answer ?? "Web research",
+                  },
+                },
+          );
+        }
+
+        if (transcript?.agentCards?.length) {
+          setAgentCards(transcript.agentCards.map((c) => ({ ...c, historical: true })));
+          setCollaborationResult(transcript.collaborationResult ?? null);
         } else {
           setAgentCards([]);
           setCollaborationResult(null);
         }
-        setView("run");
       } catch {
         /* ignore */
       }
@@ -708,30 +1098,48 @@ export default function App() {
   const resumeFromRun = useCallback(
     async (runId: string, note?: string) => {
       if (!project.trim() || running) return;
-      persistSettings();
-      void saveProjectToRegistry();
-      clearRunPanels();
+      startingRunRef.current = true;
+      collabActiveRef.current = true;
+      runningRef.current = true;
       setView("run");
       setRunning(true);
       setViewingRunId(null);
-      const res = await apiFetch("/api/run/resume", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          project,
-          runId,
-          note: note?.trim() || undefined,
-          ...runApiOptions,
-          cursorRuntime,
-          repoUrl: repoUrl || undefined,
-        }),
-      });
-      if (!res.ok) {
-        const err = await res.json();
-        applyEvent({ type: "log", message: err.error ?? "Failed to resume run", level: "error" });
+      persistSettings();
+      void saveProjectToRegistry();
+      clearRunPanels();
+      try {
+        const res = await apiFetch("/api/run/resume", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            project,
+            runId,
+            note: note?.trim() || undefined,
+            ...runApiOptions,
+            cursorRuntime,
+            repoUrl: repoUrl || undefined,
+          }),
+        });
+        if (!res.ok) {
+          const err = await res.json();
+          applyEvent({ type: "log", message: err.error ?? "Failed to resume run", level: "error" });
+          collabActiveRef.current = false;
+          setRunning(false);
+          setAgentCards([]);
+        } else {
+          setInterveneNote("");
+        }
+      } catch (err) {
+        applyEvent({
+          type: "log",
+          message: err instanceof Error ? err.message : "Failed to resume run",
+          level: "error",
+        });
+        collabActiveRef.current = false;
         setRunning(false);
-      } else {
-        setInterveneNote("");
+        setAgentCards([]);
+      } finally {
+        startingRunRef.current = false;
       }
     },
     [
@@ -773,6 +1181,30 @@ export default function App() {
   const logLines = useMemo(() => events.map(formatEventLine).filter(Boolean), [events]);
 
   const stopRun = useCallback(async () => {
+    collabActiveRef.current = false;
+    setRunning(false);
+    setAgentCards((prev) =>
+      prev.map((c) =>
+        c.status === "running"
+          ? {
+              ...c,
+              status: "failed" as const,
+              summary: "Cancelled",
+              completedAt: new Date().toISOString(),
+              streamStatus: undefined,
+            }
+          : c,
+      ),
+    );
+    setPhases((prev) => {
+      const next = { ...prev };
+      for (const key of Object.keys(next)) {
+        if (next[key]?.status === "running") {
+          next[key] = { ...next[key], status: "failed", message: "Cancelled" };
+        }
+      }
+      return next;
+    });
     try {
       const res = await apiFetch("/api/run/stop", { method: "POST" });
       if (!res.ok) {
@@ -782,72 +1214,62 @@ export default function App() {
     } catch {
       applyEvent({ type: "log", message: "Failed to stop run", level: "error" });
     }
-    collabActiveRef.current = false;
-    setRunning(false);
   }, [applyEvent]);
 
-  const startFullLoop = async () => {
+  const startRun = async () => {
     if (!project.trim()) return;
+    startingRunRef.current = true;
+    collabActiveRef.current = true;
+    runningRef.current = true;
+    setView("run");
+    setViewingRunId(null);
+    setRunning(true);
     persistSettings();
     void saveProjectToRegistry();
-    clearRunPanels();
-    setView("run");
-    setRunning(true);
-    const res = await apiFetch("/api/run/full", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        project,
-        task,
-        ...runApiOptions,
-        skipCursor,
-        cursorRuntime,
-        repoUrl: repoUrl || undefined,
-      }),
-    });
-    if (!res.ok) {
-      const err = await res.json();
-      applyEvent({ type: "log", message: err.error ?? "Failed to start", level: "error" });
+    setAgentCards([optimisticStartCard()]);
+    setEvents([]);
+    setPhases({});
+    setActivePhase(undefined);
+    setBrowserState(null);
+    setTestTarget(null);
+    setStructuredTask(null);
+    setRunReport(null);
+    setLastStep(null);
+    setLastResult(null);
+    setPlaywrightSession(null);
+    setSessionFrameIndex(0);
+    setCollaborationResult(null);
+    setWebResearch(null);
+    try {
+      const res = await apiFetch("/api/run", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          project,
+          task,
+          ...runApiOptions,
+          cursorRuntime,
+          repoUrl: repoUrl || undefined,
+        }),
+      });
+      if (!res.ok) {
+        const err = await res.json();
+        applyEvent({ type: "log", message: err.error ?? "Failed to start", level: "error" });
+        collabActiveRef.current = false;
+        setRunning(false);
+        setAgentCards([]);
+      }
+    } catch (err) {
+      applyEvent({
+        type: "log",
+        message: err instanceof Error ? err.message : "Failed to start run",
+        level: "error",
+      });
+      collabActiveRef.current = false;
       setRunning(false);
-    }
-  };
-
-  const startLocalOnly = async () => {
-    if (!project.trim()) return;
-    persistSettings();
-    void saveProjectToRegistry();
-    clearRunPanels();
-    setView("run");
-    setRunning(true);
-    const res = await apiFetch("/api/run/local", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ project, task, ...runApiOptions }),
-    });
-    if (!res.ok) {
-      const err = await res.json();
-      applyEvent({ type: "log", message: err.error ?? "Failed to start", level: "error" });
-      setRunning(false);
-    }
-  };
-
-  const startCursorOnly = async () => {
-    if (!project.trim()) return;
-    setRunning(true);
-    const res = await apiFetch("/api/run/cursor", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        project,
-        runtime: cursorRuntime,
-        repoUrl: repoUrl || undefined,
-        useReport: true,
-      }),
-    });
-    if (!res.ok) {
-      const err = await res.json();
-      applyEvent({ type: "log", message: err.error ?? "Failed to start Cursor", level: "error" });
-      setRunning(false);
+      setAgentCards([]);
+    } finally {
+      startingRunRef.current = false;
     }
   };
 
@@ -871,7 +1293,7 @@ export default function App() {
         : null
     : null;
 
-  const hasCollaboration = agentCards.length > 0 || Boolean(collaborationResult) || (running && !skipCursor);
+  const hasCollaboration = agentCards.length > 0 || Boolean(collaborationResult) || running;
 
   const pipelineUiActive = useMemo(
     () =>
@@ -883,7 +1305,20 @@ export default function App() {
     [running, phases],
   );
 
-  const showLiveSession = replayMode || pipelineUiActive;
+  const webBrowseActive = useMemo(
+    () =>
+      running &&
+      (phases.web_research?.status === "running" ||
+        Boolean(webResearch?.currentUrl || webResearch?.snapshot?.screenshot_b64) ||
+        Boolean(
+          browserState?.url &&
+            !/localhost|127\.0\.0\.1/i.test(browserState.url),
+        ) ||
+        playwrightSession?.source === "web"),
+    [running, phases, browserState, playwrightSession, webResearch],
+  );
+
+  const showLiveSession = replayMode || pipelineUiActive || webBrowseActive;
 
   return (
     <div className="mx-auto max-w-7xl px-4 py-8">
@@ -891,7 +1326,7 @@ export default function App() {
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">AI Assistant Test Runner</h1>
           <p className="mt-1 text-sm text-white/60">
-            Local agent tests the app, helper agent (Cursor) implements — they collaborate until the task is done
+            One task field — the local agent routes to web research or UI testing and escalates to the helper when stuck
           </p>
         </div>
         {view === "run" ? (
@@ -928,6 +1363,7 @@ export default function App() {
       </header>
 
       {view === "config" ? (
+        <>
         <section className="surface-card mx-auto max-w-2xl space-y-4 p-6">
           <h2 className="text-sm font-semibold uppercase tracking-wide text-white/50">Configuration</h2>
           <ProjectSelector
@@ -945,12 +1381,12 @@ export default function App() {
             onChange={(e) => setProject(e.target.value)}
             placeholder="C:\path\to\content-manager"
           />
-          <label className="block text-xs text-white/60">Task (free text)</label>
+          <label className="block text-xs text-white/60">What should the agent do?</label>
           <textarea
             className="min-h-24 w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm"
             value={task}
             onChange={(e) => setTask(e.target.value)}
-            placeholder="Verify login and home page load…"
+            placeholder="Test the login flow, remove a button on the home page, or research what httpx is used for…"
           />
           <label className="block text-xs text-white/60">Test against</label>
           <div className="flex flex-col gap-2 rounded-md border border-white/10 bg-black/20 p-3 text-sm">
@@ -998,49 +1434,136 @@ export default function App() {
               )}
             </div>
           ) : null}
-          <label className="flex items-center gap-2 text-sm text-white/70">
-            <input type="checkbox" checked={skipCursor} onChange={(e) => setSkipCursor(e.target.checked)} />
-            Skip helper agent (Cursor)
-          </label>
-          {!skipCursor ? (
-            <div className="space-y-2 rounded-md border border-white/10 bg-black/20 p-3">
-              {!config?.hasCursorApiKey ? (
-                <p className="text-xs text-amber-300/90">
-                  Set <code className="text-white/80">CURSOR_API_KEY</code> in ai-assistant/.env
-                </p>
-              ) : null}
-              <label className="block text-xs text-white/60">Helper runtime</label>
-              <select
-                className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm"
-                value={cursorRuntime}
-                onChange={(e) => setCursorRuntime(e.target.value as "cloud" | "local")}
+          <div className="space-y-2 rounded-md border border-white/10 bg-black/20 p-3">
+            {!config?.hasCursorApiKey ? (
+              <p className="text-xs text-amber-300/90">
+                Set <code className="text-white/80">CURSOR_API_KEY</code> in ai-assistant/.env — needed when the local
+                agent escalates to the helper
+              </p>
+            ) : null}
+            <label className="block text-xs text-white/60">Helper runtime</label>
+            <select
+              className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm"
+              value={cursorRuntime}
+              onChange={(e) => setCursorRuntime(e.target.value as "cloud" | "local")}
+            >
+              <option value="cloud">Cloud — visible in Cursor Agents sidebar</option>
+              <option value="local">Local — SDK bridge on this machine</option>
+            </select>
+            {cursorRuntime === "cloud" ? (
+              <>
+                <label className="block text-xs text-white/60">Git repo URL (for cloud agent)</label>
+                <input
+                  className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm"
+                  value={repoUrl}
+                  onChange={(e) => setRepoUrl(e.target.value)}
+                  placeholder="https://github.com/you/content-manager"
+                />
+              </>
+            ) : (
+              <div
+                className={cn(
+                  "rounded-md border px-3 py-2 text-xs",
+                  config?.cursorHelper?.ok
+                    ? "border-green-500/30 bg-green-950/20 text-green-200"
+                    : "border-amber-500/30 bg-amber-950/20 text-amber-200",
+                )}
               >
-                <option value="cloud">Cloud — visible in Cursor Agents sidebar</option>
-                <option value="local">Local — SDK bridge on this machine</option>
-              </select>
-              {cursorRuntime === "cloud" ? (
-                <>
-                  <label className="block text-xs text-white/60">Git repo URL (for cloud agent)</label>
-                  <input
-                    className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-sm"
-                    value={repoUrl}
-                    onChange={(e) => setRepoUrl(e.target.value)}
-                    placeholder="https://github.com/you/content-manager"
-                  />
-                </>
-              ) : null}
-            </div>
-          ) : (
-            <p className="text-xs text-white/45">Collaboration loop runs local agent only — no helper handoffs.</p>
-          )}
+                {config?.cursorHelper?.ok ? (
+                  <p>Local helper ready — Cursor app is running on this machine.</p>
+                ) : (
+                  <ul className="space-y-1">
+                    {!config?.hasCursorApiKey ? (
+                      <li>
+                        Set <code className="text-white/90">CURSOR_API_KEY</code> in ai-assistant/.env
+                      </li>
+                    ) : null}
+                    {config?.cursorHelper?.errors.map((err) => (
+                      <li key={err}>{err}</li>
+                    ))}
+                    {!config?.cursorHelper ? (
+                      <li>Open this page after selecting a project to check helper readiness.</li>
+                    ) : null}
+                  </ul>
+                )}
+              </div>
+            )}
+          </div>
 
           <hr className="border-white/10" />
           <h3 className="text-sm font-semibold text-white/70">Ollama</h3>
           {ollamaStatus ? (
-            <div className="space-y-2 text-xs">
-              <p className="text-white/60">
-                Model: <code className="text-white/80">{ollamaStatus.model}</code>
-              </p>
+            <div className="space-y-3 text-xs">
+              <div className="space-y-1">
+                <label htmlFor="ollama-model" className="text-white/60">
+                  Model
+                </label>
+                <select
+                  id="ollama-model"
+                  value={ollamaStatus.model}
+                  disabled={changingOllamaModel || running || Boolean(ollamaSwitch?.active)}
+                  onChange={(e) => void changeOllamaModel(e.target.value)}
+                  className="w-full rounded-md border border-white/15 bg-black/30 px-2.5 py-1.5 text-xs text-white/90 disabled:opacity-50"
+                >
+                  {(ollamaStatus.modelOptions ?? [{ id: ollamaStatus.model, label: ollamaStatus.model, description: "", installed: ollamaStatus.modelAvailable }]).map(
+                    (opt) => (
+                      <option key={opt.id} value={opt.id}>
+                        {opt.label}
+                        {!opt.installed ? " (not installed)" : ""}
+                      </option>
+                    ),
+                  )}
+                </select>
+                {(() => {
+                  const selected =
+                    ollamaStatus.modelOptions?.find((opt) => opt.id === ollamaStatus.model) ?? null;
+                  return selected?.description ? (
+                    <p className="text-white/45">{selected.description}</p>
+                  ) : null;
+                })()}
+              </div>
+
+              {ollamaSwitch?.active || ollamaSwitch?.step === "error" ? (
+                <div
+                  className={cn(
+                    "space-y-2 rounded-md border px-3 py-2",
+                    ollamaSwitch.step === "error"
+                      ? "border-red-500/30 bg-red-950/20"
+                      : "border-sky-500/30 bg-sky-950/20",
+                  )}
+                >
+                  <p
+                    className={cn(
+                      ollamaSwitch.step === "error" ? "text-red-200/90" : "text-sky-200/90",
+                    )}
+                  >
+                    {ollamaSwitch.message}
+                  </p>
+                  {ollamaSwitch.active && typeof ollamaSwitch.progress === "number" ? (
+                    <div className="space-y-1">
+                      <div className="h-1.5 overflow-hidden rounded-full bg-white/10">
+                        <div
+                          className="h-full rounded-full bg-sky-400/80 transition-all duration-500"
+                          style={{ width: `${Math.max(4, ollamaSwitch.progress)}%` }}
+                        />
+                      </div>
+                      <p className="text-white/45">
+                        {ollamaSwitch.step === "unloading"
+                          ? "Freeing VRAM"
+                          : ollamaSwitch.step === "loading"
+                            ? "Loading into VRAM"
+                            : ollamaSwitch.step === "downloading"
+                              ? "Downloading"
+                              : ollamaSwitch.step === "checking"
+                                ? "Checking"
+                                : "Working"}
+                        {typeof ollamaSwitch.progress === "number" ? ` · ${ollamaSwitch.progress}%` : ""}
+                      </p>
+                    </div>
+                  ) : null}
+                </div>
+              ) : null}
+
               <p
                 className={cn(
                   ollamaStatus.modelLoaded
@@ -1052,60 +1575,77 @@ export default function App() {
               >
                 {!ollamaStatus.reachable
                   ? "Ollama not reachable — start the Ollama app"
+                  : ollamaSwitch?.active
+                    ? "Switching models…"
                   : !ollamaStatus.modelAvailable
-                    ? `Model not installed — run: ollama pull ${ollamaStatus.model}`
+                    ? "Selected model is not installed yet"
                     : ollamaStatus.modelLoaded
                       ? "Model loaded in VRAM"
                       : "Model not loaded — first run will load it (30–90s)"}
               </p>
-              {ollamaStatus.reachable && ollamaStatus.modelAvailable && !ollamaStatus.modelLoaded ? (
-                <button
-                  type="button"
-                  disabled={preloadingOllama || running}
-                  onClick={preloadOllama}
-                  className="rounded-md border border-white/20 px-3 py-1.5 text-xs text-white/90 disabled:opacity-50"
-                >
-                  {preloadingOllama ? "Loading model…" : "Preload model now"}
-                </button>
+              {ollamaStatus.loadedModels.length > 0 && !ollamaSwitch?.active ? (
+                <p className="text-white/40">
+                  In VRAM: {ollamaStatus.loadedModels.join(", ")}
+                </p>
               ) : null}
+              <div className="flex flex-wrap gap-2">
+                {ollamaStatus.reachable && !ollamaStatus.modelAvailable ? (
+                  <button
+                    type="button"
+                    disabled={Boolean(pullingOllamaModel) || running || Boolean(ollamaSwitch?.active)}
+                    onClick={() => void pullOllamaModel(ollamaStatus.model)}
+                    className="rounded-md border border-white/20 px-3 py-1.5 text-xs text-white/90 disabled:opacity-50"
+                  >
+                    {pullingOllamaModel === ollamaStatus.model ? "Downloading…" : "Download model"}
+                  </button>
+                ) : null}
+                {ollamaStatus.reachable && ollamaStatus.modelAvailable && !ollamaStatus.modelLoaded ? (
+                  <button
+                    type="button"
+                    disabled={preloadingOllama || running || Boolean(ollamaSwitch?.active)}
+                    onClick={preloadOllama}
+                    className="rounded-md border border-white/20 px-3 py-1.5 text-xs text-white/90 disabled:opacity-50"
+                  >
+                    {preloadingOllama ? "Loading model…" : "Preload model now"}
+                  </button>
+                ) : null}
+              </div>
             </div>
           ) : null}
 
-          {!skipCursor ? (
-            <details className="rounded-md border border-white/10 bg-black/20 text-sm">
-              <summary className="cursor-pointer px-3 py-2.5 text-sm font-medium text-white/70">
-                Helper agent context
-                <span className="ml-2 text-xs font-normal text-white/45">
-                  {collabConfig?.helperModel ?? "composer-2.5"}
-                  {helperPromptDraft !== (collabConfig?.helperPrompt ?? "") ? " · unsaved" : ""}
-                </span>
-              </summary>
-              <div className="space-y-3 border-t border-white/10 px-3 py-3">
-                <p className="text-xs text-white/50">
-                  Prepended to every helper prompt. The helper implements code, then requests UI checks via{" "}
-                  <code className="text-white/70">### UI verification request</code> — the local agent runs those
-                  and returns answer + report. If the helper is missing a fact it can ask via{" "}
-                  <code className="text-white/70">### Info needed</code> (max {collabConfig?.maxInfoRequests ?? 2}{" "}
-                  rounds). After {collabConfig?.maxTestRetries ?? 3} failed verifications the helper gets one
-                  escalation round with full history before the run stops.
-                </p>
-                <textarea
-                  className="min-h-32 w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 font-mono text-xs leading-relaxed"
-                  value={helperPromptDraft}
-                  onChange={(e) => setHelperPromptDraft(e.target.value)}
-                  placeholder="Explain to the helper agent how the collaboration works…"
-                />
-                <button
-                  type="button"
-                  disabled={savingCollabConfig}
-                  onClick={() => void saveCollabConfig()}
-                  className="rounded-md border border-white/20 px-3 py-1.5 text-xs text-white/90 disabled:opacity-50"
-                >
-                  {savingCollabConfig ? "Saving…" : "Save helper context"}
-                </button>
-              </div>
-            </details>
-          ) : null}
+          <details className="rounded-md border border-white/10 bg-black/20 text-sm">
+            <summary className="cursor-pointer px-3 py-2.5 text-sm font-medium text-white/70">
+              Helper agent context
+              <span className="ml-2 text-xs font-normal text-white/45">
+                {collabConfig?.helperModel ?? "composer-2.5"}
+                {helperPromptDraft !== (collabConfig?.helperPrompt ?? "") ? " · unsaved" : ""}
+              </span>
+            </summary>
+            <div className="space-y-3 border-t border-white/10 px-3 py-3">
+              <p className="text-xs text-white/50">
+                Prepended to every helper prompt. The helper implements code, then requests UI checks via{" "}
+                <code className="text-white/70">### UI verification request</code> — the local agent runs those
+                and returns answer + report. For web research tasks it can ask follow-up questions via{" "}
+                <code className="text-white/70">### Info needed</code> (max {collabConfig?.maxInfoRequests ?? 2}{" "}
+                rounds). After {collabConfig?.maxTestRetries ?? 3} failed verifications the helper gets one
+                escalation round with full history before the run stops.
+              </p>
+              <textarea
+                className="min-h-32 w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 font-mono text-xs leading-relaxed"
+                value={helperPromptDraft}
+                onChange={(e) => setHelperPromptDraft(e.target.value)}
+                placeholder="Explain to the helper agent how the collaboration works…"
+              />
+              <button
+                type="button"
+                disabled={savingCollabConfig}
+                onClick={() => void saveCollabConfig()}
+                className="rounded-md border border-white/20 px-3 py-1.5 text-xs text-white/90 disabled:opacity-50"
+              >
+                {savingCollabConfig ? "Saving…" : "Save helper context"}
+              </button>
+            </div>
+          </details>
 
           <hr className="border-white/10" />
           <RunHistoryPanel
@@ -1120,33 +1660,17 @@ export default function App() {
             <button
               type="button"
               disabled={running}
-              onClick={startFullLoop}
+              onClick={startRun}
               className={cn(
                 "rounded-md bg-white px-4 py-2 text-sm font-semibold text-black",
                 running && "opacity-50",
               )}
             >
-              Run collaboration loop
+              Run
             </button>
             <p className="text-center text-[10px] text-white/40">
-              Triage → hand off or test → verify on live UI (max 3 failures)
+              Classifies task → web research or UI test → escalates to helper when stuck
             </p>
-            <button
-              type="button"
-              disabled={running}
-              onClick={startLocalOnly}
-              className="rounded-md border border-white/20 px-4 py-2 text-sm text-white/90"
-            >
-              Local agent only
-            </button>
-            <button
-              type="button"
-              disabled={running || !config?.hasCursorApiKey || skipCursor}
-              onClick={startCursorOnly}
-              className="rounded-md border border-violet-400/30 px-4 py-2 text-sm text-violet-100 disabled:opacity-50"
-            >
-              Cursor agent only
-            </button>
           </div>
 
           <details className="rounded-md border border-white/10 bg-black/20 p-3 text-sm">
@@ -1157,6 +1681,7 @@ export default function App() {
             </div>
           </details>
         </section>
+        </>
       ) : (
         <div className="flex min-h-[calc(100vh-10rem)] flex-col gap-4">
           {running ? (
@@ -1199,7 +1724,11 @@ export default function App() {
           {showLiveSession ? (
             <section className="surface-card shrink-0 p-4">
               <h2 className="mb-3 text-sm font-semibold uppercase tracking-wide text-white/50">
-                {replayMode ? "Recorded session" : "Live page — agent testing"}
+                {replayMode
+                  ? "Recorded session"
+                  : webBrowseActive
+                    ? "Live browser — web research"
+                    : "Live page — agent testing"}
               </h2>
               <PagePreview
                 state={replayMode ? null : browserState}
@@ -1209,6 +1738,12 @@ export default function App() {
                 lastAction={lastActionLine}
                 replayMode={replayMode}
               />
+            </section>
+          ) : null}
+
+          {webResearch ? (
+            <section className="surface-card shrink-0 p-4">
+              <WebResearchPanel state={webResearch} />
             </section>
           ) : null}
 
@@ -1254,10 +1789,10 @@ export default function App() {
                 testTargetMode={testTargetMode}
                 skipDeploy={runApiOptions.skipDeploy}
                 hasTask={Boolean(task.trim())}
-                skipCursor={skipCursor}
                 agentCards={agentCards}
                 collaborationResult={collaborationResult}
                 hideCollaboration={hasCollaboration}
+                webResearch={webResearch}
               />
             </section>
           </div>

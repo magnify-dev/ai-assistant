@@ -1,0 +1,12 @@
+ollama:
+  url: "http://127.0.0.1:11434"
+  model: "qwen2.5:14b"
+  timeout_sec: 120
+
+research:
+  project: "C:/Users/marce/Documents/Programming/ai-assistant"
+  max_search_results: 8
+  max_pages: 5
+  fetch_timeout_sec: 20
+  content_max_chars: 12000
+  use_ollama: true
