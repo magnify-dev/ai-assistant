@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -34,13 +35,29 @@ def _model_names(tags_body: dict) -> set[str]:
     return names
 
 
+def _normalize_model_ref(name: str) -> str:
+    trimmed = str(name or "").strip().lower()
+    if not trimmed:
+        return ""
+    if ":" not in trimmed:
+        return f"{trimmed}:latest"
+    base, tag = trimmed.split(":", 1)
+    digest = re.search(r"-[a-f0-9]{8,}$", tag, flags=re.I)
+    if digest and digest.start() > 0:
+        tag = tag[: digest.start()]
+    return f"{base}:{tag or 'latest'}"
+
+
+def _models_equivalent(requested: str, actual: str) -> bool:
+    return _normalize_model_ref(requested) == _normalize_model_ref(actual)
+
+
 def _model_loaded(ps_body: dict, model: str) -> bool:
-    base = model.split(":", 1)[0]
     for entry in ps_body.get("models") or []:
         if not isinstance(entry, dict):
             continue
         name = str(entry.get("name") or entry.get("model") or "")
-        if name == model or name.startswith(f"{base}:"):
+        if _models_equivalent(model, name):
             return True
     return False
 
@@ -101,6 +118,19 @@ def preload_model(
         on_log(f"Model {model} is loaded and ready")
 
 
+def unload_model(url: str, model: str, *, timeout_sec: float = 120) -> None:
+    payload = {
+        "model": model,
+        "prompt": "",
+        "stream": False,
+        "keep_alive": 0,
+    }
+    with httpx.Client(timeout=timeout_sec) as client:
+        response = client.post(f"{url.rstrip('/')}/api/generate", json=payload)
+        if response.status_code not in {200, 404}:
+            response.raise_for_status()
+
+
 def ensure_ollama_ready(
     *,
     url: str,
@@ -116,7 +146,7 @@ def ensure_ollama_ready(
         ps = client.get(f"{url.rstrip('/')}/api/ps").json()
 
     available = _model_names(tags if isinstance(tags, dict) else {})
-    if model not in available and not any(name.startswith(f"{model.split(':', 1)[0]}:") for name in available):
+    if not any(_models_equivalent(model, name) for name in available):
         pull_model(model, on_log=on_log)
     elif on_log:
         on_log(f"Model {model} is available")
@@ -125,5 +155,16 @@ def ensure_ollama_ready(
         if on_log:
             on_log(f"Model {model} already loaded in VRAM")
         return
+
+    loaded_names = [
+        str(entry.get("name") or entry.get("model") or "")
+        for entry in (ps.get("models") if isinstance(ps, dict) else []) or []
+        if isinstance(entry, dict)
+    ]
+    to_unload = [name for name in loaded_names if name and not _models_equivalent(model, name)]
+    for name in to_unload:
+        if on_log:
+            on_log(f"Unloading {name} from VRAM…")
+        unload_model(url, name)
 
     preload_model(url, model, timeout_sec=preload_timeout_sec, on_log=on_log)

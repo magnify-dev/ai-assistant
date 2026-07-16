@@ -34,6 +34,7 @@ export const OLLAMA_MODEL_OPTIONS: OllamaModelOption[] = [
 ];
 
 const UI_TEST_CONFIG_PATH = path.join(REPO_ROOT, "ui_test", "config.yaml");
+const WEB_SURF_CONFIG_PATH = path.join(REPO_ROOT, "web_surf", "config.yaml");
 
 function ollamaExe(): string | null {
   const localAppData = process.env.LOCALAPPDATA;
@@ -42,17 +43,31 @@ function ollamaExe(): string | null {
   return fs.existsSync(exe) ? exe : null;
 }
 
+/** Normalize Ollama model refs so name:tag comparisons are stable. */
+export function normalizeModelRef(name: string): string {
+  const trimmed = name.trim().toLowerCase();
+  if (!trimmed) return "";
+  const colon = trimmed.indexOf(":");
+  if (colon < 0) return `${trimmed}:latest`;
+  const base = trimmed.slice(0, colon);
+  let tag = trimmed.slice(colon + 1);
+  const digestDash = tag.search(/-[a-f0-9]{8,}$/i);
+  if (digestDash > 0) {
+    tag = tag.slice(0, digestDash);
+  }
+  return `${base}:${tag || "latest"}`;
+}
+
+export function modelsEquivalent(requested: string, actual: string): boolean {
+  return normalizeModelRef(requested) === normalizeModelRef(actual);
+}
+
 export function isModelAvailable(model: string, availableModels: string[]): boolean {
-  const baseName = model.split(":", 1)[0];
-  return (
-    availableModels.includes(model) ||
-    availableModels.some((name) => name.startsWith(`${baseName}:`))
-  );
+  return availableModels.some((name) => modelsEquivalent(model, name));
 }
 
 function modelsMatch(a: string, b: string): boolean {
-  if (a === b) return true;
-  return a.split(":", 1)[0] === b.split(":", 1)[0];
+  return modelsEquivalent(a, b);
 }
 
 export function readOllamaConfig(): OllamaConfig {
@@ -104,7 +119,7 @@ export async function fetchOllamaStatus(cfg: OllamaConfig): Promise<{
       .filter(Boolean);
     const loadedModels = (ps.models ?? []).map((m) => m.name || m.model || "").filter(Boolean);
     const modelAvailable = isModelAvailable(cfg.model, availableModels);
-    const modelLoaded = isModelAvailable(cfg.model, loadedModels);
+    const modelLoaded = loadedModels.some((name) => modelsEquivalent(cfg.model, name));
     return { reachable: true, modelAvailable, modelLoaded, loadedModels, availableModels };
   } catch {
     return {
@@ -236,6 +251,19 @@ export async function switchOllamaModel(
       throw new Error(`Model ${newModel} is not installed`);
     }
     if (!status.modelLoaded) {
+      const loadedToUnload = status.loadedModels.filter((name) => !modelsMatch(name, newModel));
+      if (loadedToUnload.length > 0) {
+        onProgress({
+          step: "unloading",
+          message: `Unloading ${loadedToUnload.join(", ")} from VRAM…`,
+          progress: 20,
+          fromModel: loadedToUnload[0],
+          toModel: newModel,
+        });
+        for (const loaded of loadedToUnload) {
+          await unloadOllamaModel(current.url, loaded);
+        }
+      }
       await preloadWithProgress(current, onProgress);
     }
     onProgress({ step: "done", message: `${newModel} is already selected`, progress: 100, toModel: newModel });
@@ -302,12 +330,14 @@ export function writeOllamaModel(model: string): void {
     throw new Error("UI_TEST_OLLAMA_MODEL env var overrides config — unset it to change model in UI");
   }
 
-  const text = fs.readFileSync(UI_TEST_CONFIG_PATH, "utf8");
-  const updated = text.replace(/(^\s*model:\s*)["']?[^"'\n#]+["']?/m, `$1"${model}"`);
-  if (updated === text) {
-    throw new Error("Could not find ollama.model in ui_test/config.yaml");
+  for (const configPath of [UI_TEST_CONFIG_PATH, WEB_SURF_CONFIG_PATH]) {
+    const text = fs.readFileSync(configPath, "utf8");
+    const updated = text.replace(/(^\s*model:\s*)["']?[^"'\n#]+["']?/m, `$1"${model}"`);
+    if (updated === text) {
+      throw new Error(`Could not find ollama.model in ${configPath}`);
+    }
+    fs.writeFileSync(configPath, updated, "utf8");
   }
-  fs.writeFileSync(UI_TEST_CONFIG_PATH, updated, "utf8");
 }
 
 function parsePullProgress(line: string): number | null {

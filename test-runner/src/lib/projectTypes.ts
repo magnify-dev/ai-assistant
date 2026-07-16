@@ -184,3 +184,13 @@ export type RunHistoryEntry = {
   statusText?: string;
   sessionSource?: "web" | "ui";
 };
+
+export type RunHistoryPage = {
+  runs: RunHistoryEntry[];
+  total: number;
+  offset: number;
+  limit: number;
+  hasMore: boolean;
+};
+
+export const RUN_HISTORY_PAGE_SIZE = 3;

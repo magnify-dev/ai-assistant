@@ -11,12 +11,21 @@ OVERLAY_ACTION_RE = re.compile(
 )
 FORM_KINDS = {"textbox", "combobox", "input", "select", "textarea", "spinbutton"}
 STRUCTURAL_LANDMARKS = {"main", "nav", "navigation", "banner", "content", "search"}
+CONTENT_LABEL_RE = re.compile(
+    r"\b(patch notes|changelog|release notes|updates?|what's new|whats new)\b",
+    re.I,
+)
+MARKETING_LABEL_RE = re.compile(
+    r"\b(purchase|buy now|shop now|subscribe|sign up|expansion|learn more|pre-order|preorder)\b",
+    re.I,
+)
 SEMANTIC_KEY_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 CONTROL_ID_RE = re.compile(r"^(el[-_]|input-|select-|btn-)")
 # Mirrors browser_explore.ALLOWED_ACTIONS (kept local to avoid a circular import).
 _ACTION_NAMES = {
     "click",
     "navigate",
+    "swap_branch",
     "fill",
     "select",
     "press",
@@ -24,6 +33,7 @@ _ACTION_NAMES = {
     "back",
     "wait",
     "extract",
+    "filter",
     "report",
     "help",
     "provide_values",
@@ -42,29 +52,58 @@ def _label(item: dict[str, Any]) -> str:
     return str(item.get("id") or "control")[:80]
 
 
+def _widget_type(item: dict[str, Any]) -> str:
+    widget = str(item.get("widget") or "").strip().lower()
+    if widget:
+        return widget
+    kind = str(item.get("kind") or "").lower()
+    role = str(item.get("role") or "").lower()
+    input_type = str(item.get("input_type") or "").lower()
+    if kind == "select":
+        return "select"
+    if kind == "combobox" or role == "combobox":
+        return "combobox"
+    if kind == "textarea":
+        return "textarea"
+    if role == "spinbutton" or input_type == "number":
+        return "number"
+    if input_type in {"date", "email", "tel", "search", "password"}:
+        return input_type
+    if kind in {"input", "textbox"} or role in {"textbox", "searchbox"}:
+        return "text"
+    return kind or "text"
+
+
 def _action_type(item: dict[str, Any]) -> str:
+    widget = _widget_type(item)
+    if widget in {"select", "combobox"}:
+        return "select"
     hint = str(item.get("action_hint") or "").lower()
     kind = str(item.get("kind") or item.get("role") or "").lower()
-    if kind in FORM_KINDS or "fill" in hint:
+    if kind in FORM_KINDS or widget in {"text", "number", "date", "email", "tel", "search", "textarea"} or "fill" in hint:
         return "fill"
-    if kind in {"select", "combobox"} or "select" in hint:
-        return "select"
     if kind == "link" or item.get("href"):
         return "navigate"
     return "click"
 
 
-def _query_score(item: dict[str, Any], query_tokens: set[str]) -> int:
+def _query_score(item: dict[str, Any], query_tokens: set[str], *, publisher_domains: set[str] | None = None) -> int:
     if not query_tokens:
         return 0
     blob = f"{_label(item)} {item.get('href') or ''}".lower()
     score = sum(2 for token in query_tokens if token in blob)
-    if score:
-        # Content-page links (patch notes, changelogs, news articles) beat nav links.
-        from web_surf.page_match import _CONTENT_PATH_HINTS
+    if CONTENT_LABEL_RE.search(blob):
+        score += 18
+    if MARKETING_LABEL_RE.search(blob) and not CONTENT_LABEL_RE.search(blob):
+        score -= 8
+    href = str(item.get("href") or "").strip()
+    if href:
+        from web_surf.page_match import _CONTENT_PATH_HINTS, url_on_publisher_domain
 
-        path = urlsplit(str(item.get("href") or "").lower()).path
+        path = urlsplit(href.lower()).path
         score += sum(1 for hint in _CONTENT_PATH_HINTS if hint in path)
+        if url_on_publisher_domain(href, publisher_domains or set()):
+            score += 12
     return score
 
 
@@ -93,29 +132,102 @@ def _overlay_score(item: dict[str, Any], *, has_overlay: bool) -> int:
     return score
 
 
-def _control_priority(item: dict[str, Any], query_tokens: set[str], *, has_overlay: bool) -> int:
+def _control_priority(item: dict[str, Any], query_tokens: set[str], *, has_overlay: bool, publisher_domains: set[str] | None = None) -> int:
     if item.get("disabled"):
         return -1000
     return (
-        _query_score(item, query_tokens)
+        _query_score(item, query_tokens, publisher_domains=publisher_domains)
         + _structural_score(item)
         + _overlay_score(item, has_overlay=has_overlay)
     )
 
 
 def compact_control(item: dict[str, Any]) -> dict[str, Any]:
+    widget = _widget_type(item)
     row: dict[str, Any] = {
         "id": str(item.get("id") or ""),
         "action": _action_type(item),
+        "widget": widget,
         "label": _label(item),
     }
     href = str(item.get("href") or "").strip()
     if href:
         row["href"] = href
+    name = str(item.get("name") or "").strip()
+    if name:
+        row["name"] = name[:40]
+    input_type = str(item.get("input_type") or "").strip()
+    if input_type:
+        row["input_type"] = input_type
+    value = str(item.get("value") or item.get("selected_label") or "").strip()
+    if value:
+        row["current"] = value[:40]
+    if item.get("expands_section"):
+        row["expandable"] = True
+        if item.get("collapsed") is True:
+            row["collapsed"] = True
+        elif item.get("collapsed") is False:
+            row["collapsed"] = False
     options = item.get("options")
     if isinstance(options, list) and options:
         row["options"] = [str(opt)[:80] for opt in options[:8]]
+        if len(options) > 8:
+            row["options_count"] = len(options)
     return row
+
+
+def compact_form_field(
+    item: dict[str, Any],
+    *,
+    field_mapping: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Structured description of one form input for the decision model."""
+    widget = _widget_type(item)
+    row: dict[str, Any] = {
+        "id": str(item.get("id") or ""),
+        "widget": widget,
+        "action": "select" if widget in {"select", "combobox"} else "fill",
+        "label": _label(item),
+    }
+    name = str(item.get("name") or "").strip()
+    if name:
+        row["name"] = name[:40]
+    input_type = str(item.get("input_type") or "").strip()
+    if input_type:
+        row["input_type"] = input_type
+    value = str(item.get("value") or item.get("selected_label") or "").strip()
+    if value:
+        row["current"] = value[:40]
+    options = item.get("options")
+    if isinstance(options, list) and options:
+        row["options"] = [str(opt)[:60] for opt in options[:10]]
+        if len(options) > 10:
+            row["options_count"] = len(options)
+    mapping = field_mapping or {}
+    field_id = str(item.get("id") or "")
+    if field_id and field_id in mapping:
+        row["value_key"] = mapping[field_id]
+    return row
+
+
+def curate_form_fields(
+    interactables: list[dict[str, Any]] | None,
+    *,
+    field_mapping: dict[str, str] | None = None,
+    limit: int = 12,
+) -> list[dict[str, Any]]:
+    from web_surf.form_values import is_form_interactable
+
+    fields: list[dict[str, Any]] = []
+    for raw in interactables or []:
+        if not isinstance(raw, dict) or not raw.get("id") or raw.get("disabled"):
+            continue
+        if not is_form_interactable(raw):
+            continue
+        fields.append(compact_form_field(raw, field_mapping=field_mapping))
+        if len(fields) >= limit:
+            break
+    return fields
 
 
 def curate_controls(
@@ -124,6 +236,7 @@ def curate_controls(
     query: str = "",
     has_overlay: bool = False,
     limit: int = 40,
+    publisher_domains: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Keep a balanced mix of overlay, goal-relevant, and structural controls."""
     query_tokens = _tokens(query)
@@ -131,7 +244,18 @@ def curate_controls(
     for index, raw in enumerate(interactables or []):
         if not isinstance(raw, dict) or not raw.get("id"):
             continue
-        ranked.append((_control_priority(raw, query_tokens, has_overlay=has_overlay), index, raw))
+        ranked.append(
+            (
+                _control_priority(
+                    raw,
+                    query_tokens,
+                    has_overlay=has_overlay,
+                    publisher_domains=publisher_domains,
+                ),
+                index,
+                raw,
+            )
+        )
     ranked.sort(key=lambda row: (row[0], -row[1]), reverse=True)
 
     chosen: list[dict[str, Any]] = []
@@ -158,7 +282,7 @@ def curate_controls(
     for score, _, item in ranked:
         if score < 0:
             continue
-        if query_tokens and _query_score(item, query_tokens) > 0:
+        if query_tokens and _query_score(item, query_tokens, publisher_domains=publisher_domains) > 0:
             add(item)
         if len(chosen) >= limit - 8:
             break
@@ -250,18 +374,54 @@ def compact_history(history: list[dict[str, Any]] | None, *, limit: int = 6) -> 
         target = str(item.get("target_id") or "").strip()
         label = str(item.get("target_label") or "").strip()
         url = str(item.get("target_href") or item.get("url") or "").strip()
-        status = "ok" if item.get("ok") else "fail"
         error = str(item.get("error") or "").strip()
+        status = "ok" if item.get("ok") else "fail"
+        if item.get("progress") is False or (
+            not item.get("ok") and "no progress" in error.lower()
+        ):
+            status = "no_change"
+        value_key = str(item.get("value_key") or "").strip()
         line = f"{action}:{target or '-'}"
+        if value_key:
+            line = f"{line}[{value_key}]"
         if label:
             line = f'{line} "{label[:50]}"'
         if url:
             line = f"{line} -> {url[:90]}"
+        transition = item.get("transition") if isinstance(item.get("transition"), dict) else {}
+        for change in transition.get("interactables_changed") or []:
+            if not isinstance(change, dict):
+                continue
+            after = change.get("after") if isinstance(change.get("after"), dict) else {}
+            value = str(after.get("value") or after.get("selected") or "").strip()
+            if value:
+                line = f"{line} set={value[:30]}"
+                break
         line = f"{line} {status}"
         if error:
             line = f"{line} ({error[:120]})"
         lines.append(line)
     return lines
+
+
+def _compact_field_changes(delta: dict[str, Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for change in delta.get("interactables_changed") or []:
+        if not isinstance(change, dict):
+            continue
+        fields = [str(field) for field in (change.get("fields") or []) if str(field)]
+        if not fields:
+            continue
+        after = change.get("after") if isinstance(change.get("after"), dict) else {}
+        values = {
+            field: str(after.get(field) or "")[:40]
+            for field in fields
+            if field in {"value", "selected", "checked"} and str(after.get(field) or "").strip()
+        }
+        if not values:
+            continue
+        rows.append({"id": str(change.get("id") or ""), "set": values})
+    return rows[:6]
 
 
 def compact_transition(transition: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -277,19 +437,24 @@ def compact_transition(transition: dict[str, Any] | None) -> dict[str, Any] | No
         for item in added[:8]
         if isinstance(item, dict) and item.get("id")
     ]
+    field_changes = _compact_field_changes(delta)
     if not (
         delta.get("url_changed")
         or delta.get("visible_text_changed")
         or new_blockers
         or new_controls
+        or field_changes
     ):
         return None
-    return {
+    payload: dict[str, Any] = {
         "url_changed": bool(delta.get("url_changed")),
         "text_changed": bool(delta.get("visible_text_changed")),
         "blockers": new_blockers,
         "new_controls": new_controls,
     }
+    if field_changes:
+        payload["fields_set"] = field_changes
+    return payload
 
 
 def curate_browse_context(
@@ -301,37 +466,208 @@ def curate_browse_context(
     available_value_keys: list[str] | None = None,
     field_mapping: dict[str, str] | None = None,
     recent_history: list[dict[str, Any]] | None = None,
+    agent_memory: list[dict[str, Any]] | None = None,
     last_transition: dict[str, Any] | None = None,
+    blocked_attempts: list[str] | None = None,
+    publishers: list[str] | None = None,
+    publisher_domains: set[str] | None = None,
+    seed_urls: list[str] | None = None,
+    candidates: list[Any] | None = None,
+    active_branch_url: str | None = None,
+    branch_steps: int = 0,
+    max_steps_per_branch: int = 20,
+    helper_guidance: list[dict[str, Any]] | None = None,
+    collected_evidence: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    overlays = snapshot.get("blocking_overlays") or []
+    from web_surf.form_values import _snapshot_blockers
+
+    overlays = _snapshot_blockers(snapshot)
+    domain_set = set(publisher_domains or set())
+    publisher_names = [str(item).strip() for item in (publishers or []) if str(item).strip()]
+    from web_surf.page_match import (
+        filter_text_by_date,
+        focus_query,
+        page_contains_target_date,
+        parse_target_dates,
+        url_on_publisher_domain,
+    )
+
+    focused_goal = focus_query(query)
+    visible_text = str(snapshot.get("visible_text") or "")
+    target_dates = parse_target_dates(focused_goal)
+    curated_page_text = curate_text(visible_text, query=focused_goal)
+    if target_dates and page_contains_target_date(visible_text, focused_goal):
+        filtered = filter_text_by_date(visible_text, focused_goal, max_chars=4000)
+        if len(filtered) >= 120:
+            curated_page_text = curate_text(filtered, query=focused_goal, max_chars=2200)
     payload: dict[str, Any] = {
-        "goal": query.strip(),
+        "goal": focused_goal.strip(),
         "step": step_id,
         "page": {
             "url": str(snapshot.get("url") or ""),
             "title": str(snapshot.get("title") or "")[:140],
-            "text": curate_text(str(snapshot.get("visible_text") or ""), query=query),
+            "text": curated_page_text,
         },
         "overlays": compact_blockers(overlays),
         "controls": curate_controls(
             snapshot.get("interactables"),
             query=query,
             has_overlay=bool(overlays),
+            publisher_domains=domain_set,
         ),
         "routes": compact_routes(list(discovered_routes)),
     }
+
+    publisher_routes = [
+        route
+        for route in discovered_routes
+        if url_on_publisher_domain(str(route), domain_set)
+    ]
+    if publisher_names:
+        payload["publishers"] = publisher_names[:8]
+    if publisher_routes:
+        payload["publisher_routes"] = compact_routes(publisher_routes)
+    if target_dates:
+        payload["target_dates"] = [
+            f"{day:02d}.{month:02d}.{year}" for day, month, year in target_dates
+        ]
+        if page_contains_target_date(visible_text, query):
+            payload["content_on_page"] = (
+                "The current page already contains text for the target date. "
+                "Use action=filter or action=extract once to collect that section, "
+                "then action=report. Do not navigate away to other patch-note pages."
+            )
+    current_url = str(snapshot.get("url") or "").strip().rstrip("/")
+    prior_collects = [
+        item
+        for item in (collected_evidence or [])
+        if isinstance(item, dict)
+        and str(item.get("url") or "").strip().rstrip("/") == current_url
+    ]
+    if prior_collects:
+        latest = prior_collects[-1]
+        step_ref = str(latest.get("step_id") or "").strip()
+        payload["evidence_collected"] = (
+            "Content from this page was already collected"
+            + (f" in {step_ref}" if step_ref else "")
+            + ". Use action=report now — do not repeat extract or filter."
+        )
+        payload["report_ready"] = True
+    collapsed = [
+        control
+        for control in payload.get("controls") or []
+        if control.get("expandable") and control.get("collapsed")
+    ]
+    if collapsed:
+        payload["collapsed_sections"] = collapsed[:6]
+        payload["expand_note"] = (
+            "Some controls are collapsed accordion/section headers. "
+            "Click a collapsed control whose label matches the goal to expand it "
+            "and reveal the hidden content before filter/extract/report."
+        )
     keys = [str(key) for key in (available_value_keys or []) if str(key)]
     if keys:
         payload["form_keys"] = keys
     mapping = {str(k): str(v) for k, v in (field_mapping or {}).items() if k and v}
     if mapping:
         payload["form_map"] = mapping
+    form_fields = curate_form_fields(
+        snapshot.get("interactables"),
+        field_mapping=mapping,
+    )
+    if form_fields:
+        payload["form_fields"] = form_fields
+        payload["form_note"] = "select→action=select, text→action=fill; use value_key from form_keys"
     history = compact_history(recent_history)
     if history:
-        payload["history"] = history
+        payload["history"] = history[-4:]
     transition = compact_transition(last_transition)
     if transition:
         payload["last_change"] = transition
+    from web_surf.explore_branches import build_exploration_menu, summarize_exploration_branches
+    from web_surf.form_values import AGE_GATE_AGENT_NOTE, looks_like_age_gate, summarize_overlay_actions
+
+    branch_info = summarize_exploration_branches(
+        current_url=str(snapshot.get("url") or ""),
+        seed_urls=list(seed_urls or []),
+        candidates=list(candidates or []),
+        history=list(recent_history or []),
+        active_branch_url=str(active_branch_url or snapshot.get("url") or ""),
+        branch_steps=branch_steps,
+        max_steps_per_branch=max_steps_per_branch,
+    )
+    from web_surf.agent_memory import (
+        compact_agent_memory_for_prompt,
+        compact_avoid,
+        compact_branch_note,
+        compact_failed_steps,
+        stuck_reason,
+    )
+
+    memory_rows, memory_note = compact_agent_memory_for_prompt(agent_memory, limit=12)
+    failed_steps = compact_failed_steps(agent_memory, limit=8)
+    avoid = compact_avoid(
+        blocked_signatures=blocked_attempts,
+        history=list(recent_history or []),
+        agent_memory=list(agent_memory or []),
+        snapshot=snapshot,
+        limit=10,
+    )
+    branch_note = compact_branch_note(branch_info, agent_memory)
+    stuck = stuck_reason(
+        snapshot=snapshot,
+        branch_info=branch_info,
+        failed_steps=failed_steps,
+    )
+
+    if stuck:
+        payload["stuck"] = stuck
+    if branch_note:
+        payload["branch_note"] = branch_note
+    if failed_steps:
+        payload["failed"] = failed_steps
+    if avoid:
+        payload["avoid"] = avoid
+    if memory_rows:
+        payload["steps"] = memory_rows
+    if memory_note:
+        payload["steps_note"] = memory_note
+    guidance_lines = [
+        str(item.get("instruction") or item.get("error") or "").strip()
+        for item in (helper_guidance or [])
+        if isinstance(item, dict)
+    ]
+    guidance_lines = [line for line in guidance_lines if line]
+    if guidance_lines:
+        payload["guidance"] = guidance_lines[-3:]
+    overlay_actions = summarize_overlay_actions(snapshot) if overlays else []
+    menu = build_exploration_menu(
+        controls=payload.get("controls") or [],
+        overlay_actions=overlay_actions,
+        branch_info=branch_info,
+    )
+
+    payload["branch"] = {
+        "current": branch_info.get("current"),
+        "alternatives": branch_info.get("alternatives") or [],
+        "stall_count": branch_info.get("stall_count", 0),
+        "branch_steps": branch_info.get("branch_steps", 0),
+        "max_steps_per_branch": branch_info.get("max_steps_per_branch", max_steps_per_branch),
+        "can_back": bool(branch_info.get("can_back")),
+    }
+    payload["menu"] = menu
+    payload["explore_note"] = (
+        "Pick ONE action from menu[]. Read stuck, branch_note, failed, avoid, guidance, "
+        "evidence_collected before choosing. "
+        "Clear overlays before extract/report. Swap branch only when stalled."
+    )
+
+    if looks_like_age_gate(snapshot):
+        payload["age_gate_note"] = AGE_GATE_AGENT_NOTE
+    if overlays:
+        payload["overlay_required"] = True
+        if overlay_actions:
+            payload["overlay_actions"] = overlay_actions
     return payload
 
 
@@ -341,16 +677,21 @@ def curate_form_plan_context(
     snapshot: dict[str, Any],
     existing_keys: list[str] | None = None,
 ) -> dict[str, Any]:
-    from web_surf.form_values import collect_form_fields
+    from web_surf.form_values import collect_form_fields, collect_gate_fields, looks_like_age_gate, _snapshot_blockers
 
-    fields = collect_form_fields(snapshot)
+    fields = collect_gate_fields(snapshot) if looks_like_age_gate(snapshot) else collect_form_fields(snapshot)
     compact_fields: list[dict[str, Any]] = []
     for field in fields[:14]:
         row: dict[str, Any] = {
             "id": field["id"],
             "label": field["label"][:100],
-            "action": field.get("action_hint") or field.get("kind") or "fill",
+            "widget": field.get("widget") or field.get("kind") or "text",
+            "action": "select"
+            if str(field.get("widget") or field.get("kind") or "").lower() in {"select", "combobox"}
+            else "fill",
         }
+        if field.get("name"):
+            row["name"] = field["name"][:40]
         if field.get("placeholder"):
             row["placeholder"] = field["placeholder"][:80]
         options = field.get("options")
@@ -359,12 +700,16 @@ def curate_form_plan_context(
         compact_fields.append(row)
     payload: dict[str, Any] = {
         "goal": query.strip(),
-        "overlays": compact_blockers(snapshot.get("blocking_overlays")),
+        "overlays": compact_blockers(_snapshot_blockers(snapshot)),
         "fields": compact_fields,
     }
     keys = [str(key) for key in (existing_keys or []) if str(key)]
     if keys:
         payload["existing_keys"] = keys
+    from web_surf.form_values import AGE_GATE_AGENT_NOTE, looks_like_age_gate
+
+    if looks_like_age_gate(snapshot):
+        payload["age_gate_note"] = AGE_GATE_AGENT_NOTE
     return payload
 
 

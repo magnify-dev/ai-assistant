@@ -1,12 +1,17 @@
 import { cn } from "@/lib/utils";
 import type { RunHistoryEntry } from "@/lib/projectTypes";
+import { RUN_HISTORY_PAGE_SIZE } from "@/lib/projectTypes";
 
 type Props = {
   runs: RunHistoryEntry[];
   loading?: boolean;
+  loadingMore?: boolean;
+  hasMore?: boolean;
+  total?: number;
   running?: boolean;
   onInspect: (runId: string) => void;
   onResume?: (runId: string) => void;
+  onLoadOlder?: () => void;
 };
 
 function formatGeneratedAt(value: string): string {
@@ -48,17 +53,36 @@ function statusBadge(run: RunHistoryEntry): { label: string; className: string }
   return { label: "—", className: "bg-white/10 text-white/50" };
 }
 
-export function RunHistoryPanel({ runs, loading, running, onInspect, onResume }: Props) {
-  if (loading) {
+export function RunHistoryPanel({
+  runs,
+  loading,
+  loadingMore,
+  hasMore,
+  total,
+  running,
+  onInspect,
+  onResume,
+  onLoadOlder,
+}: Props) {
+  if (loading && !runs.length) {
     return <p className="text-xs text-white/50">Loading run history…</p>;
   }
   if (!runs.length) {
     return <p className="text-xs text-white/50">No saved runs yet for this project.</p>;
   }
 
+  const remaining = Math.max(0, (total ?? runs.length) - runs.length);
+
   return (
     <div className="space-y-2">
-      <h3 className="text-sm font-semibold text-white/70">Run history</h3>
+      <div className="flex items-center justify-between gap-2">
+        <h3 className="text-sm font-semibold text-white/70">Run history</h3>
+        {total !== undefined && total > runs.length ? (
+          <span className="text-[10px] text-white/40">
+            Showing {runs.length} of {total}
+          </span>
+        ) : null}
+      </div>
       <ul className="max-h-64 space-y-1 overflow-y-auto pr-1">
         {runs.map((run) => {
           const badge = statusBadge(run);
@@ -128,6 +152,18 @@ export function RunHistoryPanel({ runs, loading, running, onInspect, onResume }:
           );
         })}
       </ul>
+      {hasMore && onLoadOlder ? (
+        <button
+          type="button"
+          disabled={loadingMore}
+          onClick={onLoadOlder}
+          className="w-full rounded-md border border-white/15 px-3 py-1.5 text-xs text-white/75 hover:bg-white/5 disabled:opacity-50"
+        >
+          {loadingMore
+            ? "Loading older runs…"
+            : `Load ${Math.min(RUN_HISTORY_PAGE_SIZE, remaining)} older run${Math.min(RUN_HISTORY_PAGE_SIZE, remaining) === 1 ? "" : "s"}`}
+        </button>
+      ) : null}
     </div>
   );
 }

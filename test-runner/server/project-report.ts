@@ -652,26 +652,59 @@ function summarizeRun(runId: string, bundle: ReturnType<typeof readRunBundle>): 
   };
 }
 
-export function listRunHistory(projectPath: string) {
-  const runs: RunSummary[] = [];
-  const current = readRunBundle(projectPath, "current");
-  if (hasRunArtifacts(current)) runs.push(summarizeRun("current", current));
+export const RUN_HISTORY_PAGE_SIZE = 3;
+
+function quickHasRunArtifacts(projectPath: string, runId: string): boolean {
+  const root = runRoot(projectPath, runId);
+  if (!fs.existsSync(root)) return false;
+  const markers = [
+    "run-report.json",
+    "collaboration-transcript.json",
+    path.join("web-artifacts", "playwright-session", "session.json"),
+    path.join("ui-artifacts", "playwright-session", "session.json"),
+  ];
+  return markers.some((rel) => fs.existsSync(path.join(root, rel)));
+}
+
+function listRunIds(projectPath: string): string[] {
+  const ids: string[] = [];
+  if (quickHasRunArtifacts(projectPath, "current")) ids.push("current");
 
   const historyDir = agentPath(projectPath, "history");
   if (fs.existsSync(historyDir)) {
     const entries = fs
       .readdirSync(historyDir, { withFileTypes: true })
-      .filter((e) => e.isDirectory())
-      .map((e) => e.name)
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name)
       .sort((a, b) => b.localeCompare(a));
     for (const id of entries) {
-      const bundle = readRunBundle(projectPath, id);
-      if (!hasRunArtifacts(bundle)) continue;
-      runs.push(summarizeRun(id, bundle));
+      if (quickHasRunArtifacts(projectPath, id)) ids.push(id);
     }
   }
+  return ids;
+}
 
-  return { runs };
+export function listRunHistory(
+  projectPath: string,
+  options?: { offset?: number; limit?: number },
+) {
+  const offset = Math.max(0, Number(options?.offset) || 0);
+  const limit = Math.max(
+    1,
+    Math.min(50, Number(options?.limit) || RUN_HISTORY_PAGE_SIZE),
+  );
+  const allIds = listRunIds(projectPath);
+  const total = allIds.length;
+  const pageIds = allIds.slice(offset, offset + limit);
+  const runs = pageIds.map((id) => summarizeRun(id, readRunBundle(projectPath, id)));
+
+  return {
+    runs,
+    total,
+    offset,
+    limit,
+    hasMore: offset + pageIds.length < total,
+  };
 }
 
 export function resolveRunArtifact(projectPath: string, runId: string, fileRel: string) {

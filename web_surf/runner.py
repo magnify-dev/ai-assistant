@@ -12,7 +12,8 @@ from web_surf.config import default_config
 from web_surf.llm import get_trace, ollama_chat, reset_trace
 from web_surf.extract import extract_facts_from_page
 from web_surf.fetch import PageResult, fetch_page_tier1
-from web_surf.page_match import focus_query, rank_search_results
+from web_surf.page_match import focus_query, score_result_url, score_search_result
+from web_surf.spec import classify_search_sources
 from web_surf.search import SearchResult, web_search
 from web_surf.spec import fallback_research_spec, structure_research_spec
 from web_surf.store import (
@@ -63,6 +64,113 @@ class WebResearchResult:
             lines.extend(["", "Errors:", *[f"- {err}" for err in self.errors[:8]]])
         text = "\n".join(lines)
         return text[:max_chars]
+
+
+def _rank_by_relevance(results: list[Any], query: str) -> list[Any]:
+    goal = focus_query(query)
+    return sorted(
+        results,
+        key=lambda row: (
+            -(
+                score_search_result(row, goal)
+                + score_result_url(str(getattr(row, "url", "") or ""), goal)
+            ),
+            str(getattr(row, "url", "") or ""),
+        ),
+    )
+
+
+def _candidate_tiers(
+    results: list[Any],
+    query: str,
+    *,
+    limit: int,
+    spec: dict[str, Any] | None = None,
+    use_llm: bool = False,
+    cfg: dict[str, Any] | None = None,
+) -> tuple[list[Any], list[Any], set[str]]:
+    """Rank results and split into publisher-primary vs secondary tiers."""
+    ranked = _rank_by_relevance(results, query)
+    publisher_domains: set[str] = set()
+    if use_llm and cfg:
+        official, secondary, publisher_domains = classify_search_sources(
+            query=query,
+            spec=spec or {},
+            results=ranked,
+            ollama_url=str(cfg["ollama_url"]),
+            model=str(cfg["ollama_model"]),
+            timeout_sec=float(cfg["ollama_timeout_sec"]),
+        )
+    else:
+        from web_surf.spec import _fallback_source_tiers
+        from web_surf.page_match import official_registrable_domains
+
+        official, secondary = _fallback_source_tiers(ranked, query)
+        official_urls = [str(getattr(row, "url", "") or "") for row in official]
+        publisher_domains = official_registrable_domains(official_urls)
+    official = _unique_urls(official, limit=limit)
+    secondary = _unique_urls(secondary, limit=limit)
+    return official, secondary, publisher_domains
+
+
+def _explore_candidate_tier(
+    *,
+    tier_name: str,
+    candidates: list[Any],
+    query: str,
+    project_path: Path,
+    page_budget: int,
+    pages_fetched: int,
+    max_steps_total: int,
+    steps_used: int,
+    spec: dict[str, Any],
+    cfg: dict[str, Any],
+    emit_events: bool,
+    publisher_domains: set[str] | None = None,
+    publishers: list[str] | None = None,
+) -> tuple[list[PageResult], str, bool, dict[str, Any], int]:
+    """Run browser exploration for one source tier; returns pages, content, goal_met, metadata, steps_used."""
+    empty_meta: dict[str, Any] = {}
+    if not candidates or pages_fetched >= page_budget:
+        return [], "", False, empty_meta, steps_used
+
+    from web_surf.browser_explore import explore_candidates_in_browser, stdin_help_provider
+
+    remaining_visits = page_budget - pages_fetched
+    remaining_steps = max(1, max_steps_total - steps_used)
+    if emit_events:
+        web_events.web_progress(
+            step="browse",
+            message=f"Exploring {tier_name} sources ({len(candidates[:remaining_visits])} site(s))",
+        )
+    exploration = explore_candidates_in_browser(
+        query=query.strip(),
+        candidates=candidates[:remaining_visits],
+        project_path=project_path,
+        max_visits=remaining_visits,
+        max_steps=remaining_steps,
+        max_steps_per_branch=int(cfg.get("max_steps_per_branch") or 20),
+        ollama_url=cfg["ollama_url"],
+        model=cfg["ollama_model"],
+        timeout_sec=float(cfg["ollama_timeout_sec"]),
+        help_provider=stdin_help_provider if emit_events else None,
+        success_criteria=[
+            str(item)
+            for item in (spec.get("success_criteria") or [])
+            if str(item).strip()
+        ],
+        form_values={
+            str(key): str(value)
+            for key, value in (cfg.get("form_values") or {}).items()
+            if str(value)
+        },
+        publisher_domains=set(publisher_domains or set()),
+        publishers=list(publishers or []),
+    )
+    browser_pages, found_content, goal_met = exploration[:3]
+    metadata = exploration[3] if len(exploration) > 3 and isinstance(exploration[3], dict) else empty_meta
+    tier_steps = len(metadata.get("steps") or [])
+    return browser_pages, found_content, goal_met, metadata, steps_used + tier_steps
 
 
 def _unique_urls(results: list[SearchResult], *, limit: int) -> list[SearchResult]:
@@ -271,13 +379,29 @@ def run_web_research(
             if emit_events:
                 web_events.log(f"Search failed for {search_query!r}: {exc}", level="error")
 
-    candidates = _unique_urls(rank_search_results(all_search, query), limit=page_budget)
+    official_candidates, secondary_candidates, publisher_domains = _candidate_tiers(
+        all_search, query, limit=page_budget, spec=spec, use_llm=use_llm, cfg=cfg
+    )
+    publishers = [
+        str(item).strip()
+        for item in (spec.get("official_sources") or [])
+        if str(item).strip()
+    ]
+    candidates = official_candidates + secondary_candidates
     result.search_results = candidates
     if emit_events:
+        official_urls = {row.url.lower() for row in official_candidates}
         web_events.candidates(
             {
                 "candidates": [
-                    {"title": row.title, "url": row.url, "snippet": row.snippet}
+                    {
+                        "title": row.title,
+                        "url": row.url,
+                        "snippet": row.snippet,
+                        "tier": "official"
+                        if row.url.lower() in official_urls
+                        else "secondary",
+                    }
                     for row in candidates
                 ]
             }
@@ -305,43 +429,49 @@ def run_web_research(
     browser_pages: list[PageResult] = []
     found_content = ""
     browser_completed = False
+    max_steps_total = max(20, page_budget * max(4, int(cfg.get("max_steps_per_branch") or 20) // 5))
+    steps_used = 0
+    browser_visits = 0
     if candidates and use_llm:
         try:
-            from web_surf.browser_explore import explore_candidates_in_browser, stdin_help_provider
-
-            if emit_events:
-                web_events.web_progress(step="browse", message="Opening browser to explore search results")
-            exploration = explore_candidates_in_browser(
-                query=query.strip(),
-                candidates=candidates,
-                project_path=project_path,
-                max_visits=page_budget,
-                max_steps=max(8, page_budget * 4),
-                ollama_url=cfg["ollama_url"],
-                model=cfg["ollama_model"],
-                timeout_sec=float(cfg["ollama_timeout_sec"]),
-                help_provider=stdin_help_provider if emit_events else None,
-                success_criteria=[
-                    str(item)
-                    for item in (spec.get("success_criteria") or [])
-                    if str(item).strip()
-                ],
-                form_values={
-                    str(key): str(value)
-                    for key, value in (cfg.get("form_values") or {}).items()
-                    if str(value)
-                },
-            )
-            browser_pages, found_content, goal_met = exploration[:3]
-            if len(exploration) > 3 and isinstance(exploration[3], dict):
-                metadata = exploration[3]
-                result.steps = list(metadata.get("steps") or [])
-                result.visited_pages = list(metadata.get("visited_pages") or [])
-                result.unmet_criteria = [
-                    str(item) for item in (metadata.get("unmet_criteria") or [])
-                ]
-                result.helper_history = list(metadata.get("helper_history") or [])
-            result.goal_met = goal_met
+            for tier_name, tier_candidates in (
+                ("official", official_candidates),
+                ("secondary", secondary_candidates),
+            ):
+                if result.goal_met or browser_visits >= page_budget:
+                    break
+                if not tier_candidates:
+                    continue
+                tier_pages, tier_content, goal_met, metadata, steps_used = _explore_candidate_tier(
+                    tier_name=tier_name,
+                    candidates=tier_candidates,
+                    query=query.strip(),
+                    project_path=project_path,
+                    page_budget=page_budget,
+                    pages_fetched=browser_visits,
+                    max_steps_total=max_steps_total,
+                    steps_used=steps_used,
+                    spec=spec,
+                    cfg=cfg,
+                    emit_events=emit_events,
+                    publisher_domains=publisher_domains,
+                    publishers=publishers,
+                )
+                browser_pages.extend(tier_pages)
+                browser_visits += len(tier_candidates[: max(0, page_budget - browser_visits)])
+                if tier_content.strip():
+                    found_content = tier_content
+                if metadata:
+                    result.steps.extend(list(metadata.get("steps") or []))
+                    result.visited_pages.extend(list(metadata.get("visited_pages") or []))
+                    if metadata.get("unmet_criteria"):
+                        result.unmet_criteria = [
+                            str(item) for item in (metadata.get("unmet_criteria") or [])
+                        ]
+                    result.helper_history.extend(list(metadata.get("helper_history") or []))
+                result.goal_met = goal_met
+                if goal_met:
+                    break
             browser_completed = True
         except Exception as exc:
             logger.warning("Browser exploration failed, falling back to HTTP fetch: %s", exc)
@@ -369,48 +499,55 @@ def run_web_research(
         facts_added += added
         visited_urls.add(browser_page.url)
 
-    total_candidates = len(candidates)
-    for idx, row in enumerate(candidates, start=1):
-        if browser_completed:
+    fetch_tiers = [
+        ("official", official_candidates),
+        ("secondary", secondary_candidates),
+    ]
+    for tier_name, tier_rows in fetch_tiers:
+        if browser_completed or result.goal_met:
             break
-        if normalize_url(row.url) in visited_urls or row.url in visited_urls:
+        if not tier_rows:
             continue
-        if pages_fetched >= page_budget:
-            break
-        if emit_events:
-            web_events.web_progress(
-                step="fetch",
-                url=row.url,
-                index=idx,
-                total=total_candidates,
-                message=f"Fetching {row.title or row.url}",
-            )
-        page = fetch_page_tier1(
-            row.url,
-            timeout_sec=float(cfg["fetch_timeout_sec"]),
-            max_chars=int(cfg["content_max_chars"]),
-        )
-        if not page.ok:
-            err = f"{row.url}: {page.error or 'fetch failed'}"
-            result.errors.append(err)
+        total_candidates = len(tier_rows)
+        for idx, row in enumerate(tier_rows, start=1):
+            if pages_fetched >= page_budget:
+                break
+            if normalize_url(row.url) in visited_urls or row.url in visited_urls:
+                continue
             if emit_events:
-                web_events.log(err, level="warning")
-            continue
+                web_events.web_progress(
+                    step="fetch",
+                    url=row.url,
+                    index=idx,
+                    total=total_candidates,
+                    message=f"Fetching {tier_name} source: {row.title or row.url}",
+                )
+            page = fetch_page_tier1(
+                row.url,
+                timeout_sec=float(cfg["fetch_timeout_sec"]),
+                max_chars=int(cfg["content_max_chars"]),
+            )
+            if not page.ok:
+                err = f"{row.url}: {page.error or 'fetch failed'}"
+                result.errors.append(err)
+                if emit_events:
+                    web_events.log(err, level="warning")
+                continue
 
-        index, facts_doc, added = _ingest_page(
-            page,
-            row,
-            spec,
-            query,
-            index,
-            facts_doc,
-            project_path,
-            use_llm,
-            cfg,
-            emit_events,
-        )
-        pages_fetched += 1
-        facts_added += added
+            index, facts_doc, added = _ingest_page(
+                page,
+                row,
+                spec,
+                query,
+                index,
+                facts_doc,
+                project_path,
+                use_llm,
+                cfg,
+                emit_events,
+            )
+            pages_fetched += 1
+            facts_added += added
 
     save_index(project_path, index)
     save_facts(project_path, facts_doc)

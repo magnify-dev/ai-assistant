@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import logging
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_SEARCH_TIMEOUT_SEC = 30.0
 
 
 @dataclass

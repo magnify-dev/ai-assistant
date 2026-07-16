@@ -12,6 +12,7 @@ logger = logging.getLogger(__name__)
 
 PROMPT_LABELS: dict[str, str] = {
     "web_research.spec": "Research plan",
+    "web_research.classify_sources": "Source classification",
     "web_research.browse_decide": "Browse decision",
     "web_research.plan_form_values": "Form value plan",
     "web_research.extract": "Fact extraction",

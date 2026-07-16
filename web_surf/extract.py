@@ -4,6 +4,7 @@ import logging
 import re
 from typing import Any
 
+from web_surf import events
 from web_surf.context_curate import curate_extract_context
 from web_surf.llm import ollama_chat_json
 from web_surf.spec import _get_prompt
@@ -88,14 +89,46 @@ def extract_facts_from_page(
         page_url=page_url,
     )
     if not parsed:
+        events.extract_preview(
+            {
+                "phase": "llm_extract",
+                "url": page_url,
+                "step_id": source_step_id,
+                "snapshot_id": source_snapshot_id,
+                "input_chars": len(clipped),
+                "curated_chars": len(user),
+                "text_preview": clipped[:1500],
+                "raw_fact_count": 0,
+                "accepted_count": 0,
+                "rejected_count": 0,
+                "error": "llm returned no parseable json",
+            }
+        )
         return [], ""
 
     summary = str(parsed.get("page_summary") or "").strip()
     raw_facts = parsed.get("facts")
     if not isinstance(raw_facts, list):
+        events.extract_preview(
+            {
+                "phase": "llm_extract",
+                "url": page_url,
+                "step_id": source_step_id,
+                "snapshot_id": source_snapshot_id,
+                "input_chars": len(clipped),
+                "curated_chars": len(user),
+                "text_preview": clipped[:1500],
+                "page_summary": summary,
+                "raw_fact_count": 0,
+                "accepted_count": 0,
+                "rejected_count": 0,
+                "error": "llm response missing facts array",
+            }
+        )
         return [], summary
 
     accepted: list[dict[str, Any]] = []
+    rejected: list[dict[str, Any]] = []
     for item in raw_facts:
         if not isinstance(item, dict):
             continue
@@ -103,8 +136,24 @@ def extract_facts_from_page(
         value = str(item.get("value") or "").strip()
         quote = str(item.get("quote") or "").strip()
         if not field or not value or not quote:
+            rejected.append(
+                {
+                    "field": field,
+                    "value": value,
+                    "quote": quote[:240],
+                    "reason": "missing field, value, or quote",
+                }
+            )
             continue
         if not quote_supported(quote, clipped):
+            rejected.append(
+                {
+                    "field": field,
+                    "value": value,
+                    "quote": quote[:240],
+                    "reason": "quote not found in page text",
+                }
+            )
             continue
         accepted.append(
             {
@@ -118,4 +167,21 @@ def extract_facts_from_page(
                 "source_snapshot_id": source_snapshot_id,
             }
         )
+    events.extract_preview(
+        {
+            "phase": "llm_extract",
+            "url": page_url,
+            "step_id": source_step_id,
+            "snapshot_id": source_snapshot_id,
+            "input_chars": len(clipped),
+            "curated_chars": len(user),
+            "text_preview": clipped[:1500],
+            "page_summary": summary,
+            "raw_fact_count": len(raw_facts),
+            "accepted_count": len(accepted),
+            "rejected_count": len(rejected),
+            "facts": accepted[:20],
+            "rejected": rejected[:20],
+        }
+    )
     return accepted, summary

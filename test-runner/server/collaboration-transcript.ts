@@ -97,6 +97,13 @@ export function buildConversationContext(cards: AgentCard[]): string {
   return lines.join("\n").trim();
 }
 
+/** Last N completed cards only — for follow-up handoffs without repeating full history. */
+export function buildRecentConversationContext(cards: AgentCard[], maxCards = 2): string {
+  const done = cards.filter((c) => c.status !== "running");
+  if (!done.length) return "";
+  return buildConversationContext(done.slice(-maxCards));
+}
+
 export function lastHelperResponse(cards: AgentCard[]): string {
   for (let i = cards.length - 1; i >= 0; i--) {
     const card = cards[i];

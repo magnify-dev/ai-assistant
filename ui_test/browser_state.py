@@ -13,6 +13,10 @@ else:
 
 _INTERACTABLE_JS = """() => {
   function isVisible(el) {
+    const tag = el.tagName.toLowerCase();
+    if (el.closest("[role='dialog'], [aria-modal='true'], dialog[open]")) {
+      if (tag === "select" || tag === "input" || tag === "textarea") return true;
+    }
     const rect = el.getBoundingClientRect();
     if (rect.width <= 0 || rect.height <= 0) return false;
     const style = getComputedStyle(el);
@@ -45,12 +49,43 @@ _INTERACTABLE_JS = """() => {
     if (!landmark) return "";
     return clean(landmark.getAttribute("aria-label") || landmark.getAttribute("role") || landmark.tagName.toLowerCase(), 80);
   }
+  function collapseMeta(el) {
+    const toggle = el.matches("[data-toggle='collapse'], [data-bs-toggle='collapse']")
+      ? el
+      : el.closest("[data-toggle='collapse'], [data-bs-toggle='collapse']");
+    if (!toggle) return null;
+    const targetSel = toggle.getAttribute("data-target")
+      || toggle.getAttribute("data-bs-target")
+      || toggle.getAttribute("href")
+      || "";
+    let panel = null;
+    if (targetSel && targetSel.startsWith("#")) {
+      panel = document.querySelector(targetSel);
+    }
+    if (!panel) {
+      panel = toggle.closest(".panel, [class*='accordion']")
+        ?.querySelector(".panel-collapse, .collapse");
+    }
+    let collapsed = true;
+    if (panel) {
+      const style = getComputedStyle(panel);
+      collapsed = !panel.classList.contains("in")
+        && !panel.classList.contains("show")
+        && (style.display === "none" || panel.offsetHeight < 8);
+    }
+    return {
+      expands_section: true,
+      collapsed,
+      toggle_target: targetSel || null,
+      data_toggle: toggle.getAttribute("data-toggle") || toggle.getAttribute("data-bs-toggle") || "collapse",
+    };
+  }
   function nearbyText(el) {
     const parent = el.closest("li,td,th,p,div,section,form") || el.parentElement;
     return parent ? clean(parent.innerText || parent.textContent, 220) : "";
   }
   const selector =
-    "a[href], button, input:not([type='hidden']), select, textarea, summary, [role='button'], [role='link'], [role='menuitem'], [tabindex]:not([tabindex='-1'])";
+    "a[href], button, blz-button, blz-select, input:not([type='hidden']), select, textarea, summary, [role='button'], [role='link'], [role='menuitem'], [role='textbox'], [role='combobox'], [role='spinbutton'], [role='searchbox'], [contenteditable=''], [contenteditable='true'], [tabindex]:not([tabindex='-1']), [data-toggle='collapse'], [data-bs-toggle='collapse']";
   const roots = [document];
   const seenRoots = new Set(roots);
   const raw = [];
@@ -72,17 +107,27 @@ _INTERACTABLE_JS = """() => {
     const role = el.getAttribute("role") || "";
     let kind = tag;
     if (tag === "a") kind = "link";
-    else if (tag === "button") kind = "button";
+    else if (tag === "button" || tag === "blz-button") kind = tag === "blz-button" ? "blz-button" : "button";
     else if (tag === "input") kind = "input";
-    const text = textOf(el);
+    else if (role === "textbox" || role === "searchbox") kind = "textbox";
+    else if (role === "combobox") kind = "combobox";
+    else if (role === "spinbutton") kind = "spinbutton";
     const aria = (el.getAttribute("aria-label") || "").trim();
+    const fieldName = (el.getAttribute("name") || "").trim();
+    let text = textOf(el);
+    if (tag === "select") {
+      text = aria || fieldName || associatedLabel(el) || text.slice(0, 40);
+    } else if (kind === "textbox" || kind === "combobox" || kind === "spinbutton") {
+      text = aria || fieldName || associatedLabel(el) || el.getAttribute("placeholder") || text.slice(0, 40);
+    }
     const href = el.href || "";
     const disabled = Boolean(el.disabled || el.getAttribute("aria-disabled") === "true");
-    const key = `${kind}|${testId}|${text}|${aria}|${href}`;
+    const key = `${kind}|${testId}|${text}|${aria}|${href}|${fieldName}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    if (!text && !aria && !testId && !href && kind !== "input" && kind !== "select" && kind !== "textarea") continue;
-    out.push({
+    if (!text && !aria && !testId && !href && !fieldName && kind !== "input" && kind !== "select" && kind !== "textarea" && kind !== "textbox" && kind !== "combobox" && kind !== "spinbutton") continue;
+    const collapse = collapseMeta(el);
+    const row = {
       index: out.length,
       kind,
       test_id: testId || null,
@@ -92,9 +137,10 @@ _INTERACTABLE_JS = """() => {
       href: href || null,
       input_type: el.type || null,
       disabled,
-      name: el.name || null,
+      name: fieldName || el.name || null,
       placeholder: el.placeholder || null,
-      value: (tag === "input" || tag === "textarea" || tag === "select") ? String(el.value || "").slice(0, 120) : null,
+      value: (tag === "input" || tag === "textarea" || tag === "select" || kind === "textbox" || kind === "combobox" || kind === "spinbutton" || el.isContentEditable) ? String(el.value || "").slice(0, 120) : null,
+      readonly: Boolean(el.readOnly || el.getAttribute("aria-readonly") === "true"),
       label: associatedLabel(el) || null,
       title: clean(el.getAttribute("title"), 120) || null,
       nearest_heading: nearestHeading(el) || null,
@@ -103,9 +149,168 @@ _INTERACTABLE_JS = """() => {
       expanded: el.getAttribute("aria-expanded"),
       selected: Boolean(el.selected || el.getAttribute("aria-selected") === "true"),
       checked: Boolean(el.checked || el.getAttribute("aria-checked") === "true"),
-    });
+    };
+    if (collapse) Object.assign(row, collapse);
+    out.push(row);
+    if (tag === "select") {
+      const last = out[out.length - 1];
+      const optEntries = Array.from(el.options || []).slice(0, 40);
+      const opts = optEntries
+        .map((o) => String(o.label || o.text || o.value || "").trim())
+        .filter(Boolean);
+      const optValues = optEntries
+        .map((o) => String(o.value || "").trim())
+        .filter(Boolean);
+      if (opts.length) last.options = opts;
+      if (optValues.length) last.option_values = optValues;
+      const selected = el.selectedIndex >= 0 ? el.options[el.selectedIndex] : null;
+      if (selected) {
+        last.selected_label = String(selected.label || selected.text || selected.value || "").trim() || null;
+      }
+    }
   }
   return { items: out.slice(0, 400), total: out.length };
+}"""
+
+_DIALOG_FORM_CONTROLS_JS = """() => {
+  function clean(value, limit = 160) {
+    return String(value || "").trim().replace(/\\s+/g, " ").slice(0, limit);
+  }
+  function textOf(el) {
+    return clean(el.innerText || el.textContent || "", 120);
+  }
+  function associatedLabel(el) {
+    if (el.labels && el.labels.length) {
+      return clean(Array.from(el.labels).map((node) => textOf(node)).join(" "));
+    }
+    const id = el.getAttribute("id");
+    if (id) {
+      const label = document.querySelector(`label[for="${CSS.escape(id)}"]`);
+      if (label) return textOf(label);
+    }
+    const parent = el.closest("label");
+    return parent ? textOf(parent) : "";
+  }
+  function nearestHeading(el) {
+    const section = el.closest("section,article,main,nav,aside,form,[role='region'],[role='dialog']");
+    const heading = section && section.querySelector("h1,h2,h3,h4,[role='heading']");
+    return heading ? textOf(heading) : "";
+  }
+  function landmarkOf(el) {
+    const landmark = el.closest("nav,main,aside,header,footer,form,[role='dialog'],[role]");
+    if (!landmark) return "";
+    return clean(landmark.getAttribute("aria-label") || landmark.getAttribute("role") || landmark.tagName.toLowerCase(), 80);
+  }
+  function nearbyText(el) {
+    const parent = el.closest("li,td,th,p,div,section,form,label") || el.parentElement;
+    return parent ? clean(parent.innerText || parent.textContent, 220) : "";
+  }
+  function collectFromRoot(root, modalRoot) {
+    const selector =
+      "select, input:not([type='hidden']), textarea, button, blz-button, blz-select, [role='combobox'], [role='textbox'], [role='spinbutton'], [role='button']";
+    const rows = [];
+    for (const el of root.querySelectorAll(selector)) {
+      const tag = el.tagName.toLowerCase();
+      const role = el.getAttribute("role") || "";
+      let kind = tag;
+      if (tag === "button" || tag === "blz-button") kind = tag === "blz-button" ? "blz-button" : "button";
+      else if (tag === "input") kind = "input";
+      else if (role === "textbox") kind = "textbox";
+      else if (role === "combobox") kind = "combobox";
+      else if (role === "spinbutton") kind = "spinbutton";
+      const aria = clean(el.getAttribute("aria-label") || "", 120);
+      const fieldName = clean(el.getAttribute("name") || el.name || "", 80);
+      let text = textOf(el);
+      if (tag === "select") {
+        text = aria || fieldName || associatedLabel(el) || text.slice(0, 40);
+      } else if (kind === "textbox" || kind === "combobox" || kind === "spinbutton") {
+        text = aria || fieldName || associatedLabel(el) || clean(el.getAttribute("placeholder") || "", 80) || text.slice(0, 40);
+      }
+      const row = {
+        index: rows.length,
+        kind,
+        test_id: clean(el.getAttribute("data-testid") || "", 80) || null,
+        role: role || null,
+        text: text || null,
+        aria: aria || null,
+        href: el.href || null,
+        input_type: el.type || null,
+        disabled: Boolean(el.disabled || el.getAttribute("aria-disabled") === "true"),
+        name: fieldName || null,
+        placeholder: clean(el.placeholder || "", 120) || null,
+        value: (tag === "input" || tag === "textarea" || tag === "select" || kind === "textbox" || kind === "combobox" || kind === "spinbutton" || el.isContentEditable)
+          ? String(el.value || "").slice(0, 120)
+          : null,
+        readonly: Boolean(el.readOnly || el.getAttribute("aria-readonly") === "true"),
+        label: associatedLabel(el) || null,
+        title: clean(el.getAttribute("title") || "", 120) || null,
+        nearest_heading: nearestHeading(el) || null,
+        landmark: landmarkOf(el) || null,
+        nearby_text: nearbyText(el) || null,
+        in_dialog: true,
+        dialog_label: clean(modalRoot.getAttribute("aria-label") || modalRoot.getAttribute("aria-labelledby") || textOf(modalRoot).slice(0, 80), 120) || null,
+      };
+      if (tag === "select") {
+        const optEntries = Array.from(el.options || []).slice(0, 40);
+        const opts = optEntries.map((o) => clean(o.label || o.text || o.value || "", 80)).filter(Boolean);
+        const optValues = optEntries.map((o) => clean(o.value || "", 80)).filter(Boolean);
+        if (opts.length) row.options = opts;
+        if (optValues.length) row.option_values = optValues;
+        const selected = el.selectedIndex >= 0 ? el.options[el.selectedIndex] : null;
+        if (selected) row.selected_label = clean(selected.label || selected.text || selected.value || "", 80) || null;
+      }
+      rows.push(row);
+    }
+    return rows;
+  }
+  function modalRoots() {
+    const roots = [document];
+    const seen = new Set(roots);
+    for (let i = 0; i < roots.length; i++) {
+      for (const host of roots[i].querySelectorAll("*")) {
+        if (host.shadowRoot && !seen.has(host.shadowRoot)) {
+          seen.add(host.shadowRoot);
+          roots.push(host.shadowRoot);
+        }
+      }
+    }
+    const modals = [];
+    const modalSelector = "[role='dialog'], [aria-modal='true'], dialog[open]";
+    for (const root of roots) {
+      for (const modal of root.querySelectorAll(modalSelector)) {
+        modals.push({ modal, root });
+        for (const host of modal.querySelectorAll("*")) {
+          if (host.shadowRoot && !seen.has(host.shadowRoot)) {
+            seen.add(host.shadowRoot);
+            roots.push(host.shadowRoot);
+            modals.push({ modal, root: host.shadowRoot });
+          }
+        }
+      }
+    }
+    return modals;
+  }
+  const out = [];
+  const seen = new Set();
+  for (const { modal, root } of modalRoots()) {
+    for (const row of collectFromRoot(root === modal.getRootNode() ? modal : root, modal)) {
+      const key = `${row.kind}|${row.name || ""}|${row.text || ""}|${row.aria || ""}|${row.label || ""}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      row.index = out.length;
+      out.push(row);
+    }
+    if (root !== modal.getRootNode()) {
+      for (const row of collectFromRoot(modal, modal)) {
+        const key = `${row.kind}|${row.name || ""}|${row.text || ""}|${row.aria || ""}|${row.label || ""}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        row.index = out.length;
+        out.push(row);
+      }
+    }
+  }
+  return out.slice(0, 80);
 }"""
 
 _BLOCKING_OVERLAYS_JS = """() => {
@@ -117,17 +322,40 @@ _BLOCKING_OVERLAYS_JS = """() => {
   function clean(value, limit = 300) {
     return String(value || "").trim().replace(/\\s+/g, " ").slice(0, limit);
   }
+  function isBlockingOverlay(el) {
+    const style = getComputedStyle(el);
+    const rect = el.getBoundingClientRect();
+    const role = el.getAttribute("role") || "";
+    const ariaModal = el.getAttribute("aria-modal") === "true";
+    const tag = el.tagName.toLowerCase();
+    const text = clean(el.innerText || el.textContent, 400).toLowerCase();
+    const label = clean(el.getAttribute("aria-label") || el.getAttribute("aria-labelledby"), 200).toLowerCase();
+    const blob = `${text} ${label}`.trim();
+    const gateText = /\\b(age|cookie|consent|privacy|verify|gdpr|ccpa|before you continue|date of birth|too young)\\b/.test(blob);
+    const falsePositive = /\\b(launch trailer|watch next|play video|leaderboard|permadeath|difficulty|mini.?game)\\b/.test(blob);
+    if (falsePositive && !gateText) return false;
+    if (role === "dialog" || ariaModal || (tag === "dialog" && el.open)) return true;
+    if (gateText) {
+      const fixed = style.position === "fixed" || style.position === "sticky";
+      const coversViewport = rect.width > window.innerWidth * 0.35 && rect.height > window.innerHeight * 0.15;
+      if (fixed || coversViewport || gateText) return true;
+    }
+    const className = String(el.className || "").toLowerCase();
+    if (/\\b(modal|gate|consent)\\b/.test(className) && gateText) return true;
+    return false;
+  }
   const roots = [document];
   const seenRoots = new Set(roots);
   const overlays = [];
   for (let rootIndex = 0; rootIndex < roots.length; rootIndex++) {
     const root = roots[rootIndex];
-    for (const el of root.querySelectorAll("[role='dialog'], [aria-modal='true'], dialog[open], blz-age-gate, [class*='modal'], [class*='overlay']")) {
-      if (!visible(el)) continue;
+    for (const el of root.querySelectorAll("[role='dialog'], [aria-modal='true'], dialog[open], [class*='modal'], [class*='overlay'], [class*='gate'], [class*='consent']")) {
+      if (!visible(el) || !isBlockingOverlay(el)) continue;
       const text = clean(el.innerText || el.textContent);
       const label = clean(el.getAttribute("aria-label") || el.getAttribute("aria-labelledby"));
       const tag = el.tagName.toLowerCase();
-      if (!text && !label && !tag.includes("age")) continue;
+      const isCustomHost = tag.includes("-") && el.shadowRoot;
+      if (!text && !label && !isCustomHost) continue;
       overlays.push({
         id: el.id || `${tag}-${overlays.length + 1}`,
         tag,
@@ -146,6 +374,47 @@ _BLOCKING_OVERLAYS_JS = """() => {
   }
   return overlays.slice(0, 20);
 }"""
+
+
+_OVERLAY_GATE_KEYWORDS_RE = re.compile(
+    r"\b(age.?verif\w*|verify your age|confirm your age|date of birth|birth.?year|"
+    r"too young|enter your age|before you continue|we value your privacy|"
+    r"cookie|consent|privacy preferences|gdpr|ccpa|accept all cookies)\b",
+    re.I,
+)
+_OVERLAY_FALSE_POSITIVE_RE = re.compile(
+    r"\b(launch trailer|watch next|play video|leaderboard|permadeath|"
+    r"mini.?game|difficulty|start leaderboard)\b",
+    re.I,
+)
+
+
+def _overlay_text_blob(overlay: dict[str, Any]) -> str:
+    return " ".join(
+        str(overlay.get(key) or "")
+        for key in ("text", "label", "id", "tag", "role")
+    ).lower()
+
+
+def filter_blocking_overlays(overlays: list[Any]) -> list[dict[str, Any]]:
+    """Drop video players and other non-blocking elements mis-tagged as overlays."""
+    filtered: list[dict[str, Any]] = []
+    for raw in overlays or []:
+        if not isinstance(raw, dict):
+            continue
+        blob = _overlay_text_blob(raw)
+        if not blob.strip():
+            continue
+        if _OVERLAY_FALSE_POSITIVE_RE.search(blob) and not _OVERLAY_GATE_KEYWORDS_RE.search(blob):
+            continue
+        role = str(raw.get("role") or "").lower()
+        tag = str(raw.get("tag") or "").lower()
+        if role == "dialog" or tag == "dialog":
+            filtered.append(raw)
+            continue
+        if _OVERLAY_GATE_KEYWORDS_RE.search(blob):
+            filtered.append(raw)
+    return filtered
 
 _SEMANTIC_JS = """() => {
   function visible(el) {
@@ -177,27 +446,62 @@ def _id_slug(value: Any) -> str:
     return slug[:48]
 
 
+def _widget_for_item(item: dict[str, Any]) -> str:
+    """Describe how the agent should interact with a form control."""
+    kind = str(item.get("kind") or "").lower()
+    role = str(item.get("role") or "").lower()
+    input_type = str(item.get("input_type") or "").lower()
+    if kind == "select":
+        return "select"
+    if kind == "combobox" or role == "combobox":
+        return "combobox"
+    if kind == "textarea":
+        return "textarea"
+    if role == "spinbutton" or input_type == "number":
+        return "number"
+    if input_type in {"date", "email", "tel", "search", "password"}:
+        return input_type
+    if kind in {"input", "textbox"} or role in {"textbox", "searchbox"}:
+        return "text"
+    return kind or "text"
+
+
 def _interactable_action_hint(item: dict[str, Any]) -> str:
     kind = str(item.get("kind") or "").lower()
     label = str(item.get("text") or item.get("aria") or item.get("label") or "").strip()
     href = str(item.get("href") or "").strip()
+    widget = _widget_for_item(item)
     if kind == "link" and href:
         return f"Follow this link to {href}."
     if kind == "button":
         return f'Click this button to "{label}".' if label else "Click this button."
-    if kind in {"input", "textarea"}:
-        field = label or str(item.get("placeholder") or "this field").strip()
+    if widget in {"select", "combobox"}:
+        options = item.get("options") if isinstance(item.get("options"), list) else []
+        field = label or str(item.get("name") or "this menu").strip()
+        if options:
+            preview = ", ".join(str(opt) for opt in options[:4])
+            suffix = "..." if len(options) > 4 else ""
+            return f'Choose an option in {field} (dropdown: {preview}{suffix}).'
+        return f"Choose an option in {field}."
+    if widget in {"text", "number", "date", "email", "tel", "search", "textarea"}:
+        field = label or str(item.get("placeholder") or item.get("name") or "this field").strip()
+        if widget == "number":
+            return f"Enter a number in {field}."
         return f"Enter text in {field}."
-    if kind == "select":
-        return f"Choose an option in {label or 'this menu'}."
-    if kind == "summary":
-        return f"Expand or collapse {label or 'this section'}."
+    if kind == "summary" or item.get("expands_section"):
+        state = "collapsed" if item.get("collapsed") else "expanded"
+        return f"Expand or collapse {label or 'this section'} ({state})."
     return f"Interact with {label or 'this control'}."
 
 
 def _stable_interactable_id(item: dict[str, Any], occurrence: int) -> str:
     kind = _id_slug(item.get("kind") or item.get("role") or "element")
-    label = _id_slug(item.get("test_id") or item.get("text") or item.get("aria") or item.get("name"))
+    if str(item.get("kind") or "").lower() == "select":
+        label = _id_slug(
+            item.get("name") or item.get("aria") or item.get("label") or item.get("test_id")
+        )
+    else:
+        label = _id_slug(item.get("test_id") or item.get("text") or item.get("aria") or item.get("name"))
     if label:
         suffix = f"-{occurrence + 1}" if occurrence else ""
         return f"el-{kind}-{label}{suffix}"
@@ -207,6 +511,64 @@ def _stable_interactable_id(item: dict[str, Any], occurrence: int) -> str:
     )
     digest = hashlib.sha256(f"{signature}|{occurrence}".encode("utf-8")).hexdigest()[:12]
     return f"el_{digest}"
+
+
+def _interactable_dedupe_key(item: dict[str, Any]) -> str:
+    return "|".join(
+        str(item.get(key) or "").strip().lower()
+        for key in ("kind", "role", "test_id", "text", "aria", "href", "name", "placeholder", "label")
+    )
+
+
+def _merge_interactables(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for group in groups:
+        for raw in group:
+            if not isinstance(raw, dict):
+                continue
+            key = _interactable_dedupe_key(raw)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(dict(raw))
+    for index, item in enumerate(merged):
+        item["index"] = index
+    return merged
+
+
+def _infer_gate_interactables_from_overlays(overlays: list[Any]) -> list[dict[str, Any]]:
+    """When modal controls are not exposed in the DOM tree, infer year/month/day fields from overlay copy."""
+    inferred: list[dict[str, Any]] = []
+    for raw in overlays or []:
+        if not isinstance(raw, dict):
+            continue
+        blob = f"{raw.get('text') or ''} {raw.get('label') or ''}".lower()
+        if not re.search(r"\b(year|month|day|date of birth|birth)\b", blob):
+            continue
+        if not re.search(r"\bage\b|\bverif", blob):
+            continue
+        for name, label in (("year", "year"), ("month", "month"), ("day", "day")):
+            if name not in blob:
+                continue
+            inferred.append(
+                {
+                    "index": len(inferred),
+                    "kind": "select",
+                    "role": None,
+                    "text": label,
+                    "aria": label,
+                    "name": name,
+                    "label": label,
+                    "disabled": False,
+                    "in_dialog": True,
+                    "dialog_label": str(raw.get("label") or raw.get("text") or "")[:120],
+                    "inferred_from_overlay": True,
+                }
+            )
+        if inferred:
+            break
+    return inferred
 
 
 def _enrich_interactables(items: Any, page_url: str) -> list[dict[str, Any]]:
@@ -228,6 +590,7 @@ def _enrich_interactables(items: Any, page_url: str) -> list[dict[str, Any]]:
         occurrence = occurrences.get(signature, 0)
         occurrences[signature] = occurrence + 1
         item["id"] = _stable_interactable_id(item, occurrence)
+        item["widget"] = _widget_for_item(item)
         item["action_hint"] = _interactable_action_hint(item)
         result.append(item)
     return result
@@ -296,6 +659,10 @@ def collect_page_state(page: Page, *, include_screenshot: bool = True) -> dict[s
     except Exception:
         raw_interactables = []
     try:
+        dialog_controls = page.evaluate(_DIALOG_FORM_CONTROLS_JS)
+    except Exception:
+        dialog_controls = []
+    try:
         semantic = page.evaluate(_SEMANTIC_JS)
     except Exception:
         semantic = {}
@@ -309,7 +676,17 @@ def collect_page_state(page: Page, *, include_screenshot: bool = True) -> dict[s
         title = ""
     page_url = str(page.url)
     raw_items = raw_interactables.get("items") if isinstance(raw_interactables, dict) else raw_interactables
-    interactables = _enrich_interactables(raw_items, page_url)
+    filtered_overlays = filter_blocking_overlays(
+        blocking_overlays if isinstance(blocking_overlays, list) else []
+    )
+    dialog_items = dialog_controls if isinstance(dialog_controls, list) else []
+    inferred_items = _infer_gate_interactables_from_overlays(filtered_overlays)
+    merged_items = _merge_interactables(
+        raw_items if isinstance(raw_items, list) else [],
+        dialog_items,
+        inferred_items,
+    )
+    interactables = _enrich_interactables(merged_items, page_url)
     interactable_total = (
         int(raw_interactables.get("total") or len(interactables))
         if isinstance(raw_interactables, dict)
@@ -333,7 +710,7 @@ def collect_page_state(page: Page, *, include_screenshot: bool = True) -> dict[s
         "landmarks": semantic.get("landmarks") if isinstance(semantic.get("landmarks"), list) else [],
         "visible_text": str(semantic.get("visible_text") or ""),
         "discovered_routes": routes,
-        "blocking_overlays": blocking_overlays if isinstance(blocking_overlays, list) else [],
+        "blocking_overlays": filtered_overlays,
     }
     if include_screenshot:
         shot = capture_screenshot_b64(page)

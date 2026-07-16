@@ -409,6 +409,138 @@ function fallbackExpand(taskText: string, projectPath: string, extra?: { verific
   };
 }
 
+export type HelperInterventionDecision = {
+  action: "answer" | "retry" | "escalate";
+  reason: string;
+  answer?: string;
+};
+
+export type InterventionSituation =
+  | "web_research_insufficient"
+  | "ui_question_unanswered"
+  | "ui_verification_failed"
+  | "pipeline_failed";
+
+function fallbackInterventionDecision(
+  taskText: string,
+  input: {
+    situation: InterventionSituation;
+    findings: string;
+    iteration: number;
+    maxIterations: number;
+    webStats?: { pages_fetched: number; facts_added: number; goal_met: boolean };
+  },
+): HelperInterventionDecision {
+  const needsImpl = taskRequiresImplementation(taskText);
+  const findings = input.findings.trim();
+
+  if (input.situation === "web_research_insufficient") {
+    const pages = input.webStats?.pages_fetched ?? 0;
+    const facts = input.webStats?.facts_added ?? 0;
+    const goalMet = input.webStats?.goal_met ?? false;
+    if (!goalMet && pages === 0 && facts === 0 && input.iteration < input.maxIterations) {
+      return { action: "retry", reason: "Browser research fetched no pages — retry exploration" };
+    }
+    if (!goalMet && input.iteration < input.maxIterations) {
+      return { action: "retry", reason: "Research goal not met — retry with different navigation" };
+    }
+  }
+
+  if (!needsImpl) {
+    if (findings) {
+      return { action: "answer", reason: "Return local research findings", answer: findings };
+    }
+    if (input.iteration < input.maxIterations) {
+      return { action: "retry", reason: "Retry local web research" };
+    }
+    return {
+      action: "answer",
+      reason: "Local research exhausted without helper",
+      answer: findings || "Could not complete research with local tools.",
+    };
+  }
+
+  if (input.situation === "pipeline_failed" || input.situation === "ui_verification_failed") {
+    if (input.iteration < 2) {
+      return { action: "retry", reason: "Retry local pipeline before involving helper" };
+    }
+    return { action: "escalate", reason: "Implementation task needs helper after local failure" };
+  }
+
+  if (findings) {
+    return { action: "answer", reason: "Best-effort local answer", answer: findings };
+  }
+  if (input.iteration < input.maxIterations) {
+    return { action: "retry", reason: "Retry local work" };
+  }
+  return { action: "escalate", reason: "Local attempts exhausted for implementation task" };
+}
+
+export async function decideHelperIntervention(
+  taskText: string,
+  input: {
+    situation: InterventionSituation;
+    findings: string;
+    suggestedHandoff?: string;
+    iteration: number;
+    maxIterations: number;
+    webStats?: { pages_fetched: number; facts_added: number; goal_met: boolean };
+  },
+  noOllama = false,
+): Promise<HelperInterventionDecision> {
+  if (noOllama) {
+    return fallbackInterventionDecision(taskText, input);
+  }
+
+  const cfg = readOllamaConfig();
+  const userContent = [
+    `User task:\n${taskText}`,
+    `Situation: ${input.situation}`,
+    `Iteration: ${input.iteration} of ${input.maxIterations}`,
+    `Requires implementation (heuristic): ${taskRequiresImplementation(taskText)}`,
+    input.webStats
+      ? `Web research stats: pages_fetched=${input.webStats.pages_fetched}, facts_added=${input.webStats.facts_added}, goal_met=${input.webStats.goal_met}`
+      : "",
+    `\nLocal findings:\n${input.findings || "(none)"}`,
+    input.suggestedHandoff ? `\nSuggested handoff if escalating:\n${input.suggestedHandoff.slice(0, 2000)}` : "",
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+  try {
+    const res = await fetch(`${cfg.url.replace(/\/$/, "")}/api/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: cfg.model,
+        messages: [
+          { role: "system", content: getPrompt("collaboration.intervention_decide") },
+          { role: "user", content: userContent },
+        ],
+        stream: false,
+        format: "json",
+      }),
+      signal: AbortSignal.timeout(60_000),
+    });
+    if (!res.ok) {
+      return fallbackInterventionDecision(taskText, input);
+    }
+    const data = (await res.json()) as { message?: { content?: string } };
+    const parsed = extractJson(data.message?.content ?? "");
+    const action = String(parsed?.action ?? "").toLowerCase();
+    if (action === "answer" || action === "retry" || action === "escalate") {
+      return {
+        action,
+        reason: String(parsed?.reason ?? action).trim() || action,
+        answer: String(parsed?.answer ?? "").trim() || undefined,
+      };
+    }
+  } catch {
+    /* fall through */
+  }
+  return fallbackInterventionDecision(taskText, input);
+}
+
 export function triageTask(
   taskText: string,
   opts?: { previousHelperResponse?: string; helperSucceeded?: boolean },
@@ -420,16 +552,16 @@ export function triageTask(
   if (!needsImpl) {
     return {
       action: "test",
-      summary: "Explore the app to answer your question",
-      reason: "Informational task — run UI tests",
+      summary: "Explore or research to answer your question",
+      reason: "Informational task — local agent works first",
     };
   }
 
   if (!helperSucceeded || !previousHelperResponse?.trim()) {
     return {
-      action: "handoff",
-      summary: "Expand task and hand off to implementation agent",
-      reason: "Implementation task with no successful helper run yet — skip baseline testing",
+      action: "test",
+      summary: "Run local tests before involving the helper",
+      reason: "Implementation task — local agent establishes baseline first",
     };
   }
 
@@ -845,8 +977,15 @@ export function verifyAfterWebResearch(
     kind: "question",
     prompt: buildWebResearchQuestionPrompt(taskText, findings || answer || errors.join("; ")),
     answer: answer || errors.join("; ") || "Web research did not produce a reliable answer.",
-    summary: "Web research insufficient — asking helper agent",
+    summary:
+      pagesFetched === 0 && factsAdded === 0
+        ? "Web research stalled (0 pages) — will retry"
+        : "Web research insufficient — asking helper agent",
     testsPassed: false,
+    failureNote:
+      pagesFetched === 0 && factsAdded === 0
+        ? `Web research fetched 0 pages and 0 facts (goal_met=${goalMet})`
+        : undefined,
   };
 }
 

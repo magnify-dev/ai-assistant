@@ -14,6 +14,7 @@ export type CursorRunOptions = {
 };
 
 const CONNECT_TIMEOUT_MS = 90_000;
+const CONNECT_RETRY_DELAY_MS = 2_000;
 
 function connectionTimeoutMessage(runtime: CursorRuntime): string {
   const base = `Cursor connection timed out after ${CONNECT_TIMEOUT_MS / 1000}s.`;
@@ -213,7 +214,30 @@ export class CursorRunner extends EventEmitter {
         throw new Error("repoUrl is required for cloud runtime");
       }
 
-      const agent = await this.createAgent(options, modelId, generation);
+      let agent;
+      try {
+        agent = await this.createAgent(options, modelId, generation);
+      } catch (firstErr) {
+        const timedOut =
+          firstErr instanceof Error && firstErr.message.includes("timed out");
+        if (
+          options.runtime === "local" &&
+          timedOut &&
+          !this.abortRequested &&
+          generation === this.runGeneration
+        ) {
+          this.emit("event", {
+            type: "log",
+            message:
+              "Cursor connection timed out — retrying once. Ensure the Cursor desktop app is open and idle.",
+            level: "warn",
+          });
+          await new Promise((resolve) => setTimeout(resolve, CONNECT_RETRY_DELAY_MS));
+          agent = await this.createAgent(options, modelId, generation);
+        } else {
+          throw firstErr;
+        }
+      }
       if (generation !== this.runGeneration) {
         return { ok: false, cancelled: true, error: "Cancelled by user" };
       }

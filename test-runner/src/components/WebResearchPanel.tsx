@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import type {
   WebResearchItem,
   WebResearchLlmExchange,
+  WebResearchMemoryEntry,
   WebResearchState,
 } from "@/lib/webResearchTypes";
 
@@ -135,6 +136,79 @@ function PromptBlock({ title, body, tone }: { title: string; body: string; tone:
         {body}
       </pre>
     </div>
+  );
+}
+
+function memoryLabel(entry: WebResearchMemoryEntry): string {
+  if (entry.summary) return text(entry.summary);
+  const decision = entry.decision && typeof entry.decision === "object" ? entry.decision : {};
+  const outcome = entry.outcome && typeof entry.outcome === "object" ? entry.outcome : {};
+  const action = text(decision.action ?? "step");
+  const reason = text(decision.reason);
+  const status = text(outcome.status ?? outcome.ok);
+  return [text(entry.step_id), action, reason, status].filter(Boolean).join(" — ");
+}
+
+function AgentMemorySection({
+  entries,
+  finished,
+}: {
+  entries?: WebResearchMemoryEntry[];
+  finished: boolean;
+}) {
+  const listRef = useRef<HTMLOListElement>(null);
+  const stickToBottom = useRef(true);
+  const items = entries ?? [];
+
+  useEffect(() => {
+    const el = listRef.current;
+    if (el && stickToBottom.current && !finished) {
+      el.scrollTop = el.scrollHeight;
+    }
+  }, [items.length, finished]);
+
+  return (
+    <section className="rounded-md border border-cyan-400/25 bg-cyan-400/5 p-3">
+      <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+        <div>
+          <h3 className="text-[10px] font-semibold uppercase tracking-wide text-cyan-100/80">
+            Agent memory
+          </h3>
+          <p className="mt-1 text-xs text-white/50">
+            Structured log of every decision and outcome — injected into each new prompt.
+          </p>
+        </div>
+        <span className="rounded-full bg-cyan-400/15 px-2 py-0.5 text-[10px] text-cyan-50/90">
+          {items.length} steps
+        </span>
+      </div>
+      {items.length ? (
+        <ol
+          ref={listRef}
+          onScroll={(e) => {
+            const el = e.currentTarget;
+            stickToBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+          }}
+          className="max-h-56 space-y-1 overflow-y-auto overscroll-y-contain pr-1 text-xs text-white/75"
+        >
+          {items.map((entry, index) => (
+            <li
+              key={text(entry.step_id ?? index)}
+              className="rounded border border-white/10 bg-black/25 px-2 py-1.5"
+            >
+              <p className="font-mono text-[11px] leading-relaxed">{memoryLabel(entry)}</p>
+              {entry.page_url ? (
+                <p className="mt-1 truncate text-[10px] text-white/40">{text(entry.page_url)}</p>
+              ) : null}
+            </li>
+          ))}
+        </ol>
+      ) : (
+        <p className="text-xs text-white/35">
+          {finished ? "No agent memory recorded." : "Waiting for first completed step…"}
+        </p>
+      )}
+    </section>
   );
 }
 
@@ -352,6 +426,8 @@ export function WebResearchPanel({ state }: Props) {
           <ListSection title="Transitions" items={graphEdges} empty="No transitions reported." />
         </div>
       </section>
+
+      <AgentMemorySection entries={state.agentMemory} finished={runFinished} />
 
       <LlmPromptTrace exchanges={state.llmExchanges} finished={runFinished} />
     </div>

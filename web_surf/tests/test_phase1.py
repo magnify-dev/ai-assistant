@@ -6,7 +6,14 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from web_surf.extract import quote_supported
-from web_surf.page_match import focus_query, rank_search_results, score_result_url
+from web_surf.page_match import (
+    focus_query,
+    is_official_source,
+    is_secondary_host,
+    partition_by_source_tier,
+    rank_search_results,
+    score_result_url,
+)
 from web_surf.store import (
     cache_page_markdown,
     facts_summary_for_agent,
@@ -127,6 +134,135 @@ class PageMatchTests(unittest.TestCase):
         ranked = rank_search_results(rows, "patch notes", per_domain=2)
         top_hosts = [row.url.split("/")[2] for row in ranked[:3]]
         self.assertIn("other.example", top_hosts)
+
+    def test_official_tier_before_secondary(self) -> None:
+        rows = [
+            SimpleNamespace(
+                title="Fan wiki",
+                url="https://wiki.fan.com/examplegame-patch",
+                snippet="community summary",
+                query="q",
+            ),
+            SimpleNamespace(
+                title="Official patch notes",
+                url="https://news.examplegame.com/en-us/patch-notes",
+                snippet="Official patch notes",
+                query="q",
+            ),
+            SimpleNamespace(
+                title="Reddit thread",
+                url="https://www.reddit.com/r/examplegame/comments/1",
+                snippet="discussion",
+                query="q",
+            ),
+        ]
+        official, secondary = partition_by_source_tier(rows, "examplegame patch notes")
+        self.assertEqual(len(official), 1)
+        self.assertEqual(official[0].url, "https://news.examplegame.com/en-us/patch-notes")
+        self.assertEqual(len(secondary), 2)
+        ranked = rank_search_results(rows, "examplegame patch notes")
+        self.assertTrue(is_official_source(ranked[0].url, "examplegame patch notes"))
+        self.assertFalse(is_official_source(ranked[-1].url, "examplegame patch notes"))
+
+    def test_is_secondary_host_detects_social(self) -> None:
+        self.assertTrue(is_secondary_host("https://www.reddit.com/r/game"))
+        self.assertFalse(is_secondary_host("https://news.examplegame.com/patch-notes"))
+
+    def test_publisher_article_urls_are_official(self) -> None:
+        self.assertTrue(
+            is_official_source(
+                "https://news.publisher.com/en-us/article/12345/product-patch-notes",
+                "product patch notes",
+            )
+        )
+        self.assertFalse(
+            is_official_source(
+                "https://wiki.fan.com/product-patch",
+                "product patch notes",
+            )
+        )
+
+
+    def test_parse_target_dates_reads_numeric_and_named_dates(self) -> None:
+        from web_surf.page_match import parse_target_dates
+
+        self.assertEqual(parse_target_dates("patch notes 14.7.2026"), [(14, 7, 2026)])
+        self.assertEqual(parse_target_dates("notes for July 14, 2026"), [(14, 7, 2026)])
+
+    def test_page_matches_query_requires_substantive_dated_content(self) -> None:
+        from web_surf.page_match import page_matches_query
+
+        header_only = (
+            "Diablo IV Patch Notes 3.1.1 Build #72805 (All Platforms)—July 14, 2026 "
+            "3.1.0 Build #72592 (All Platforms)—June 30, 2026"
+        )
+        self.assertFalse(
+            page_matches_query(header_only, "diablo 4 patch notes 14.7.2026")
+        )
+        detailed = (
+            header_only
+            + " Fixed an issue where Tower Halo rewards could appear inverted. "
+            "Fixed an issue where Forgotten Souls were not dropping from Whisper Caches."
+        )
+        self.assertTrue(page_matches_query(detailed, "diablo 4 patch notes 14.7.2026"))
+
+    def test_suggest_expand_action_targets_collapsed_patch_section(self) -> None:
+        from web_surf.page_match import suggest_expand_action
+
+        snapshot = {
+            "interactables": [
+                {
+                    "id": "patch-july",
+                    "kind": "link",
+                    "text": "3.1.1 Build #72805 (All Platforms)—July 14, 2026",
+                    "href": "https://news.blizzard.com/en-us/article/24287406/diablo-iv-patch-notes#3.1.1",
+                    "expands_section": True,
+                    "collapsed": True,
+                },
+                {
+                    "id": "patch-june",
+                    "kind": "link",
+                    "text": "3.1.0 Build #72592 (All Platforms)—June 30, 2026",
+                    "href": "https://news.blizzard.com/en-us/article/24287406/diablo-iv-patch-notes#3.1.0",
+                    "expands_section": True,
+                    "collapsed": True,
+                },
+            ],
+        }
+        action = suggest_expand_action(snapshot, "diablo 4 patch notes 14.7.2026")
+        self.assertIsNotNone(action)
+        self.assertEqual(action["action"], "click")
+        self.assertEqual(action["target_id"], "patch-july")
+
+    def test_goal_is_satisfied_prefers_publisher_when_routes_exist(self) -> None:
+        from web_surf.page_match import goal_is_satisfied
+
+        detailed = (
+            "3.1.1 Build July 14, 2026 Fixed an issue where Tower Halo rewards "
+            "could appear inverted. Fixed an issue where Forgotten Souls were not dropping."
+        )
+        self.assertFalse(
+            goal_is_satisfied(
+                detailed,
+                "diablo 4 patch notes 14.7.2026",
+                source_url="https://gamingpromax.com/diablo-4-season-14-update-3-1-1-patch-notes",
+                publisher_domains={"blizzard.com"},
+                publisher_routes={
+                    "https://news.blizzard.com/en-us/article/24287406/diablo-iv-patch-notes"
+                },
+            )
+        )
+        self.assertTrue(
+            goal_is_satisfied(
+                detailed,
+                "diablo 4 patch notes 14.7.2026",
+                source_url="https://news.blizzard.com/en-us/article/24287406/diablo-iv-patch-notes",
+                publisher_domains={"blizzard.com"},
+                publisher_routes={
+                    "https://news.blizzard.com/en-us/article/24287406/diablo-iv-patch-notes"
+                },
+            )
+        )
 
 
 class ExtractTests(unittest.TestCase):

@@ -17,10 +17,12 @@ import type {
   PlaywrightSession,
   ProjectsRegistry,
   RunHistoryEntry,
+  RunHistoryPage,
   RunReport,
   StructuredTask,
   TestTarget,
 } from "@/lib/projectTypes";
+import { RUN_HISTORY_PAGE_SIZE } from "@/lib/projectTypes";
 import type { AgentRunCard, CollaborationConfig, CollaborationResult } from "@/lib/collaborationTypes";
 import {
   applyWebResearchEvent,
@@ -28,10 +30,29 @@ import {
   type WebResearchState,
 } from "@/lib/webResearchTypes";
 import type { PhaseMap, RunEvent } from "@/types";
+import { buildUiDisplaySnapshot, isUiDebugEnabled, traceUiDisplay } from "@/lib/uiRunDebug";
+import { UiRunDebugPanel } from "@/components/UiRunDebugPanel";
 
 const BROWSER_PHASES = ["exploration", "ui_test", "web_research"] as const;
 
 const SETTINGS_KEY = "test_runner_settings_v2";
+const VIEW_KEY = "test_runner_view_v1";
+
+function loadPersistedView(): "config" | "run" {
+  try {
+    return sessionStorage.getItem(VIEW_KEY) === "run" ? "run" : "config";
+  } catch {
+    return "config";
+  }
+}
+
+function persistView(view: "config" | "run") {
+  try {
+    sessionStorage.setItem(VIEW_KEY, view);
+  } catch {
+    /* ignore */
+  }
+}
 
 type StoredSettings = {
   project?: string;
@@ -119,6 +140,12 @@ function optimisticStartCard(): AgentRunCard {
   };
 }
 
+function optimisticRunPhases(message = "Preparing run…"): PhaseMap {
+  return {
+    collaboration: { status: "running", message },
+  };
+}
+
 function applyStateFromServer(
   data: {
     running?: boolean;
@@ -161,6 +188,11 @@ function applyStateFromServer(
   // run genuinely ended while we were disconnected — accept the full snapshot.
   const serverHasResult = Boolean(data.collaborationResult) || Boolean(data.lastResult);
   if (protect && data.running === false && !serverHasResult) {
+    if (isUiDebugEnabled()) {
+      console.warn(
+        "[UI run] refreshState ignored — server snapshot running=false while client protects active run",
+      );
+    }
     return;
   }
 
@@ -300,11 +332,17 @@ export default function App() {
   const [structuredTask, setStructuredTask] = useState<StructuredTask | null>(null);
   const [runReport, setRunReport] = useState<RunReport | null>(null);
   const [lastStep, setLastStep] = useState<RunEvent | null>(null);
-  const [view, setView] = useState<"config" | "run">("config");
+  const [view, setViewState] = useState<"config" | "run">(loadPersistedView);
+  const [startingRun, setStartingRun] = useState(false);
   const [logOpen, setLogOpen] = useState(false);
   const [hasLatestRun, setHasLatestRun] = useState(false);
   const [runHistory, setRunHistory] = useState<RunHistoryEntry[]>([]);
   const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyLoadingMore, setHistoryLoadingMore] = useState(false);
+  const [historyHasMore, setHistoryHasMore] = useState(false);
+  const [historyTotal, setHistoryTotal] = useState(0);
+  const preloadedHistoryRef = useRef<{ offset: number; page: RunHistoryPage } | null>(null);
+  const historyFetchSeqRef = useRef(0);
   const [viewingRunId, setViewingRunId] = useState<string | null>(null);
   const [playwrightSession, setPlaywrightSession] = useState<PlaywrightSession | null>(null);
   const [sessionFrameIndex, setSessionFrameIndex] = useState(0);
@@ -318,7 +356,6 @@ export default function App() {
   const [interveneNote, setInterveneNote] = useState("");
   const logRef = useRef<HTMLPreElement>(null);
   const runningRef = useRef(running);
-  runningRef.current = running;
   /** True from Run click until the server acknowledges start — avoids refreshState clobbering UI. */
   const startingRunRef = useRef(false);
   /** True between collaboration_start and collaboration_done — the python pipeline emits
@@ -326,6 +363,16 @@ export default function App() {
   const collabActiveRef = useRef(false);
   const viewingRunIdRef = useRef<string | null>(null);
   viewingRunIdRef.current = viewingRunId;
+
+  const setView = useCallback((next: "config" | "run") => {
+    setViewState(next);
+    persistView(next);
+  }, []);
+
+  const showRunView = useCallback(() => setView("run"), [setView]);
+  const showConfigView = useCallback(() => setView("config"), [setView]);
+
+  runningRef.current = running || startingRunRef.current || collabActiveRef.current;
 
   const runApiOptions = useMemo(() => runTargetOptions(testTargetMode), [testTargetMode]);
 
@@ -416,7 +463,7 @@ export default function App() {
             setPlaywrightSession,
           },
           {
-            protectActiveRun: runningRef.current,
+            protectActiveRun: runningRef.current || startingRunRef.current,
             protectInspectedSession: Boolean(viewingRunIdRef.current),
           },
         );
@@ -424,26 +471,97 @@ export default function App() {
       .catch(() => {});
   }, []);
 
+  const fetchHistoryPage = useCallback(async (offset: number) => {
+    const response = await apiFetch(
+      `/api/project/run-history?path=${encodeURIComponent(project)}&offset=${offset}&limit=${RUN_HISTORY_PAGE_SIZE}`,
+    );
+    return (await response.json()) as RunHistoryPage;
+  }, [project]);
+
+  const preloadHistoryPage = useCallback(
+    (offset: number) => {
+      if (!project.trim() || offset < 0) return;
+      void fetchHistoryPage(offset)
+        .then((page) => {
+          if (!page.runs?.length) return;
+          preloadedHistoryRef.current = { offset, page };
+        })
+        .catch(() => {
+          preloadedHistoryRef.current = null;
+        });
+    },
+    [fetchHistoryPage, project],
+  );
+
+  const applyHistoryPage = useCallback(
+    (page: RunHistoryPage, mode: "replace" | "append") => {
+      const runs = page.runs ?? [];
+      setRunHistory((prev) => (mode === "append" ? [...prev, ...runs] : runs));
+      setHistoryTotal(page.total ?? runs.length);
+      setHistoryHasMore(Boolean(page.hasMore));
+      setHasLatestRun(runs.some((run) => run.id === "current"));
+      if (page.hasMore) {
+        preloadHistoryPage(page.offset + runs.length);
+      } else {
+        preloadedHistoryRef.current = null;
+      }
+    },
+    [preloadHistoryPage],
+  );
+
   const loadRunHistory = useCallback(() => {
     if (!project.trim()) {
       setRunHistory([]);
+      setHistoryTotal(0);
+      setHistoryHasMore(false);
       setHasLatestRun(false);
+      preloadedHistoryRef.current = null;
       return;
     }
+    const fetchId = ++historyFetchSeqRef.current;
     setHistoryLoading(true);
-    apiFetch(`/api/project/run-history?path=${encodeURIComponent(project)}`)
-      .then((r) => r.json())
-      .then((data: { runs?: RunHistoryEntry[] }) => {
-        const runs = data.runs ?? [];
-        setRunHistory(runs);
-        setHasLatestRun(runs.some((run) => run.id === "current"));
+    void fetchHistoryPage(0)
+      .then((page) => {
+        if (fetchId !== historyFetchSeqRef.current) return;
+        preloadedHistoryRef.current = null;
+        applyHistoryPage(page, "replace");
       })
       .catch(() => {
+        if (fetchId !== historyFetchSeqRef.current) return;
         setRunHistory([]);
+        setHistoryTotal(0);
+        setHistoryHasMore(false);
         setHasLatestRun(false);
+        preloadedHistoryRef.current = null;
       })
-      .finally(() => setHistoryLoading(false));
-  }, [project]);
+      .finally(() => {
+        if (fetchId === historyFetchSeqRef.current) setHistoryLoading(false);
+      });
+  }, [applyHistoryPage, fetchHistoryPage, project]);
+
+  const loadOlderRunHistory = useCallback(() => {
+    if (!project.trim() || historyLoadingMore || !historyHasMore) return;
+
+    const nextOffset = runHistory.length;
+    const cached = preloadedHistoryRef.current;
+    if (cached && cached.offset === nextOffset) {
+      applyHistoryPage(cached.page, "append");
+      preloadedHistoryRef.current = null;
+      return;
+    }
+
+    setHistoryLoadingMore(true);
+    void fetchHistoryPage(nextOffset)
+      .then((page) => applyHistoryPage(page, "append"))
+      .finally(() => setHistoryLoadingMore(false));
+  }, [
+    applyHistoryPage,
+    fetchHistoryPage,
+    historyHasMore,
+    historyLoadingMore,
+    project,
+    runHistory.length,
+  ]);
 
   const loadRunReport = useCallback(() => {
     if (!project.trim() || running) return;
@@ -479,8 +597,8 @@ export default function App() {
   }, [loadRunReport, loadRunHistory, running, project]);
 
   useEffect(() => {
-    if (running) setView("run");
-  }, [running]);
+    if ((running || startingRun) && view !== "run") showRunView();
+  }, [running, startingRun, view, showRunView]);
 
   useEffect(() => {
     if (view === "run" && !runningRef.current && !startingRunRef.current) refreshState();
@@ -568,7 +686,11 @@ export default function App() {
     if (event.type === "run_state") {
       const isRunning = Boolean((event as { running?: boolean }).running);
       if (!isRunning) {
-        collabActiveRef.current = false;
+        // Child runners (web research / python) emit run_state:false when their process
+        // exits mid-collaboration — only collaboration_done should end the UI run.
+        if (startingRunRef.current || collabActiveRef.current || runningRef.current) {
+          return;
+        }
         setRunning(false);
       } else if (!collabActiveRef.current) {
         setRunning(true);
@@ -695,6 +817,8 @@ export default function App() {
     }
     if (event.type === "collaboration_start") {
       collabActiveRef.current = true;
+      startingRunRef.current = false;
+      setStartingRun(false);
       const resumed = Boolean((event as { resumed?: boolean }).resumed);
       if (!resumed) {
         setAgentCards((prev) => (prev.some((c) => c.status === "running") ? prev : [optimisticStartCard()]));
@@ -710,7 +834,10 @@ export default function App() {
       setLastResult(null);
     }
     if (event.type === "collaboration_done") {
+      if (startingRunRef.current) return;
       collabActiveRef.current = false;
+      startingRunRef.current = false;
+      setStartingRun(false);
       const e = event as { ok?: boolean; answer?: string; error?: string; iterations?: number };
       setCollaborationResult({ ok: e.ok, answer: e.answer, error: e.error, iterations: e.iterations });
       setAgentCards((prev) =>
@@ -727,18 +854,17 @@ export default function App() {
         ),
       );
       setRunning(false);
+      runningRef.current = false;
       loadRunHistory();
     }
     if (event.type === "run_cleared") {
-      if (runningRef.current || collabActiveRef.current) {
+      if (runningRef.current || collabActiveRef.current || startingRunRef.current) {
         setStructuredTask(null);
         setRunReport(null);
         setTestTarget(null);
         setBrowserState(null);
         setLastStep(null);
         setLastResult(null);
-        setPhases({});
-        setActivePhase(undefined);
         setViewingRunId(null);
         setWebResearch(null);
         return;
@@ -758,12 +884,12 @@ export default function App() {
       setCollaborationResult(null);
       setWebResearch(null);
     }
-    if (event.type === "done" && !collabActiveRef.current) {
+    if (event.type === "done" && !collabActiveRef.current && !startingRunRef.current) {
       setRunning(false);
       setLastResult({ overall_ok: (event as { overall_ok?: boolean }).overall_ok });
       loadRunHistory();
     }
-    if (event.type === "process_exit" && !collabActiveRef.current) {
+    if (event.type === "process_exit" && !collabActiveRef.current && !startingRunRef.current) {
       setRunning(false);
     }
     if (event.type === "ollama_switch") {
@@ -971,7 +1097,7 @@ export default function App() {
   const viewRun = useCallback(
     async (runId: string) => {
       if (!project.trim()) return;
-      setView("run");
+      showRunView();
       setViewingRunId(runId);
       try {
         const res = await apiFetch(
@@ -1092,7 +1218,7 @@ export default function App() {
         /* ignore */
       }
     },
-    [project],
+    [project, showRunView],
   );
 
   const resumeFromRun = useCallback(
@@ -1101,12 +1227,16 @@ export default function App() {
       startingRunRef.current = true;
       collabActiveRef.current = true;
       runningRef.current = true;
-      setView("run");
+      setStartingRun(true);
+      showRunView();
       setRunning(true);
       setViewingRunId(null);
       persistSettings();
       void saveProjectToRegistry();
       clearRunPanels();
+      setAgentCards([optimisticStartCard()]);
+      setPhases(optimisticRunPhases("Resuming run…"));
+      setActivePhase("collaboration");
       try {
         const res = await apiFetch("/api/run/resume", {
           method: "POST",
@@ -1124,6 +1254,8 @@ export default function App() {
           const err = await res.json();
           applyEvent({ type: "log", message: err.error ?? "Failed to resume run", level: "error" });
           collabActiveRef.current = false;
+          startingRunRef.current = false;
+          setStartingRun(false);
           setRunning(false);
           setAgentCards([]);
         } else {
@@ -1136,10 +1268,10 @@ export default function App() {
           level: "error",
         });
         collabActiveRef.current = false;
+        startingRunRef.current = false;
+        setStartingRun(false);
         setRunning(false);
         setAgentCards([]);
-      } finally {
-        startingRunRef.current = false;
       }
     },
     [
@@ -1152,6 +1284,7 @@ export default function App() {
       cursorRuntime,
       repoUrl,
       applyEvent,
+      showRunView,
     ],
   );
 
@@ -1180,8 +1313,134 @@ export default function App() {
 
   const logLines = useMemo(() => events.map(formatEventLine).filter(Boolean), [events]);
 
+  const lastActionLine = useMemo(() => {
+    if (!lastStep || lastStep.type !== "step") return undefined;
+    const mark = lastStep.ok ? "✓" : "✗";
+    return `${lastStep.action} ${lastStep.target} ${mark}${lastStep.message ? ` — ${lastStep.message}` : ""}`.trim();
+  }, [lastStep]);
+
+  const replayMode = Boolean(playwrightSession?.frames?.length) && !running;
+  const viewingRunLabel = runHistory.find((run) => run.id === viewingRunId)?.label;
+  const viewingRunCanResume = Boolean(
+    viewingRunId && runHistory.find((run) => run.id === viewingRunId)?.canResume && !running,
+  );
+  const currentRunResumable = runHistory.some((run) => run.id === "current" && run.canResume);
+  const resumeTargetId = !running
+    ? viewingRunId && viewingRunCanResume
+      ? viewingRunId
+      : currentRunResumable
+        ? "current"
+        : null
+    : null;
+
+  const inRunMode = running || startingRun;
+  const showConfigPanel = view === "config";
+
+  const hasCollaboration = agentCards.length > 0 || Boolean(collaborationResult) || inRunMode;
+
+  const pipelineUiActive = useMemo(
+    () =>
+      inRunMode &&
+      BROWSER_PHASES.some((key) => {
+        const phase = phases[key as keyof PhaseMap];
+        return phase?.status === "running";
+      }),
+    [inRunMode, phases],
+  );
+
+  const webBrowseActive = useMemo(
+    () =>
+      inRunMode &&
+      (phases.web_research?.status === "running" ||
+        Boolean(webResearch?.currentUrl || webResearch?.snapshot?.screenshot_b64) ||
+        Boolean(
+          browserState?.url &&
+            !/localhost|127\.0\.0\.1/i.test(browserState.url),
+        ) ||
+        playwrightSession?.source === "web"),
+    [inRunMode, phases, browserState, playwrightSession, webResearch],
+  );
+
+  const showLiveSession = replayMode || pipelineUiActive || webBrowseActive;
+
+  const uiDebugSnapshot = useMemo(
+    () =>
+      buildUiDisplaySnapshot({
+        trigger: "state",
+        view,
+        running,
+        startingRun,
+        inRunMode,
+        showConfigPanel,
+        viewingRunId,
+        replayMode,
+        pipelineUiActive,
+        webBrowseActive,
+        showLiveSession,
+        hasCollaboration,
+        webResearch,
+        resumeTargetId,
+        logOpen,
+        agentCardsCount: agentCards.length,
+        eventsCount: events.length,
+        phaseKeysCount: Object.keys(phases).length,
+        hasLatestRun,
+        refs: {
+          startingRunRef: startingRunRef.current,
+          collabActiveRef: collabActiveRef.current,
+          runningRef: runningRef.current,
+        },
+      }),
+    [
+      view,
+      running,
+      startingRun,
+      inRunMode,
+      showConfigPanel,
+      viewingRunId,
+      replayMode,
+      pipelineUiActive,
+      webBrowseActive,
+      showLiveSession,
+      hasCollaboration,
+      webResearch,
+      resumeTargetId,
+      logOpen,
+      agentCards.length,
+      events.length,
+      phases,
+      hasLatestRun,
+    ],
+  );
+
+  const lastUiTraceKeyRef = useRef("");
+  const traceUi = useCallback(
+    (trigger: string, note?: string) => {
+      traceUiDisplay({ ...uiDebugSnapshot, trigger, note });
+    },
+    [uiDebugSnapshot],
+  );
+
+  useEffect(() => {
+    const key = JSON.stringify({
+      view: uiDebugSnapshot.view,
+      running: uiDebugSnapshot.running,
+      startingRun: uiDebugSnapshot.startingRun,
+      visible: uiDebugSnapshot.visible,
+      viewingRunId: uiDebugSnapshot.viewingRunId,
+      refs: uiDebugSnapshot.refs,
+    });
+    if (key === lastUiTraceKeyRef.current) return;
+    lastUiTraceKeyRef.current = key;
+    traceUiDisplay(uiDebugSnapshot);
+  }, [uiDebugSnapshot]);
+
   const stopRun = useCallback(async () => {
+    traceUi("run:stop", "Stop clicked");
     collabActiveRef.current = false;
+    startingRunRef.current = false;
+    runningRef.current = false;
+    setStartingRun(false);
     setRunning(false);
     setAgentCards((prev) =>
       prev.map((c) =>
@@ -1214,22 +1473,52 @@ export default function App() {
     } catch {
       applyEvent({ type: "log", message: "Failed to stop run", level: "error" });
     }
-  }, [applyEvent]);
+  }, [applyEvent, traceUi]);
 
   const startRun = async () => {
     if (!project.trim()) return;
+    traceUiDisplay(
+      buildUiDisplaySnapshot({
+        trigger: "run:click",
+        view: "run",
+        running: true,
+        startingRun: true,
+        inRunMode: true,
+        showConfigPanel: false,
+        viewingRunId: null,
+        replayMode: false,
+        pipelineUiActive: false,
+        webBrowseActive: false,
+        showLiveSession: false,
+        hasCollaboration: true,
+        webResearch: null,
+        resumeTargetId: null,
+        logOpen,
+        agentCardsCount: 1,
+        eventsCount: 0,
+        phaseKeysCount: 1,
+        hasLatestRun,
+        refs: {
+          startingRunRef: true,
+          collabActiveRef: true,
+          runningRef: true,
+        },
+        note: "Run button clicked (optimistic)",
+      }),
+    );
     startingRunRef.current = true;
     collabActiveRef.current = true;
     runningRef.current = true;
-    setView("run");
+    setStartingRun(true);
+    showRunView();
     setViewingRunId(null);
     setRunning(true);
     persistSettings();
     void saveProjectToRegistry();
     setAgentCards([optimisticStartCard()]);
     setEvents([]);
-    setPhases({});
-    setActivePhase(undefined);
+    setPhases(optimisticRunPhases());
+    setActivePhase("collaboration");
     setBrowserState(null);
     setTestTarget(null);
     setStructuredTask(null);
@@ -1256,8 +1545,12 @@ export default function App() {
         const err = await res.json();
         applyEvent({ type: "log", message: err.error ?? "Failed to start", level: "error" });
         collabActiveRef.current = false;
+        startingRunRef.current = false;
+        runningRef.current = false;
+        setStartingRun(false);
         setRunning(false);
         setAgentCards([]);
+        traceUi("run:start-failed", err.error ?? "Failed to start");
       }
     } catch (err) {
       applyEvent({
@@ -1266,59 +1559,17 @@ export default function App() {
         level: "error",
       });
       collabActiveRef.current = false;
+      startingRunRef.current = false;
+      runningRef.current = false;
+      setStartingRun(false);
       setRunning(false);
       setAgentCards([]);
-    } finally {
-      startingRunRef.current = false;
+      traceUi(
+        "run:start-failed",
+        err instanceof Error ? err.message : "Failed to start run",
+      );
     }
   };
-
-  const lastActionLine = useMemo(() => {
-    if (!lastStep || lastStep.type !== "step") return undefined;
-    const mark = lastStep.ok ? "✓" : "✗";
-    return `${lastStep.action} ${lastStep.target} ${mark}${lastStep.message ? ` — ${lastStep.message}` : ""}`.trim();
-  }, [lastStep]);
-
-  const replayMode = Boolean(playwrightSession?.frames?.length) && !running;
-  const viewingRunLabel = runHistory.find((run) => run.id === viewingRunId)?.label;
-  const viewingRunCanResume = Boolean(
-    viewingRunId && runHistory.find((run) => run.id === viewingRunId)?.canResume && !running,
-  );
-  const currentRunResumable = runHistory.some((run) => run.id === "current" && run.canResume);
-  const resumeTargetId = !running
-    ? viewingRunId && viewingRunCanResume
-      ? viewingRunId
-      : currentRunResumable
-        ? "current"
-        : null
-    : null;
-
-  const hasCollaboration = agentCards.length > 0 || Boolean(collaborationResult) || running;
-
-  const pipelineUiActive = useMemo(
-    () =>
-      running &&
-      BROWSER_PHASES.some((key) => {
-        const phase = phases[key as keyof PhaseMap];
-        return phase?.status === "running";
-      }),
-    [running, phases],
-  );
-
-  const webBrowseActive = useMemo(
-    () =>
-      running &&
-      (phases.web_research?.status === "running" ||
-        Boolean(webResearch?.currentUrl || webResearch?.snapshot?.screenshot_b64) ||
-        Boolean(
-          browserState?.url &&
-            !/localhost|127\.0\.0\.1/i.test(browserState.url),
-        ) ||
-        playwrightSession?.source === "web"),
-    [running, phases, browserState, playwrightSession, webResearch],
-  );
-
-  const showLiveSession = replayMode || pipelineUiActive || webBrowseActive;
 
   return (
     <div className="mx-auto max-w-7xl px-4 py-8">
@@ -1329,7 +1580,7 @@ export default function App() {
             One task field — the local agent routes to web research or UI testing and escalates to the helper when stuck
           </p>
         </div>
-        {view === "run" ? (
+        {view === "run" || inRunMode ? (
           <div className="flex flex-wrap items-center gap-2">
             {viewingRunId ? (
               <span className="rounded-full bg-violet-500/15 px-2 py-0.5 text-xs text-violet-100">
@@ -1345,24 +1596,24 @@ export default function App() {
                 Resume from failure
               </button>
             ) : null}
-            <button
-              type="button"
-              onClick={() => {
-                setView("config");
-                if (!running) {
+            {!inRunMode ? (
+              <button
+                type="button"
+                onClick={() => {
+                  showConfigView();
                   setViewingRunId(null);
                   setPlaywrightSession(null);
-                }
-              }}
-              className="rounded-md border border-white/20 px-3 py-1.5 text-sm text-white/80 hover:bg-white/5"
-            >
-              Back to configuration
-            </button>
+                }}
+                className="rounded-md border border-white/20 px-3 py-1.5 text-sm text-white/80 hover:bg-white/5"
+              >
+                Back to configuration
+              </button>
+            ) : null}
           </div>
         ) : null}
       </header>
 
-      {view === "config" ? (
+      {showConfigPanel ? (
         <>
         <section className="surface-card mx-auto max-w-2xl space-y-4 p-6">
           <h2 className="text-sm font-semibold uppercase tracking-wide text-white/50">Configuration</h2>
@@ -1651,19 +1902,23 @@ export default function App() {
           <RunHistoryPanel
             runs={runHistory}
             loading={historyLoading}
-            running={running}
+            loadingMore={historyLoadingMore}
+            hasMore={historyHasMore}
+            total={historyTotal}
+            running={inRunMode}
             onInspect={(runId) => void viewRun(runId)}
             onResume={(runId) => void resumeFromRun(runId)}
+            onLoadOlder={loadOlderRunHistory}
           />
 
           <div className="flex flex-col gap-2 pt-2">
             <button
               type="button"
-              disabled={running}
+              disabled={inRunMode}
               onClick={startRun}
               className={cn(
                 "rounded-md bg-white px-4 py-2 text-sm font-semibold text-black",
-                running && "opacity-50",
+                inRunMode && "opacity-50",
               )}
             >
               Run
@@ -1684,11 +1939,11 @@ export default function App() {
         </>
       ) : (
         <div className="flex min-h-[calc(100vh-10rem)] flex-col gap-4">
-          {running ? (
+          {inRunMode ? (
             <CurrentRunStatus
               phases={phases}
               agentCards={agentCards}
-              running={running}
+              running={inRunMode}
               showPipelineStrip={hasCollaboration}
               testTargetMode={testTargetMode}
               skipDeploy={runApiOptions.skipDeploy}
@@ -1758,7 +2013,7 @@ export default function App() {
                 <CollaborationPanel
                   agentCards={agentCards}
                   collaborationResult={collaborationResult}
-                  running={running}
+                  running={inRunMode}
                 />
               </section>
             ) : (
@@ -1783,7 +2038,7 @@ export default function App() {
                 structuredTask={structuredTask}
                 runReport={runReport}
                 testTarget={testTarget}
-                running={running}
+                running={inRunMode}
                 projectPath={project}
                 lastResult={lastResult}
                 testTargetMode={testTargetMode}
@@ -1817,6 +2072,7 @@ export default function App() {
           </section>
         </div>
       )}
+      <UiRunDebugPanel current={uiDebugSnapshot} />
     </div>
   );
 }

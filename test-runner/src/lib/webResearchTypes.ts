@@ -53,6 +53,16 @@ export type WebResearchItem = {
   [key: string]: unknown;
 };
 
+export type WebResearchMemoryEntry = {
+  step_id?: string;
+  page_url?: string;
+  decision?: Record<string, unknown>;
+  outcome?: Record<string, unknown>;
+  summary?: string;
+  ts?: string;
+  [key: string]: unknown;
+};
+
 export type WebResearchLlmExchange = {
   seq?: number;
   prompt_key?: string;
@@ -100,6 +110,7 @@ export type WebResearchState = {
   transitions?: WebResearchItem[];
   formValuePlans?: WebResearchItem[];
   llmExchanges?: WebResearchLlmExchange[];
+  agentMemory?: WebResearchMemoryEntry[];
   runFinished?: boolean;
   updatedAt?: string;
   [key: string]: unknown;
@@ -127,6 +138,7 @@ const WEB_EVENT_TYPES = new Set([
   "web_state_transition",
   "web_form_values_plan",
   "web_llm_exchange",
+  "web_agent_memory",
 ]);
 
 type UnknownEvent = Record<string, unknown> & { type?: string; ts?: string };
@@ -191,6 +203,9 @@ export function applyWebResearchEvent(
     if (Array.isArray(event.llm_exchanges)) {
       next.llmExchanges = event.llm_exchanges as WebResearchLlmExchange[];
     }
+    if (Array.isArray(event.agent_memory)) {
+      next.agentMemory = event.agent_memory as WebResearchMemoryEntry[];
+    }
   } else if (type === "web_index") {
     const pages = object(event.pages);
     if (pages) {
@@ -226,6 +241,23 @@ export function applyWebResearchEvent(
       next.llmExchanges = existing;
     } else {
       next.llmExchanges = [...existing, exchange].slice(-500);
+    }
+  } else if (type === "web_agent_memory") {
+    const entry = object(event.entry) as WebResearchMemoryEntry | undefined;
+    const batch = objects(event.memory);
+    if (batch?.length) {
+      next.agentMemory = batch as WebResearchMemoryEntry[];
+    } else if (entry) {
+      const existing = next.agentMemory ?? [];
+      const stepId = String(entry.step_id ?? "");
+      const updated = event.updated === true;
+      if (updated && stepId && existing.some((item) => String(item.step_id ?? "") === stepId)) {
+        next.agentMemory = existing.map((item) =>
+          String(item.step_id ?? "") === stepId ? { ...item, ...entry, ts } : item,
+        );
+      } else if (!stepId || !existing.some((item) => String(item.step_id ?? "") === stepId)) {
+        next.agentMemory = [...existing, { ...entry, ts }].slice(-200);
+      }
     }
   } else if (type === "web_candidates") {
     next.candidates = objects(event.candidates ?? event.items) ?? [];

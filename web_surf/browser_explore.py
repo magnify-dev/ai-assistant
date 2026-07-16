@@ -10,13 +10,28 @@ from typing import Any, Callable
 from urllib.parse import urlsplit, urlunsplit
 
 from web_surf import events
+from web_surf.agent_memory import commit_agent_memory
 from web_surf.context_curate import curate_browse_context, normalize_decision
 from web_surf.fetch import PageResult
-from web_surf.page_match import focus_query, page_matches_query
+from web_surf.page_match import (
+    focus_query,
+    goal_is_satisfied,
+    page_contains_target_date,
+    page_has_goal_links,
+    page_matches_query,
+    page_text_for_goal,
+    parse_target_dates,
+    url_on_publisher_domain,
+)
 from web_surf.form_values import (
+    _snapshot_blockers,
     ensure_form_values,
     is_verification_field,
+    normalize_gate_select_value,
+    overlay_blocks_collect,
+    report_is_negative,
     sanitize_form_values,
+    suggest_overlay_action,
 )
 from web_surf.llm import ollama_chat
 from web_surf.spec import _get_prompt
@@ -27,6 +42,7 @@ from web_surf.store import (
     record_visit,
     save_session_state,
 )
+from ui_test.state_diff import action_signature, diff_page_states, is_no_progress, progress_fingerprint
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +51,7 @@ HelpProvider = Callable[[dict[str, Any]], dict[str, Any]]
 ALLOWED_ACTIONS = {
     "click",
     "navigate",
+    "swap_branch",
     "fill",
     "select",
     "press",
@@ -42,6 +59,7 @@ ALLOWED_ACTIONS = {
     "back",
     "wait",
     "extract",
+    "filter",
     "report",
     "help",
     "ask_helper",
@@ -62,6 +80,9 @@ KEY_NAMES = {
     "Backspace",
     "Delete",
 }
+_OVERLAY_DEFERRED_ACTIONS = frozenset(
+    {"navigate", "report", "extract", "filter", "scroll", "back", "wait", "help"}
+)
 
 
 def origin_url(url: str) -> str:
@@ -99,14 +120,26 @@ def ollama_decision_provider(
     ollama_url: str,
     model: str,
     timeout_sec: float,
+    publishers: list[str] | None = None,
+    publisher_domains: set[str] | None = None,
 ) -> DecisionProvider:
+    def _system_prompt(step_id: str) -> str:
+        match = re.search(r"(\d+)", step_id or "")
+        step_num = int(match.group(1)) if match else 1
+        if step_num >= 3:
+            compact = _get_prompt("web_research.browse_decide_compact")
+            if compact.strip():
+                return compact
+        return _get_prompt("web_research.browse_decide")
+
     def decide(context: dict[str, Any]) -> dict[str, Any]:
+        step_id = str(context.get("step_id") or "")
         raw = ollama_chat(
             prompt_key="web_research.browse_decide",
             ollama_url=ollama_url,
             model=model,
             timeout_sec=timeout_sec,
-            system=_get_prompt("web_research.browse_decide"),
+            system=_system_prompt(step_id),
             user=json.dumps(
                 curate_browse_context(
                     query=str(context.get("query") or ""),
@@ -116,7 +149,18 @@ def ollama_decision_provider(
                     available_value_keys=list(context.get("keys") or context.get("available_value_keys") or []),
                     field_mapping=context.get("map") if isinstance(context.get("map"), dict) else context.get("field_mapping"),
                     recent_history=context.get("history") if isinstance(context.get("history"), list) else context.get("recent_history"),
+                    agent_memory=list(context.get("agent_memory") or []),
                     last_transition=context.get("last") or context.get("last_transition"),
+                    blocked_attempts=list(context.get("blocked_attempts") or []),
+                    publishers=list(context.get("publishers") or publishers or []),
+                    publisher_domains=set(context.get("publisher_domains") or publisher_domains or set()),
+                    seed_urls=list(context.get("seed_urls") or []),
+                    candidates=list(context.get("candidates") or []),
+                    active_branch_url=str(context.get("active_branch_url") or ""),
+                    branch_steps=int(context.get("branch_steps") or 0),
+                    max_steps_per_branch=int(context.get("max_steps_per_branch") or 20),
+                    helper_guidance=list(context.get("helper_guidance") or []),
+                    collected_evidence=list(context.get("collected_evidence") or []),
                 ),
                 ensure_ascii=False,
                 separators=(",", ":"),
@@ -136,6 +180,37 @@ def ollama_decision_provider(
     return decide
 
 
+def _matching_link_id(
+    url: str,
+    elements: dict[str, dict[str, Any]],
+    current_url: str | None,
+) -> str | None:
+    """Return a snapshot control id when url matches a visible link (including same-page anchors)."""
+    normalized = _safe_normalize(url)
+    if not normalized:
+        return None
+    for el_id, item in elements.items():
+        href = _safe_normalize(str(item.get("href") or ""))
+        if href and href == normalized:
+            return el_id
+    current = _safe_normalize(str(current_url or ""))
+    if not current:
+        return None
+    parsed_target = urlsplit(normalized)
+    parsed_current = urlsplit(current)
+    if (
+        parsed_target.netloc == parsed_current.netloc
+        and parsed_target.path.rstrip("/") == parsed_current.path.rstrip("/")
+        and parsed_target.fragment
+    ):
+        fragment_suffix = f"#{parsed_target.fragment}"
+        for el_id, item in elements.items():
+            href = _safe_normalize(str(item.get("href") or ""))
+            if href.endswith(fragment_suffix):
+                return el_id
+    return None
+
+
 def validate_action(
     decision: Any,
     snapshot: dict[str, Any],
@@ -150,6 +225,8 @@ def validate_action(
         return None, f"unsupported action: {action or '(missing)'}"
     if action == "ask_helper":
         action = "help"
+    if action == "swap_branch":
+        action = "navigate"
     validated = {
         "action": action,
         "reason": str(decision.get("reason") or "")[:500],
@@ -180,6 +257,11 @@ def validate_action(
             return None, f"{action} target_id is not in the current snapshot"
         if elements[target_id].get("disabled"):
             return None, f"{action} target is disabled"
+        target_kind = str(elements[target_id].get("kind") or "").lower()
+        target_widget = str(elements[target_id].get("widget") or "").lower()
+        if action == "fill" and (target_kind in {"select", "combobox"} or target_widget in {"select", "combobox"}):
+            action = "select"
+            validated["action"] = action
         target_href = _safe_normalize(str(elements[target_id].get("href") or ""))
         if target_href and allowed_origins and origin_url(target_href) not in allowed_origins:
             return None, f"{action} target leaves the allowed candidate origins"
@@ -187,6 +269,15 @@ def validate_action(
         validated["target"] = elements[target_id]
     if action == "navigate":
         url = _safe_normalize(str(decision.get("url") or ""))
+        link_id = _matching_link_id(url, elements, str(snapshot.get("url") or ""))
+        if link_id:
+            return validate_action(
+                {**decision, "action": "click", "target_id": link_id, "url": ""},
+                snapshot,
+                discovered_routes,
+                allowed_origins,
+                form_values,
+            )
         allowed = {_safe_normalize(route) for route in discovered_routes}
         # Links visible on the current page are discovered by definition.
         allowed.update(
@@ -228,7 +319,7 @@ def validate_action(
                     f"{action} on a verification field requires value_key from available_value_keys; "
                     "use provide_values first if keys are missing"
                 )
-        validated["value"] = value[:2000]
+        validated["value"] = normalize_gate_select_value(value[:2000], target)
     if action == "press":
         value = str(decision.get("value") or "")
         if value not in KEY_NAMES:
@@ -256,8 +347,29 @@ def validate_action(
         if not sanitized:
             return None, "provide_values requires a non-empty form_values object"
         validated["form_values"] = sanitized
-    if action in {"extract", "report"}:
+    if action in {"extract", "filter", "report"}:
         validated["note"] = str(decision.get("note") or "")[:2000]
+    if action in {"extract", "filter"}:
+        blocked, overlay_error = overlay_blocks_collect(snapshot)
+        if blocked:
+            visible = str(snapshot.get("visible_text") or "")
+            events.extract_preview(
+                {
+                    "phase": "blocked",
+                    "action": action,
+                    "url": str(snapshot.get("url") or ""),
+                    "step_id": str(snapshot.get("step_id") or ""),
+                    "snapshot_id": str(snapshot.get("snapshot_id") or ""),
+                    "visible_text_chars": len(visible.strip()),
+                    "text_preview": visible[:1500],
+                    "error": overlay_error,
+                }
+            )
+            return None, overlay_error
+    elif _snapshot_blockers(snapshot) and action in _OVERLAY_DEFERRED_ACTIONS:
+        return None, (
+            "clear blocking overlay first — dismiss consent or complete age verification"
+        )
     return validated, ""
 
 
@@ -312,16 +424,47 @@ def _compact_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
 
 def _locator_for(page: Any, item: dict[str, Any]) -> Any:
     test_id = str(item.get("test_id") or "")
-    role = str(item.get("role") or item.get("kind") or "")
-    text = str(item.get("text") or item.get("aria") or "")
+    kind = str(item.get("kind") or "").lower()
+    widget = str(item.get("widget") or "").lower()
+    role = str(item.get("role") or kind or "")
+    name = str(item.get("name") or "").strip()
+    aria = str(item.get("aria") or "").strip()
+    label = str(item.get("label") or "").strip()
+    text = str(item.get("text") or aria or label or "")
     href = str(item.get("href") or "")
     if test_id:
         return page.get_by_test_id(test_id).first
-    if role in {"link", "button", "menuitem", "textbox", "checkbox", "radio", "combobox"} and text:
+    if kind == "select" and name:
+        if item.get("in_dialog"):
+            return page.locator(
+                f"[role='dialog'] select[name={json.dumps(name)}], "
+                f"[aria-modal='true'] select[name={json.dumps(name)}], "
+                f"select[name={json.dumps(name)}]"
+            ).first
+        return page.locator(f"select[name={json.dumps(name)}]").first
+    if widget in {"combobox"} or role == "combobox":
+        if aria:
+            return page.get_by_role("combobox", name=aria, exact=False).first
+        if label:
+            return page.get_by_role("combobox", name=label, exact=False).first
+        if name:
+            return page.locator(f"[role='combobox'][name={json.dumps(name)}]").first
+    if aria and kind in {"select", "input", "textarea", "textbox", "combobox", "spinbutton"}:
+        return page.get_by_label(aria, exact=False).first
+    if label and kind in {"input", "textarea", "textbox", "spinbutton"}:
+        return page.get_by_label(label, exact=False).first
+    if name and kind in {"select", "input", "textarea", "textbox", "spinbutton"}:
+        tag = "input" if kind in {"textbox", "spinbutton"} else kind
+        return page.locator(f"{tag}[name={json.dumps(name)}]").first
+    if href and (not text or len(text) > 100):
+        return page.locator(f"a[href={json.dumps(href)}]").first
+    if role in {"link", "button", "menuitem", "textbox", "checkbox", "radio", "combobox", "spinbutton", "searchbox"} and text:
+        if len(text) > 80:
+            return page.get_by_role(role, name=text[:80], exact=False).first
         return page.get_by_role(role, name=text, exact=True).first
     if href:
         return page.locator(f"a[href={json.dumps(href)}]").first
-    if text:
+    if text and len(text) <= 80:
         return page.get_by_text(text, exact=True).first
     placeholder = str(item.get("placeholder") or "")
     if placeholder:
@@ -329,18 +472,175 @@ def _locator_for(page: Any, item: dict[str, Any]) -> Any:
     raise ValueError("target has no usable semantic locator")
 
 
+def _selection_matches(current: str, expected: str, item: dict[str, Any]) -> bool:
+    current = str(current or "").strip()
+    expected = str(expected or "").strip()
+    if not expected:
+        return False
+    if current == expected:
+        return True
+    if expected in current or current in expected:
+        return True
+    options = item.get("options") if isinstance(item.get("options"), list) else []
+    option_values = item.get("option_values") if isinstance(item.get("option_values"), list) else []
+    for opt in options:
+        opt_text = str(opt).strip()
+        if opt_text == expected and (opt_text == current or expected in opt_text):
+            return True
+    for opt_val in option_values:
+        if str(opt_val).strip() == expected and str(opt_val).strip() == current:
+            return True
+    return False
+
+
+def _fill_stable(page: Any, item: dict[str, Any], value: str) -> None:
+    loc = _locator_for(page, item)
+    try:
+        loc.scroll_into_view_if_needed(timeout=3000)
+    except Exception:
+        pass
+    try:
+        loc.click(timeout=3000)
+    except Exception:
+        pass
+    label = str(item.get("text") or item.get("name") or item.get("id") or "field")
+    for attempt in range(3):
+        loc.fill(value, timeout=8000)
+        try:
+            current = loc.input_value(timeout=2000)
+            if current == value:
+                return
+        except Exception:
+            pass
+        page.wait_for_timeout(250 * (attempt + 1))
+    raise RuntimeError(f"Could not set {label} — input value did not stick")
+
+
+def _select_stable(page: Any, item: dict[str, Any], value: str) -> None:
+    loc = _locator_for(page, item)
+    try:
+        loc.scroll_into_view_if_needed(timeout=3000)
+    except Exception:
+        pass
+    label = str(item.get("text") or item.get("name") or item.get("id") or "menu")
+    strategies = [
+        lambda: loc.select_option(value=value, timeout=8000),
+        lambda: loc.select_option(label=value, timeout=8000),
+    ]
+    last_exc: Exception | None = None
+    for attempt in range(3):
+        for strategy in strategies:
+            try:
+                strategy()
+                current = loc.input_value(timeout=2000)
+                if _selection_matches(current, value, item):
+                    return
+            except Exception as exc:
+                last_exc = exc
+        page.wait_for_timeout(250 * (attempt + 1))
+    raise RuntimeError(f"Could not select {value!r} in {label}") from last_exc
+
+
+def _discover_official_outbound(
+    snapshot: dict[str, Any],
+    publisher_domains: set[str],
+    allowed_origins: set[str],
+    discovered_routes: set[str],
+) -> list[str]:
+    """Promote outbound links to publisher domains identified for this research task."""
+    from web_surf.page_match import url_on_publisher_domain
+
+    if not publisher_domains:
+        return []
+
+    promoted: list[str] = []
+    seen: set[str] = set()
+    candidates: list[str] = []
+    for item in snapshot.get("interactables") or []:
+        if not isinstance(item, dict):
+            continue
+        href = _safe_normalize(str(item.get("href") or ""))
+        if href:
+            candidates.append(href)
+    for route in snapshot.get("discovered_routes") or []:
+        href = _safe_normalize(str(route))
+        if href:
+            candidates.append(href)
+
+    for href in candidates:
+        if not href or href in seen or not url_on_publisher_domain(href, publisher_domains):
+            continue
+        seen.add(href)
+        origin = origin_url(href)
+        if origin not in allowed_origins:
+            allowed_origins.add(origin)
+            promoted.append(href)
+        discovered_routes.add(href)
+        discovered_routes.add(origin)
+    return promoted
+
+
+def _sync_branch_navigation(
+    *,
+    page_url: str,
+    snapshot: dict[str, Any],
+    allowed_origins: set[str],
+    discovered_routes: set[str],
+) -> bool:
+    """Allow in-branch exploration after redirects (e.g. age-gate handoffs)."""
+    current = _safe_normalize(page_url)
+    if not current:
+        return False
+    expanded = False
+    origin = origin_url(current)
+    if origin and origin not in allowed_origins:
+        allowed_origins.add(origin)
+        expanded = True
+    discovered_routes.add(current)
+    if origin:
+        discovered_routes.add(origin)
+    hrefs: list[str] = []
+    for route in snapshot.get("discovered_routes") or []:
+        href = _safe_normalize(str(route))
+        if href:
+            hrefs.append(href)
+    for item in snapshot.get("interactables") or []:
+        if not isinstance(item, dict):
+            continue
+        href = _safe_normalize(str(item.get("href") or ""))
+        if href:
+            hrefs.append(href)
+    for href in hrefs:
+        discovered_routes.add(href)
+        route_origin = origin_url(href)
+        if route_origin and route_origin not in allowed_origins:
+            allowed_origins.add(route_origin)
+            expanded = True
+    return expanded
+
+
 def _execute(page: Any, action: dict[str, Any]) -> None:
+    from ui_test.expandable import is_collapse_toggle, wait_for_section_expand
+
     kind = action["action"]
     # Short element timeouts: a click blocked by an overlay should fail fast so the
     # next snapshot (which lists the overlay) reaches the model quickly.
     if kind == "navigate":
         page.goto(action["url"], wait_until="domcontentloaded", timeout=45000)
     elif kind == "click":
-        _locator_for(page, action["target"]).click(timeout=8000)
+        target = action.get("target") if isinstance(action.get("target"), dict) else {}
+        loc = _locator_for(page, action["target"])
+        try:
+            loc.scroll_into_view_if_needed(timeout=3000)
+        except Exception:
+            pass
+        loc.click(timeout=8000)
+        if is_collapse_toggle(target):
+            wait_for_section_expand(page, target, timeout_ms=5000)
     elif kind == "fill":
-        _locator_for(page, action["target"]).fill(action["value"], timeout=8000)
+        _fill_stable(page, action["target"], action["value"])
     elif kind == "select":
-        _locator_for(page, action["target"]).select_option(label=action["value"], timeout=8000)
+        _select_stable(page, action["target"], action["value"])
     elif kind == "press":
         _locator_for(page, action["target"]).press(action["value"], timeout=8000)
     elif kind == "scroll":
@@ -350,7 +650,8 @@ def _execute(page: Any, action: dict[str, Any]) -> None:
     elif kind == "wait":
         page.wait_for_timeout(action["duration_ms"])
     if kind in {"navigate", "click", "fill", "select", "press", "scroll", "back"}:
-        page.wait_for_timeout(750)
+        if kind != "click" or not is_collapse_toggle(action.get("target") or {}):
+            page.wait_for_timeout(750)
 
 
 def stdin_help_provider(request: dict[str, Any]) -> dict[str, Any]:
@@ -375,8 +676,39 @@ def stdin_help_provider(request: dict[str, Any]) -> dict[str, Any]:
         }
 
 
-def _page_result(page: Any, snapshot: dict[str, Any], step_id: str) -> PageResult:
-    text = str(snapshot.get("visible_text") or "").strip()[:12000]
+def _content_collect_key(
+    snapshot: dict[str, Any],
+    goal: str,
+    *,
+    apply_date_filter: bool = False,
+) -> str:
+    """Stable identity for extract/filter dedup — same URL + same clipped text."""
+    raw_text = str(snapshot.get("visible_text") or "").strip()
+    if apply_date_filter and goal:
+        text = page_text_for_goal(raw_text, goal, max_chars=12000)
+    else:
+        text = raw_text[:12000]
+    url = _safe_normalize(str(snapshot.get("url") or ""))
+    return f"{url}|{content_hash(text)}"
+
+
+def _content_collect_signature(action_name: str, collect_key: str) -> str:
+    return f"{action_name}|{collect_key}"
+
+
+def _page_result(
+    page: Any,
+    snapshot: dict[str, Any],
+    step_id: str,
+    *,
+    goal: str = "",
+    apply_date_filter: bool = False,
+) -> PageResult:
+    raw_text = str(snapshot.get("visible_text") or "").strip()
+    if apply_date_filter and goal:
+        text = page_text_for_goal(raw_text, goal, max_chars=12000)
+    else:
+        text = raw_text[:12000]
     return PageResult(
         url=_safe_normalize(str(snapshot.get("url") or page.url)),
         title=str(snapshot.get("title") or ""),
@@ -392,6 +724,89 @@ def _page_result(page: Any, snapshot: dict[str, Any], step_id: str) -> PageResul
     )
 
 
+def _publisher_routes(discovered_routes: set[str], publisher_domains: set[str]) -> set[str]:
+    if not publisher_domains:
+        return set()
+    return {
+        str(route)
+        for route in discovered_routes
+        if url_on_publisher_domain(str(route), publisher_domains)
+    }
+
+
+def _goal_satisfied_for_page(
+    text: str,
+    goal: str,
+    *,
+    source_url: str,
+    publisher_domains: set[str],
+    discovered_routes: set[str],
+) -> bool:
+    return goal_is_satisfied(
+        text,
+        goal,
+        source_url=source_url,
+        publisher_domains=publisher_domains,
+        publisher_routes=_publisher_routes(discovered_routes, publisher_domains),
+    )
+
+
+def _should_collect_on_page(
+    snapshot: dict[str, Any],
+    goal: str,
+    *,
+    publisher_domains: set[str] | None = None,
+    discovered_routes: set[str] | None = None,
+) -> bool:
+    visible = str(snapshot.get("visible_text") or "")
+    if not page_contains_target_date(visible, goal):
+        return False
+    scoped = page_text_for_goal(visible, goal, max_chars=12000)
+    return _goal_satisfied_for_page(
+        scoped,
+        goal,
+        source_url=str(snapshot.get("url") or ""),
+        publisher_domains=set(publisher_domains or set()),
+        discovered_routes=set(discovered_routes or set()),
+    )
+
+
+def _auto_collect_from_page(
+    *,
+    page: Any,
+    snapshot: dict[str, Any],
+    step_id: str,
+    goal: str,
+    reason: str,
+    publisher_domains: set[str] | None = None,
+    discovered_routes: set[str] | None = None,
+) -> tuple[PageResult | None, dict[str, Any]]:
+    if not _should_collect_on_page(
+        snapshot,
+        goal,
+        publisher_domains=publisher_domains,
+        discovered_routes=discovered_routes,
+    ):
+        return None, {}
+    page_result = _page_result(
+        page,
+        snapshot,
+        step_id,
+        goal=goal,
+        apply_date_filter=True,
+    )
+    if not page_result.ok or len(page_result.text) < 200:
+        return None, {}
+    return page_result, {
+        "step_id": step_id,
+        "snapshot_id": snapshot["snapshot_id"],
+        "action": "filter",
+        "reason": reason,
+        "ok": True,
+        "auto_collected": True,
+    }
+
+
 def explore_candidates_in_browser(
     *,
     query: str,
@@ -399,6 +814,7 @@ def explore_candidates_in_browser(
     project_path: Path,
     max_visits: int = 5,
     max_steps: int = 20,
+    max_steps_per_branch: int = 20,
     ollama_url: str = "http://127.0.0.1:11434",
     model: str = "qwen2.5:14b",
     timeout_sec: float = 120.0,
@@ -407,6 +823,8 @@ def explore_candidates_in_browser(
     success_criteria: list[str] | None = None,
     form_values: dict[str, str] | None = None,
     form_values_provider: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+    publisher_domains: set[str] | None = None,
+    publishers: list[str] | None = None,
 ) -> tuple[list[PageResult], str, bool, dict[str, Any]]:
     """Explore from result origins, executing exactly one validated model action per step."""
     from playwright.sync_api import sync_playwright
@@ -423,7 +841,11 @@ def explore_candidates_in_browser(
         ollama_url=ollama_url,
         model=model,
         timeout_sec=timeout_sec,
+        publishers=list(publishers or []),
+        publisher_domains=set(publisher_domains or set()),
     )
+    publisher_domain_set = set(publisher_domains or set())
+    publisher_names = list(publishers or [])
     session_form_values: dict[str, str] = {
         str(key): str(value)
         for key, value in (form_values or {}).items()
@@ -443,7 +865,13 @@ def explore_candidates_in_browser(
     # the model navigate back to them at any time.
     discovered_routes = set(origins) | set(seed_urls)
     start_urls = seed_urls or origins
+    max_steps = max(max_steps, len(start_urls) * max(1, max_steps_per_branch))
     history: list[dict[str, Any]] = []
+    agent_memory: list[dict[str, Any]] = []
+    active_branch_url = ""
+    stall_break_threshold = 5
+    state_attempts: dict[str, set[str]] = {}
+    collected_content_keys: set[str] = set()
     report_rejected = False
     helper_guidance: list[dict[str, Any]] = []
     snapshots: list[dict[str, Any]] = []
@@ -457,6 +885,7 @@ def explore_candidates_in_browser(
         "seed_urls": seed_urls,
         "origins": origins,
         "history": history,
+        "agent_memory": agent_memory,
         "snapshots": snapshots,
         "transitions": transitions,
         "discovered_routes": sorted(discovered_routes),
@@ -496,10 +925,53 @@ def explore_candidates_in_browser(
         )
         recorder.attach(context)
         page = context.new_page()
+
+        def _record_agent_memory(
+            *,
+            outcome: dict[str, Any],
+            decision: dict[str, Any] | None = None,
+            page_url: str = "",
+            snapshot: dict[str, Any] | None = None,
+        ) -> dict[str, Any]:
+            entry = commit_agent_memory(
+                step_id=str(outcome.get("step_id") or ""),
+                decision=decision if isinstance(decision, dict) else outcome,
+                outcome=outcome,
+                page_url=page_url or str(page.url or ""),
+                snapshot=snapshot,
+            )
+            agent_memory.append(entry)
+            events.agent_memory(
+                {
+                    "session_id": session_id,
+                    "entry": entry,
+                    "memory": agent_memory,
+                    "total": len(agent_memory),
+                }
+            )
+            return entry
+
+        def _finalize_step(
+            item: dict[str, Any],
+            *,
+            decision: dict[str, Any] | None = None,
+            page_url: str = "",
+            snapshot: dict[str, Any] | None = None,
+        ) -> None:
+            history.append(item)
+            _record_agent_memory(
+                outcome=item,
+                decision=decision,
+                page_url=page_url,
+                snapshot=snapshot,
+            )
+            events.action({"session_id": session_id, **item})
+
         try:
             for start_url in start_urls:
                 if len(history) >= max_steps or goal_met:
                     break
+                active_branch_url = start_url
                 previous_url = str(page.url or "")
                 bootstrap_id = f"step_{len(history) + 1:03d}"
                 try:
@@ -527,14 +999,25 @@ def explore_candidates_in_browser(
                         "step_id": bootstrap_id,
                         "action": "origin",
                         "url": start_url,
+                        "branch_url": active_branch_url,
                         "ok": False,
                         "error": str(exc),
                     }
-                    history.append(item)
-                    events.action({"session_id": session_id, **item})
+                    _finalize_step(item, page_url=start_url)
                     continue
 
-                while len(history) < max_steps and not goal_met:
+                while (
+                    len(history) < max_steps
+                    and sum(
+                        1
+                        for row in history
+                        if _safe_normalize(str(row.get("branch_url") or active_branch_url))
+                        == _safe_normalize(active_branch_url)
+                        and str(row.get("action") or "") not in {"", "pending"}
+                    )
+                    < max_steps_per_branch
+                    and not goal_met
+                ):
                     step_id = f"step_{len(history) + 1:03d}"
                     events.controller(
                         {
@@ -559,6 +1042,34 @@ def explore_candidates_in_browser(
                         snapshot=snapshot,
                     )
                     snapshots.append(_compact_snapshot(snapshot))
+                    if _sync_branch_navigation(
+                        page_url=str(page.url or ""),
+                        snapshot=snapshot,
+                        allowed_origins=allowed_origins,
+                        discovered_routes=discovered_routes,
+                    ):
+                        events.log(
+                            "Expanded branch navigation after redirect — continuing on current path",
+                            level="info",
+                        )
+                    promoted = _discover_official_outbound(
+                        snapshot,
+                        publisher_domain_set,
+                        allowed_origins,
+                        discovered_routes,
+                    )
+                    if promoted:
+                        events.log(
+                            f"Discovered {len(promoted)} official outbound link(s) — navigation allowed",
+                            level="info",
+                        )
+                        events.candidates(
+                            {
+                                "session_id": session_id,
+                                "tier": "discovered_official",
+                                "candidates": [{"url": url} for url in promoted[:12]],
+                            }
+                        )
                     discovered_routes.update(
                         route
                         for route in snapshot.get("discovered_routes") or []
@@ -596,11 +1107,41 @@ def explore_candidates_in_browser(
                         "step_id": step_id,
                         "snapshot": _compact_snapshot(snapshot),
                         "discovered_routes": discovered_routes,
+                        "seed_urls": seed_urls,
+                        "candidates": candidates[:max_visits],
                         "available_value_keys": sorted(session_form_values.keys()),
                         "field_mapping": field_mapping,
-                        "recent_history": history[-5:],
+                        "recent_history": history,
+                        "agent_memory": agent_memory,
                         "last_transition": transitions[-1] if transitions else None,
+                        "publishers": publisher_names,
+                        "publisher_domains": publisher_domain_set,
+                        "active_branch_url": active_branch_url,
+                        "branch_steps": sum(
+                            1
+                            for row in history
+                            if _safe_normalize(str(row.get("branch_url") or active_branch_url))
+                            == _safe_normalize(active_branch_url)
+                            and str(row.get("action") or "") not in {"", "pending"}
+                        ),
+                        "max_steps_per_branch": max_steps_per_branch,
+                        "helper_guidance": helper_guidance[-4:],
+                        "collected_evidence": [
+                            {
+                                "url": page_result.url,
+                                "title": page_result.title[:120],
+                                "chars": len(page_result.text),
+                                "step_id": str(
+                                    (page_result.evidence_context or {}).get("source_step_id") or ""
+                                ),
+                            }
+                            for page_result in pages[-5:]
+                        ],
                     }
+                    current_fp = progress_fingerprint(snapshot)
+                    blocked_attempts = sorted(state_attempts.get(current_fp, set()))
+                    if blocked_attempts:
+                        model_context["blocked_attempts"] = blocked_attempts
                     events.controller(
                         {
                             "session_id": session_id,
@@ -610,10 +1151,33 @@ def explore_candidates_in_browser(
                             "max_steps": max_steps,
                         }
                     )
-                    try:
-                        raw_decision = decide(model_context)
-                    except Exception as exc:
-                        raw_decision = {"action": "help", "question": f"Decision model unavailable: {exc}"}
+                    overlay_suggestion = None
+                    if _snapshot_blockers(snapshot):
+                        overlay_suggestion = suggest_overlay_action(
+                            snapshot,
+                            session_form_values,
+                            field_mapping,
+                            recent_history=history,
+                        )
+                    if overlay_suggestion:
+                        raw_decision = {
+                            **overlay_suggestion,
+                            "reason": str(
+                                overlay_suggestion.get("reason")
+                                or "Deterministic overlay step"
+                            ),
+                        }
+                        events.log(
+                            "Using deterministic overlay action: "
+                            f"{overlay_suggestion.get('action')} "
+                            f"{overlay_suggestion.get('target_id') or ''}".strip(),
+                            level="info",
+                        )
+                    else:
+                        try:
+                            raw_decision = decide(model_context)
+                        except Exception as exc:
+                            raw_decision = {"action": "help", "question": f"Decision model unavailable: {exc}"}
                     coerced = normalize_decision(raw_decision)
                     if coerced is not None:
                         raw_decision = coerced
@@ -633,18 +1197,22 @@ def explore_candidates_in_browser(
                         allowed_origins,
                         session_form_values,
                     )
+                    raw_action = (
+                        str(raw_decision.get("action") or "").lower().strip()
+                        if isinstance(raw_decision, dict)
+                        else ""
+                    )
                     pending_item = {
                         "step_id": step_id,
                         "snapshot_id": snapshot["snapshot_id"],
-                        "action": str(raw_decision.get("action") or "pending")
-                        if isinstance(raw_decision, dict)
-                        else "pending",
+                        "action": raw_action or "pending",
                         "reason": str(raw_decision.get("reason") or "")
                         if isinstance(raw_decision, dict)
                         else "",
                         "target_id": str(raw_decision.get("target_id") or "")
                         if isinstance(raw_decision, dict)
                         else "",
+                        "branch_url": active_branch_url,
                         "ok": None,
                     }
                     session_state.update(
@@ -652,6 +1220,7 @@ def explore_candidates_in_browser(
                             "status": "deciding",
                             "session_id": session_id,
                             "history": [*history, pending_item],
+                            "agent_memory": agent_memory,
                             "snapshots": snapshots[-20:],
                             "discovered_routes": sorted(discovered_routes),
                             "current_url": str(page.url or ""),
@@ -659,7 +1228,10 @@ def explore_candidates_in_browser(
                     )
                     save_session_state(project_path, session_id, session_state)
                     if action is None:
-                        if "not available in the generated form value store" in validation_error:
+                        if (
+                            "not available in the generated form value store" in validation_error
+                            or "use provide_values first" in validation_error
+                        ):
                             retry_plan = ensure_form_values(
                                 query=goal,
                                 snapshot=snapshot,
@@ -702,12 +1274,16 @@ def explore_candidates_in_browser(
                                 else "invalid",
                                 "reason": pending_item["reason"],
                                 "target_id": pending_item["target_id"],
+                                "branch_url": active_branch_url,
                                 "ok": False,
                                 "error": validation_error,
                             }
-                            history.append(item)
-                            events.action({"session_id": session_id, **item})
-                            if sum(1 for row in history[-3:] if not row.get("ok")) >= 3:
+                            _finalize_step(
+                                item,
+                                decision=raw_decision if isinstance(raw_decision, dict) else None,
+                                snapshot=snapshot,
+                            )
+                            if sum(1 for row in history[-stall_break_threshold:] if not row.get("ok")) >= stall_break_threshold:
                                 events.controller(
                                     {
                                         "session_id": session_id,
@@ -719,12 +1295,118 @@ def explore_candidates_in_browser(
                                 break
                             continue
 
+                    attempt_signature = action_signature(action)
+                    if action["action"] in {"extract", "filter"}:
+                        collect_key = _content_collect_key(
+                            snapshot,
+                            goal,
+                            apply_date_filter=action["action"] == "filter",
+                        )
+                        attempt_signature = _content_collect_signature(
+                            action["action"],
+                            collect_key,
+                        )
+                        if collect_key in collected_content_keys:
+                            item = {
+                                "step_id": step_id,
+                                "snapshot_id": snapshot["snapshot_id"],
+                                "action": action["action"],
+                                "reason": action.get("reason", ""),
+                                "target_id": action.get("target_id", pending_item["target_id"]),
+                                "branch_url": active_branch_url,
+                                "ok": False,
+                                "progress": False,
+                                "error": (
+                                    f"{action['action']} rejected: this page content was already "
+                                    "collected — use action=report"
+                                ),
+                            }
+                            _finalize_step(
+                                item,
+                                decision=raw_decision if isinstance(raw_decision, dict) else None,
+                                snapshot=snapshot,
+                            )
+                            helper_guidance.append(
+                                {
+                                    "step_id": step_id,
+                                    "kind": "duplicate_collect",
+                                    "instruction": (
+                                        "This page was already extracted. Use action=report now — "
+                                        "do not repeat extract or filter on the same content."
+                                    ),
+                                }
+                            )
+                            if sum(
+                                1
+                                for row in history[-stall_break_threshold:]
+                                if row.get("progress") is False
+                                or "already collected" in str(row.get("error") or "").lower()
+                            ) >= stall_break_threshold:
+                                events.controller(
+                                    {
+                                        "session_id": session_id,
+                                        "status": "blocked",
+                                        "current_url": str(page.url or ""),
+                                        "reason": item["error"],
+                                    }
+                                )
+                                break
+                            continue
+                    if attempt_signature in state_attempts.get(current_fp, set()):
+                        item = {
+                            "step_id": step_id,
+                            "snapshot_id": snapshot["snapshot_id"],
+                            "action": action["action"],
+                            "reason": action.get("reason", ""),
+                            "target_id": action.get("target_id", pending_item["target_id"]),
+                            "branch_url": active_branch_url,
+                            "ok": False,
+                            "progress": False,
+                            "error": (
+                                "action already tried without progress — "
+                                "pick a different control or route"
+                            ),
+                        }
+                        _finalize_step(
+                            item,
+                            decision=raw_decision if isinstance(raw_decision, dict) else None,
+                            snapshot=snapshot,
+                        )
+                        if sum(
+                            1
+                            for row in history[-stall_break_threshold:]
+                            if row.get("progress") is False or "no progress" in str(row.get("error") or "").lower()
+                        ) >= stall_break_threshold:
+                            events.controller(
+                                {
+                                    "session_id": session_id,
+                                    "status": "blocked",
+                                    "current_url": str(page.url or ""),
+                                    "reason": item["error"],
+                                }
+                            )
+                            break
+                        session_state.update(
+                            {
+                                "status": "running",
+                                "history": history,
+                                "agent_memory": agent_memory,
+                                "snapshots": snapshots[-20:],
+                                "transitions": transitions[-20:],
+                                "discovered_routes": sorted(discovered_routes),
+                                "current_url": str(page.url or ""),
+                            }
+                        )
+                        save_session_state(project_path, session_id, session_state)
+                        continue
+
                     item = {
                         "step_id": step_id,
                         "snapshot_id": snapshot["snapshot_id"],
-                        "action": action["action"],
+                        "action": raw_action or action["action"],
                         "reason": action.get("reason", ""),
                         "target_id": action.get("target_id", pending_item["target_id"]),
+                        "branch_url": active_branch_url,
                     }
                     target_info = action.get("target") if isinstance(action.get("target"), dict) else {}
                     target_label = str(
@@ -738,6 +1420,8 @@ def explore_candidates_in_browser(
                     target_href = str(target_info.get("href") or "").strip()
                     if target_href:
                         item["target_href"] = target_href
+                    if action.get("value_key"):
+                        item["value_key"] = str(action["value_key"])
                     if action["action"] == "provide_values":
                         session_form_values.update(action["form_values"])
                         events.form_values_plan(
@@ -751,14 +1435,14 @@ def explore_candidates_in_browser(
                                 "trigger": "provide_values_action",
                             }
                         )
-                        history.append(
+                        _finalize_step(
                             {
                                 **item,
                                 "ok": True,
                                 "form_values_added": sorted(action["form_values"].keys()),
-                            }
+                            },
+                            decision=raw_decision if isinstance(raw_decision, dict) else None,
                         )
-                        events.action({"session_id": session_id, **history[-1]})
                         continue
                     if action["action"] == "help":
                         events.controller(
@@ -790,14 +1474,17 @@ def explore_candidates_in_browser(
                         }
                         events.help_result(result)
                         answer = str(result.get("answer") or "").strip()
-                        history.append({**item, "ok": bool(answer), "help_result": result})
+                        _finalize_step(
+                            {**item, "ok": bool(answer), "help_result": result},
+                            decision=raw_decision if isinstance(raw_decision, dict) else None,
+                        )
                         if answer:
                             helper_guidance.append(
                                 {"step_id": step_id, "question": action["question"], "answer": answer}
                             )
                             continue
                         break
-                    if action["action"] in {"extract", "report"}:
+                    if action["action"] in {"extract", "filter", "report"}:
                         events.controller(
                             {
                                 "session_id": session_id,
@@ -807,30 +1494,89 @@ def explore_candidates_in_browser(
                                 "max_steps": max_steps,
                             }
                         )
-                        page_result = _page_result(page, snapshot, step_id)
-                        if (
-                            action["action"] == "report"
-                            and not report_rejected
-                            and not page_matches_query(page_result.text, goal, min_chars=300)
-                        ):
-                            # One-time guard against reporting from a page that clearly
-                            # lacks the requested data (404s, unrelated pages).
-                            report_rejected = True
+                        page_result = _page_result(
+                            page,
+                            snapshot,
+                            step_id,
+                            goal=goal,
+                            apply_date_filter=(
+                                action["action"] == "filter"
+                                or (
+                                    action["action"] == "report"
+                                    and bool(parse_target_dates(goal))
+                                )
+                            ),
+                        )
+                        report_reason = str(action.get("reason") or "")
+                        report_note = str(action.get("note") or "")
+                        reject_report = False
+                        reject_error = ""
+                        if action["action"] == "report":
+                            if report_is_negative(report_reason, report_note):
+                                reject_report = True
+                                reject_error = (
+                                    "report rejected: reason indicates the answer was not found — "
+                                    "click a goal-relevant link or extract more evidence first"
+                                )
+                            elif page_has_goal_links(snapshot, goal):
+                                reject_report = True
+                                reject_error = (
+                                    "report rejected: goal-relevant links are still available — "
+                                    "click one of them before reporting"
+                                )
+                            elif (
+                                publisher_domain_set
+                                and not url_on_publisher_domain(
+                                    str(snapshot.get("url") or ""),
+                                    publisher_domain_set,
+                                )
+                                and _publisher_routes(discovered_routes, publisher_domain_set)
+                            ):
+                                reject_report = True
+                                reject_error = (
+                                    "report rejected: official publisher sources are still available — "
+                                    "follow a publisher link before reporting from a secondary site"
+                                )
+                            elif (
+                                not report_rejected
+                                and not _goal_satisfied_for_page(
+                                    page_result.text,
+                                    goal,
+                                    source_url=page_result.url,
+                                    publisher_domains=publisher_domain_set,
+                                    discovered_routes=discovered_routes,
+                                )
+                            ):
+                                reject_report = True
+                                report_rejected = True
+                                reject_error = (
+                                    "report rejected: current page text does not answer the goal — "
+                                    "navigate to a page that does, or report again if you are certain"
+                                )
+                        if reject_report:
                             item = {
                                 **item,
                                 "ok": False,
-                                "error": (
-                                    "report rejected: current page text does not answer the goal — "
-                                    "navigate to a page that does, or report again if you are certain"
-                                ),
+                                "error": reject_error,
                             }
-                            history.append(item)
-                            events.action({"session_id": session_id, **item})
+                            _finalize_step(item, decision=raw_decision if isinstance(raw_decision, dict) else None)
                             continue
+                        events.extract_preview(
+                            {
+                                "phase": "collected",
+                                "action": action["action"],
+                                "url": page_result.url,
+                                "step_id": step_id,
+                                "snapshot_id": snapshot["snapshot_id"],
+                                "visible_text_chars": len(page_result.text),
+                                "text_preview": page_result.text[:1500],
+                                "ok": page_result.ok,
+                            }
+                        )
                         if page_result.ok:
                             pages.append(page_result)
                             found_content = page_result.text
-                            goal_met = action["action"] == "report"
+                            goal_met = action["action"] == "report" and page_result.ok
                             evidence_payload = {
                                 "session_id": session_id,
                                 "step_id": step_id,
@@ -841,9 +1587,40 @@ def explore_candidates_in_browser(
                                 "note": action.get("note", ""),
                             }
                             events.evidence(evidence_payload)
-                        history.append({**item, "ok": page_result.ok})
-                        events.action({"session_id": session_id, **history[-1]})
-                        if action["action"] == "report":
+                            if action["action"] in {"extract", "filter"}:
+                                collect_key = _content_collect_key(
+                                    snapshot,
+                                    goal,
+                                    apply_date_filter=action["action"] == "filter",
+                                )
+                                collected_content_keys.add(collect_key)
+                                state_attempts.setdefault(current_fp, set()).add(
+                                    _content_collect_signature(action["action"], collect_key)
+                                )
+                                instruction = (
+                                    "Page content was collected. Use action=report now — "
+                                    "do not extract or filter the same page again."
+                                )
+                                if _goal_satisfied_for_page(
+                                    page_result.text,
+                                    goal,
+                                    source_url=page_result.url,
+                                    publisher_domains=publisher_domain_set,
+                                    discovered_routes=discovered_routes,
+                                ):
+                                    instruction = (
+                                        "Collected text answers the goal. Use action=report now — "
+                                        "do not extract the same page again."
+                                    )
+                                helper_guidance.append(
+                                    {
+                                        "step_id": step_id,
+                                        "kind": "content_collected",
+                                        "instruction": instruction,
+                                    }
+                                )
+                        _finalize_step({**item, "ok": page_result.ok}, decision=raw_decision if isinstance(raw_decision, dict) else None)
+                        if action["action"] == "report" and page_result.ok:
                             events.criteria(
                                 {
                                     "session_id": session_id,
@@ -901,7 +1678,23 @@ def explore_candidates_in_browser(
                         snapshot=post_snapshot,
                     )
                     snapshots.append(_compact_snapshot(post_snapshot))
-                    from ui_test.state_diff import diff_page_states
+                    _sync_branch_navigation(
+                        page_url=str(page.url or ""),
+                        snapshot=post_snapshot,
+                        allowed_origins=allowed_origins,
+                        discovered_routes=discovered_routes,
+                    )
+                    if raw_action == "swap_branch":
+                        item["action"] = "swap_branch"
+                        swap_target = _safe_normalize(
+                            str(raw_decision.get("url") or "")
+                            if isinstance(raw_decision, dict)
+                            else ""
+                        )
+                        seed_norms = {_safe_normalize(url) for url in seed_urls}
+                        if swap_target in seed_norms:
+                            active_branch_url = swap_target
+                            state_attempts = {}
 
                     delta = diff_page_states(snapshot, post_snapshot)
                     transition = {
@@ -915,28 +1708,304 @@ def explore_candidates_in_browser(
                     transitions.append(transition)
                     item["transition"] = delta
                     events.transition(transition)
+                    state_attempts.setdefault(current_fp, set()).add(attempt_signature)
+                    if is_no_progress(snapshot, post_snapshot, delta):
+                        item["ok"] = False
+                        item["progress"] = False
+                        item["error"] = (
+                            "no progress — page state unchanged; "
+                            "try a different control or route"
+                        )
+                    elif not item.get("ok"):
+                        item["progress"] = False
                     if delta["new_blockers"] or (
                         not item["ok"] and "intercept" in str(item.get("error") or "").lower()
                     ):
                         blocker = delta["new_blockers"] or delta["blocking_overlays"]
+                        from web_surf.form_values import AGE_GATE_AGENT_NOTE, looks_like_age_gate
+
+                        instruction = (
+                            "Resolve this blocker using available_value_keys and field_mapping. "
+                            "Use provide_values if new semantic keys are needed."
+                        )
+                        if looks_like_age_gate(post_snapshot):
+                            instruction = f"{instruction} {AGE_GATE_AGENT_NOTE}"
                         helper_guidance.append(
                             {
                                 "step_id": step_id,
                                 "kind": "blocking_overlay",
                                 "error": item.get("error", ""),
                                 "blockers": blocker,
+                                "instruction": instruction,
+                            }
+                        )
+                    _finalize_step(
+                        item,
+                        decision=raw_decision if isinstance(raw_decision, dict) else None,
+                        snapshot=post_snapshot,
+                    )
+                    if item.get("progress") is False:
+                        from ui_test.expandable import (
+                            is_collapse_toggle,
+                            is_collapsed_section,
+                            section_text_growth,
+                            wait_for_section_expand,
+                        )
+
+                        target = action.get("target") if isinstance(action.get("target"), dict) else {}
+                        if (
+                            action.get("action") == "click"
+                            and is_collapse_toggle(target)
+                            and is_collapsed_section(target)
+                        ):
+                            if wait_for_section_expand(page, target, timeout_ms=5000):
+                                post_snapshot = _snapshot(
+                                    page,
+                                    session_id=session_id,
+                                    step_id=step_id,
+                                    context="post_expand",
+                                    form_values=session_form_values,
+                                )
+                                snapshots.append(_compact_snapshot(post_snapshot))
+                                if section_text_growth(snapshot, post_snapshot):
+                                    item["ok"] = True
+                                    item["progress"] = True
+                                    item.pop("error", None)
+                                    history[-1] = item
+                                    if agent_memory:
+                                        agent_memory[-1] = commit_agent_memory(
+                                            step_id=str(item.get("step_id") or ""),
+                                            decision=raw_decision if isinstance(raw_decision, dict) else item,
+                                            outcome=item,
+                                            page_url=str(page.url or ""),
+                                        )
+                                        events.agent_memory(
+                                            {
+                                                "session_id": session_id,
+                                                "entry": agent_memory[-1],
+                                                "memory": agent_memory,
+                                                "total": len(agent_memory),
+                                                "updated": True,
+                                            }
+                                        )
+                                    events.action({"session_id": session_id, **item})
+                                    helper_guidance.append(
+                                        {
+                                            "step_id": step_id,
+                                            "kind": "section_expanded",
+                                            "instruction": (
+                                                "Collapsed section expanded successfully. "
+                                                "Use filter/extract on the visible content, then report."
+                                            ),
+                                        }
+                                    )
+                                    session_state.update(
+                                        {
+                                            "status": "running",
+                                            "history": history,
+                                            "agent_memory": agent_memory,
+                                            "snapshots": snapshots[-20:],
+                                            "transitions": transitions[-20:],
+                                            "discovered_routes": sorted(discovered_routes),
+                                            "current_url": str(page.url or ""),
+                                        }
+                                    )
+                                    save_session_state(project_path, session_id, session_state)
+                                    continue
+                        elif action.get("action") == "click" and isinstance(action.get("target"), dict):
+                            try:
+                                _locator_for(page, action["target"]).scroll_into_view_if_needed(
+                                    timeout=3000
+                                )
+                                page.wait_for_timeout(500)
+                                post_snapshot = _snapshot(
+                                    page,
+                                    session_id=session_id,
+                                    step_id=step_id,
+                                    context="post_scroll",
+                                    form_values=session_form_values,
+                                )
+                            except Exception:
+                                pass
+                        collected, collect_item = _auto_collect_from_page(
+                            page=page,
+                            snapshot=post_snapshot,
+                            step_id=step_id,
+                            goal=goal,
+                            reason=(
+                                "Collect target-date section already present on this page "
+                                "instead of repeating ineffective navigation"
+                            ),
+                            publisher_domains=publisher_domain_set,
+                            discovered_routes=discovered_routes,
+                        )
+                        if collected:
+                            pages.append(collected)
+                            found_content = collected.text
+                            events.evidence(
+                                {
+                                    "session_id": session_id,
+                                    "step_id": step_id,
+                                    "snapshot_id": post_snapshot["snapshot_id"],
+                                    "source_url": collected.url,
+                                    "title": collected.title,
+                                    "text": collected.text,
+                                    "note": collect_item.get("reason", ""),
+                                    "auto_collected": True,
+                                }
+                            )
+                            _finalize_step(
+                                {
+                                    **collect_item,
+                                    "snapshot_id": post_snapshot["snapshot_id"],
+                                }
+                            )
+                            if _goal_satisfied_for_page(
+                                collected.text,
+                                goal,
+                                source_url=collected.url,
+                                publisher_domains=publisher_domain_set,
+                                discovered_routes=discovered_routes,
+                            ):
+                                goal_met = True
+                                events.criteria(
+                                    {
+                                        "session_id": session_id,
+                                        "criteria": [
+                                            {
+                                                "criterion": criterion,
+                                                "met": True,
+                                                "note": collect_item.get("reason", ""),
+                                            }
+                                            for criterion in (success_criteria or [])
+                                        ],
+                                        "unmet_criteria": [],
+                                    }
+                                )
+                                break
+                            helper_guidance.append(
+                                {
+                                    "step_id": step_id,
+                                    "kind": "content_collected",
+                                    "instruction": (
+                                        "Target-date content was collected from the current page. "
+                                        "Use action=report now instead of navigating elsewhere."
+                                    ),
+                                }
+                            )
+                            session_state.update(
+                                {
+                                    "status": "running",
+                                    "history": history,
+                                    "agent_memory": agent_memory,
+                                    "snapshots": snapshots[-20:],
+                                    "transitions": transitions[-20:],
+                                    "discovered_routes": sorted(discovered_routes),
+                                    "current_url": str(page.url or ""),
+                                }
+                            )
+                            save_session_state(project_path, session_id, session_state)
+                            continue
+                        helper_guidance.append(
+                            {
+                                "step_id": step_id,
+                                "kind": "no_progress",
+                                "error": item.get("error", ""),
                                 "instruction": (
-                                    "Resolve this blocker using available_value_keys and field_mapping. "
-                                    "Use provide_values if new semantic keys are needed."
+                                    "The last action left the page in the same state. "
+                                    "Use action=filter or action=extract on the current page text, "
+                                    "or scroll to reveal more content — do not repeat the same click."
                                 ),
                             }
                         )
-                    history.append(item)
-                    events.action({"session_id": session_id, **history[-1]})
+                        if sum(
+                            1
+                            for row in history[-stall_break_threshold:]
+                            if row.get("progress") is False
+                            or "no progress" in str(row.get("error") or "").lower()
+                        ) >= stall_break_threshold:
+                            stuck_collected, stuck_item = _auto_collect_from_page(
+                                page=page,
+                                snapshot=post_snapshot,
+                                step_id=step_id,
+                                goal=goal,
+                                reason=(
+                                    "Stopped repeating navigation; collected target-date section "
+                                    "from the current canonical page"
+                                ),
+                                publisher_domains=publisher_domain_set,
+                                discovered_routes=discovered_routes,
+                            )
+                            if stuck_collected and _goal_satisfied_for_page(
+                                stuck_collected.text,
+                                goal,
+                                source_url=stuck_collected.url,
+                                publisher_domains=publisher_domain_set,
+                                discovered_routes=discovered_routes,
+                            ):
+                                pages.append(stuck_collected)
+                                found_content = stuck_collected.text
+                                events.evidence(
+                                    {
+                                        "session_id": session_id,
+                                        "step_id": step_id,
+                                        "snapshot_id": post_snapshot["snapshot_id"],
+                                        "source_url": stuck_collected.url,
+                                        "title": stuck_collected.title,
+                                        "text": stuck_collected.text,
+                                        "note": stuck_item.get("reason", ""),
+                                        "auto_collected": True,
+                                    }
+                                )
+                                _finalize_step(
+                                    {
+                                        **stuck_item,
+                                        "snapshot_id": post_snapshot["snapshot_id"],
+                                    }
+                                )
+                                goal_met = True
+                                events.criteria(
+                                    {
+                                        "session_id": session_id,
+                                        "criteria": [
+                                            {
+                                                "criterion": criterion,
+                                                "met": True,
+                                                "note": stuck_item.get("reason", ""),
+                                            }
+                                            for criterion in (success_criteria or [])
+                                        ],
+                                        "unmet_criteria": [],
+                                    }
+                                )
+                                break
+                            events.controller(
+                                {
+                                    "session_id": session_id,
+                                    "status": "blocked",
+                                    "current_url": str(page.url or ""),
+                                    "reason": item.get("error") or "stuck repeating ineffective actions",
+                                }
+                            )
+                            break
+                        session_state.update(
+                            {
+                                "status": "running",
+                                "history": history,
+                                "agent_memory": agent_memory,
+                                "snapshots": snapshots[-20:],
+                                "transitions": transitions[-20:],
+                                "discovered_routes": sorted(discovered_routes),
+                                "current_url": str(page.url or ""),
+                            }
+                        )
+                        save_session_state(project_path, session_id, session_state)
+                        continue
                     session_state.update(
                         {
                             "status": "running",
                             "history": history,
+                            "agent_memory": agent_memory,
                             "snapshots": snapshots[-20:],
                             "transitions": transitions[-20:],
                             "discovered_routes": sorted(discovered_routes),
@@ -949,6 +2018,7 @@ def explore_candidates_in_browser(
                 {
                     "status": "completed" if goal_met else "incomplete",
                     "history": history,
+                    "agent_memory": agent_memory,
                     "snapshots": snapshots[-20:],
                     "transitions": transitions[-20:],
                     "discovered_routes": sorted(discovered_routes),
@@ -993,5 +2063,6 @@ def explore_candidates_in_browser(
         "visited_pages": list((graph.get("nodes") or {}).values()),
         "unmet_criteria": [] if goal_met else list(success_criteria or []),
         "helper_history": helper_guidance,
+        "agent_memory": agent_memory,
         "transitions": transitions,
     }

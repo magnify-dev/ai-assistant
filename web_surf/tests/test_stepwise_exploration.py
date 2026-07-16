@@ -9,24 +9,34 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from ui_test.browser_state import _enrich_interactables
+from ui_test.browser_state import _enrich_interactables, filter_blocking_overlays
 from ui_test.state_diff import diff_page_states
 from web_surf import events
 from web_surf.form_values import (
+    enforce_adult_verification_values,
     fallback_form_values,
     form_context_fingerprint,
+    looks_like_age_gate,
     needs_form_value_plan,
     plan_form_values,
+    report_is_negative,
     sanitize_form_values,
+    suggest_overlay_action,
+    _pick_adult_year,
 )
 from web_surf.browser_explore import (
+    _content_collect_key,
+    _content_collect_signature,
+    _discover_official_outbound,
     _json_object,
     _redact_form_values,
+    _sync_branch_navigation,
     explore_candidates_in_browser,
     origin_url,
     stdin_help_provider,
     validate_action,
 )
+from web_surf.context_curate import curate_browse_context
 from web_surf.extract import extract_facts_from_page
 from web_surf.fetch import PageResult
 from web_surf.runner import run_web_research
@@ -89,7 +99,8 @@ class DecisionTests(unittest.TestCase):
             self.snapshot,
             {"https://example.com/docs"},
         )
-        self.assertEqual(valid["url"], "https://example.com/docs")
+        self.assertEqual(valid["action"], "click")
+        self.assertEqual(valid["target_id"], "el_docs")
         self.assertEqual(error, "")
 
     def test_navigate_with_target_id_is_coerced_to_click(self) -> None:
@@ -102,14 +113,86 @@ class DecisionTests(unittest.TestCase):
         self.assertEqual(action["action"], "click")
         self.assertEqual(action["target_id"], "el_docs")
 
-    def test_navigate_to_visible_link_href_is_allowed(self) -> None:
+    def test_navigate_to_visible_link_href_is_coerced_to_click(self) -> None:
         action, error = validate_action(
             {"action": "navigate", "url": "https://example.com/docs"},
             self.snapshot,
             set(),
         )
         self.assertEqual(error, "")
-        self.assertEqual(action["url"], "https://example.com/docs")
+        self.assertEqual(action["action"], "click")
+        self.assertEqual(action["target_id"], "el_docs")
+
+    def test_navigate_same_page_anchor_is_coerced_to_click(self) -> None:
+        snapshot = {
+            "url": "https://news.example.com/article/patch-notes",
+            "interactables": [
+                {
+                    "id": "el_patch",
+                    "kind": "link",
+                    "text": "3.1.1 patch",
+                    "href": "https://news.example.com/article/patch-notes#3.1.1",
+                    "disabled": False,
+                }
+            ],
+        }
+        action, error = validate_action(
+            {
+                "action": "navigate",
+                "url": "https://news.example.com/article/patch-notes#3.1.1",
+            },
+            snapshot,
+            {"https://news.example.com/article/patch-notes"},
+        )
+        self.assertEqual(error, "")
+        self.assertEqual(action["action"], "click")
+        self.assertEqual(action["target_id"], "el_patch")
+
+    def test_report_blocked_while_overlay_present(self) -> None:
+        snapshot = {
+            "url": "https://example.com/",
+            "blocking_overlays": [{"id": "gate", "text": "Age Verification"}],
+            "interactables": [],
+        }
+        action, error = validate_action(
+            {"action": "report", "reason": "found it"},
+            snapshot,
+            set(),
+        )
+        self.assertIsNone(action)
+        self.assertIn("overlay", error.lower())
+
+    def test_extract_allowed_with_cookie_overlay_when_content_visible(self) -> None:
+        snapshot = {
+            "url": "https://gaming.example/patch-notes",
+            "visible_text": "Patch notes for July 14, 2026. " * 40,
+            "blocking_overlays": [
+                {"id": "cookie", "text": "We use cookies for consent", "role": "dialog"},
+            ],
+            "interactables": [],
+        }
+        action, error = validate_action(
+            {"action": "extract", "reason": "collect patch notes"},
+            snapshot,
+            set(),
+        )
+        self.assertEqual(error, "")
+        self.assertEqual(action["action"], "extract")
+
+    def test_extract_blocked_for_age_gate_even_with_visible_text(self) -> None:
+        snapshot = {
+            "url": "https://news.example/patch-notes",
+            "visible_text": "Patch notes preview " * 30,
+            "blocking_overlays": [{"id": "gate", "text": "Age Verification required"}],
+            "interactables": [],
+        }
+        action, error = validate_action(
+            {"action": "extract", "reason": "collect patch notes"},
+            snapshot,
+            set(),
+        )
+        self.assertIsNone(action)
+        self.assertIn("overlay", error.lower())
 
     def test_origin_and_relaxed_json_fallbacks(self) -> None:
         self.assertEqual(origin_url("https://Example.com/a?q=1"), "https://example.com/")
@@ -145,6 +228,68 @@ class DecisionTests(unittest.TestCase):
         )
         self.assertIsNone(action)
         self.assertIn("not discovered", error)
+
+    def test_discovered_official_links_expand_allowed_origins(self) -> None:
+        allowed = {"https://guide.example/"}
+        routes = {"https://guide.example/wiki"}
+        snapshot = {
+            "interactables": [
+                {
+                    "id": "el_official",
+                    "kind": "link",
+                    "text": "Official patch notes",
+                    "href": "https://news.publisher.com/en-us/article/1/product-patch-notes",
+                }
+            ]
+        }
+        promoted = _discover_official_outbound(
+            snapshot,
+            {"publisher.com"},
+            allowed,
+            routes,
+        )
+        self.assertEqual(len(promoted), 1)
+        self.assertIn("https://news.publisher.com/", allowed)
+        action, error = validate_action(
+            {"action": "navigate", "url": promoted[0]},
+            snapshot,
+            routes,
+            allowed,
+        )
+        self.assertIsNotNone(action, error)
+        self.assertEqual(action["action"], "click")
+        self.assertEqual(action["target_id"], "el_official")
+
+    def test_branch_redirect_expands_allowed_origins(self) -> None:
+        allowed = {"https://news.blizzard.com/"}
+        routes = {"https://news.blizzard.com/en-us/article/1/patch-notes"}
+        snapshot = {
+            "url": "https://timesaver.gg/guide",
+            "discovered_routes": ["https://timesaver.gg/guide/patch-notes"],
+            "interactables": [
+                {
+                    "id": "el_guide",
+                    "kind": "link",
+                    "text": "Patch notes",
+                    "href": "https://timesaver.gg/guide/patch-notes",
+                }
+            ],
+        }
+        expanded = _sync_branch_navigation(
+            page_url="https://timesaver.gg/guide",
+            snapshot=snapshot,
+            allowed_origins=allowed,
+            discovered_routes=routes,
+        )
+        self.assertTrue(expanded)
+        self.assertIn("https://timesaver.gg/", allowed)
+        action, error = validate_action(
+            {"action": "click", "target_id": "el_guide"},
+            snapshot,
+            routes,
+            allowed,
+        )
+        self.assertIsNotNone(action, error)
 
     def test_helper_response_is_read_from_matching_ndjson(self) -> None:
         stream = StringIO(
@@ -209,8 +354,43 @@ class DecisionTests(unittest.TestCase):
         self.assertIsNone(action)
         self.assertIn("value_key", error)
 
+    def test_fill_on_select_coerces_to_select_action(self) -> None:
+        snapshot = {
+            "blocking_overlays": [{"id": "gate", "text": "Verify your age"}],
+            "interactables": [
+                {
+                    "id": "el_year",
+                    "kind": "select",
+                    "name": "year",
+                    "aria": "year",
+                    "text": "year",
+                    "disabled": False,
+                }
+            ],
+        }
+        action, error = validate_action(
+            {"action": "fill", "target_id": "el_year", "value_key": "birth_year"},
+            snapshot,
+            set(),
+            form_values={"birth_year": "1990"},
+        )
+        self.assertEqual(error, "")
+        self.assertEqual(action["action"], "select")
+        self.assertEqual(action["value"], "1990")
 
-class FormValuePlannerTests(unittest.TestCase):
+    def test_select_uses_name_for_stable_id(self) -> None:
+        raw = [
+            {
+                "kind": "select",
+                "name": "year",
+                "aria": "year",
+                "text": "year 2026 2025 2024 2023",
+                "href": None,
+            }
+        ]
+        items = _enrich_interactables(raw, "https://example.com/")
+        self.assertEqual(items[0]["id"], "el-select-year")
+
     def test_detects_when_planning_is_needed(self) -> None:
         snapshot = {
             "blocking_overlays": [{"id": "gate", "text": "Confirm your age"}],
@@ -231,6 +411,267 @@ class FormValuePlannerTests(unittest.TestCase):
         self.assertIn("birth_date", result["form_values"])
         self.assertIn("country", result["form_values"])
         self.assertEqual(result["field_mapping"]["dob"], "birth_date")
+
+    def test_report_is_negative_detects_failure_reasons(self) -> None:
+        self.assertTrue(report_is_negative("patch notes are not available on this page"))
+        self.assertFalse(report_is_negative("found patch notes for July 14, 2026"))
+
+    def test_suggest_overlay_action_fills_birth_year_first(self) -> None:
+        snapshot = {
+            "blocking_overlays": [{"id": "gate", "text": "Age Verification"}],
+            "interactables": [
+                {"id": "el-select-year", "kind": "select", "name": "year", "text": "year"},
+                {"id": "el-select-month", "kind": "select", "name": "month", "text": "month"},
+                {"id": "el-select-day", "kind": "select", "name": "day", "text": "day"},
+            ],
+        }
+        action = suggest_overlay_action(
+            snapshot,
+            {"birth_year": "1990", "birth_month": "Jan", "birth_day": "1"},
+            {
+                "el-select-year": "birth_year",
+                "el-select-month": "birth_month",
+                "el-select-day": "birth_day",
+            },
+        )
+        self.assertEqual(action["action"], "select")
+        self.assertEqual(action["target_id"], "el-select-year")
+        self.assertEqual(action["value_key"], "birth_year")
+
+    def test_suggest_overlay_prefers_reject_over_cookie_policy_link(self) -> None:
+        """Regression: nearby_text on legal links must not steal accept/reject matching."""
+        snapshot = {
+            "blocking_overlays": [
+                {
+                    "id": "privacy-banner",
+                    "tag": "div",
+                    "text": "By clicking Accept All Cookies, you agree to cookie storage. Cookie Policy",
+                }
+            ],
+            "interactables": [
+                {
+                    "id": "el-link-cookie-policy",
+                    "kind": "link",
+                    "text": "Cookie Policy",
+                    "href": "https://www.blizzard.com/cookies",
+                    "landmark": "Privacy",
+                    "nearby_text": "By clicking Accept All Cookies, you agree to cookie storage.",
+                },
+                {
+                    "id": "el-button-reject-all",
+                    "kind": "button",
+                    "text": "Reject All",
+                    "landmark": "Privacy",
+                },
+                {
+                    "id": "el-button-accept-all-cookies",
+                    "kind": "button",
+                    "text": "Accept All Cookies",
+                    "landmark": "Privacy",
+                },
+            ],
+        }
+        action = suggest_overlay_action(snapshot, {}, {})
+        self.assertEqual(action["action"], "click")
+        self.assertEqual(action["target_id"], "el-button-reject-all")
+
+    def test_suggest_overlay_detects_cookie_banner_without_blocking_overlay(self) -> None:
+        snapshot = {
+            "visible_text": (
+                "By clicking Accept All Cookies, you agree to the storing of cookies "
+                "on your device to enhance site navigation."
+            ),
+            "blocking_overlays": [],
+            "interactables": [
+                {
+                    "id": "el-button-reject-all",
+                    "kind": "button",
+                    "text": "Reject All",
+                    "landmark": "Privacy",
+                },
+                {
+                    "id": "el-button-accept-all-cookies",
+                    "kind": "button",
+                    "text": "Accept All Cookies",
+                    "landmark": "Privacy",
+                },
+            ],
+        }
+        action = suggest_overlay_action(snapshot, {}, {})
+        self.assertEqual(action["action"], "click")
+        self.assertEqual(action["target_id"], "el-button-reject-all")
+
+    def test_normalize_gate_select_value_maps_numeric_month(self) -> None:
+        from web_surf.form_values import normalize_gate_select_value
+
+        field = {
+            "name": "month",
+            "options": ["month", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul"],
+        }
+        self.assertEqual(normalize_gate_select_value("7", field), "Jul")
+        self.assertEqual(normalize_gate_select_value("Jan", field), "Jan")
+
+    def test_suggest_overlay_fills_month_after_year_despite_dom_defaults(self) -> None:
+        snapshot = {
+            "blocking_overlays": [{"id": "gate", "text": "Age Verification"}],
+            "interactables": [
+                {"id": "el-select-year", "kind": "select", "name": "year", "text": "year", "value": "1990"},
+                {"id": "el-select-month", "kind": "select", "name": "month", "text": "month", "value": "1"},
+                {"id": "el-select-day", "kind": "select", "name": "day", "text": "day", "value": "1"},
+                {
+                    "id": "el-link-cookie-policy",
+                    "kind": "link",
+                    "text": "Cookie Policy",
+                    "nearby_text": "Accept All Cookies",
+                },
+            ],
+        }
+        history = [
+            {
+                "ok": True,
+                "action": "select",
+                "target_id": "el-select-year",
+            }
+        ]
+        action = suggest_overlay_action(
+            snapshot,
+            {"birth_year": "1990", "birth_month": "Jan", "birth_day": "1"},
+            {
+                "el-select-year": "birth_year",
+                "el-select-month": "birth_month",
+                "el-select-day": "birth_day",
+            },
+            recent_history=history,
+        )
+        self.assertEqual(action["action"], "select")
+        self.assertEqual(action["target_id"], "el-select-month")
+        self.assertEqual(action["value_key"], "birth_month")
+
+    def test_summarize_overlay_actions_maps_modal_controls(self) -> None:
+        from web_surf.form_values import summarize_overlay_actions
+
+        snapshot = {
+            "blocking_overlays": [{"id": "privacy-banner", "text": "Cookie consent"}],
+            "interactables": [
+                {"id": "reject", "kind": "button", "text": "Reject All", "landmark": "Privacy"},
+                {"id": "accept", "kind": "button", "text": "Accept All Cookies", "landmark": "Privacy"},
+                {"id": "policy", "kind": "link", "text": "Cookie Policy", "href": "/cookies"},
+            ],
+        }
+        summary = summarize_overlay_actions(snapshot)
+        self.assertEqual(len(summary), 1)
+        self.assertEqual(summary[0]["kind"], "cookie")
+        intents = {row["intent"] for row in summary[0]["actions"]}
+        self.assertIn("reject", intents)
+        self.assertIn("accept", intents)
+        self.assertNotIn("policy", intents)
+
+    def test_fallback_planner_maps_year_month_day_selects(self) -> None:
+        snapshot = {
+            "blocking_overlays": [{"id": "gate", "text": "Age gate"}],
+            "interactables": [
+                {"id": "year", "kind": "select", "name": "year", "aria": "year", "action_hint": "select"},
+                {"id": "month", "kind": "select", "name": "month", "aria": "month", "action_hint": "select"},
+                {"id": "day", "kind": "select", "name": "day", "aria": "day", "action_hint": "select"},
+            ],
+        }
+        result = fallback_form_values(snapshot)
+        self.assertEqual(result["form_values"]["birth_year"], "1990")
+        self.assertEqual(result["form_values"]["birth_month"], "Jan")
+        self.assertEqual(result["form_values"]["birth_day"], "1")
+        self.assertEqual(result["field_mapping"]["year"], "birth_year")
+
+    def test_pick_adult_year_rejects_recent_options(self) -> None:
+        self.assertEqual(_pick_adult_year(["2026", "2025", "1990", "1985"]), "1990")
+        self.assertEqual(_pick_adult_year(["2026", "2025", "2020"]), "1990")
+
+    def test_enforce_adult_verification_values_clamps_too_young_year(self) -> None:
+        snapshot = {
+            "interactables": [
+                {
+                    "id": "year",
+                    "kind": "select",
+                    "name": "year",
+                    "options": ["2026", "2025", "1990", "1985"],
+                }
+            ]
+        }
+        enforced = enforce_adult_verification_values({"birth_year": "2026"}, snapshot=snapshot)
+        self.assertEqual(enforced["birth_year"], "1990")
+
+    def test_looks_like_age_gate_from_year_month_day_fields(self) -> None:
+        snapshot = {
+            "interactables": [
+                {"id": "y", "kind": "select", "name": "year"},
+                {"id": "m", "kind": "select", "name": "month"},
+                {"id": "d", "kind": "select", "name": "day"},
+            ]
+        }
+        self.assertTrue(looks_like_age_gate(snapshot))
+
+    def test_looks_like_age_gate_ignores_embedded_game_widgets(self) -> None:
+        snapshot = {
+            "interactables": [
+                {
+                    "id": "el-select-difficulty",
+                    "kind": "select",
+                    "aria": "Difficulty",
+                    "options": ["Easy", "Hard"],
+                },
+                {"id": "el-input-email", "kind": "input", "label": "Email Address", "name": "email"},
+            ]
+        }
+        self.assertFalse(looks_like_age_gate(snapshot))
+
+    def test_filter_blocking_overlays_drops_video_trailers(self) -> None:
+        overlays = [
+            {"id": "div-1", "text": "Diablo 4: Lord of Hatred Launch Trailer WATCH NEXT Play Video 2:32"},
+            {"id": "privacy-banner", "text": "We use cookies. Accept All Cookies or Reject All."},
+        ]
+        filtered = filter_blocking_overlays(overlays)
+        self.assertEqual([item["id"] for item in filtered], ["privacy-banner"])
+
+    def test_needs_form_value_plan_false_for_video_overlay_and_game_fields(self) -> None:
+        snapshot = {
+            "blocking_overlays": [
+                {"id": "div-1", "text": "Diablo 4: Lord of Hatred Launch Trailer WATCH NEXT Play Video 2:32"},
+            ],
+            "interactables": [
+                {
+                    "id": "el-select-difficulty",
+                    "kind": "select",
+                    "aria": "Difficulty",
+                    "options": ["Easy", "Hard"],
+                },
+                {"id": "el-input-email", "kind": "input", "label": "Email Address", "name": "email"},
+            ],
+        }
+        self.assertFalse(needs_form_value_plan(snapshot, {}))
+
+    def test_suggest_overlay_action_does_not_fill_difficulty_for_false_gate(self) -> None:
+        snapshot = {
+            "blocking_overlays": [
+                {"id": "div-1", "text": "Diablo 4: Lord of Hatred Launch Trailer WATCH NEXT Play Video 2:32"},
+            ],
+            "interactables": [
+                {
+                    "id": "el-select-difficulty",
+                    "kind": "select",
+                    "aria": "Difficulty",
+                    "options": ["Easy", "Hard"],
+                },
+                {"id": "el-input-email", "kind": "input", "label": "Email Address", "name": "email"},
+            ],
+        }
+        action = suggest_overlay_action(
+            snapshot,
+            {"difficulty": "Hard", "email": "test@example.com"},
+            {
+                "el-select-difficulty": "difficulty",
+                "el-input-email": "email",
+            },
+        )
+        self.assertIsNone(action)
 
     def test_sanitize_form_values_normalizes_keys(self) -> None:
         values = sanitize_form_values({"Birth Date": "1990-01-01", "": "x", "note": ""})
@@ -254,7 +695,113 @@ class FormValuePlannerTests(unittest.TestCase):
         self.assertEqual(result["field_mapping"]["dob"], "birth_date")
 
 
+class ContentCollectTests(unittest.TestCase):
+    def test_content_collect_key_stable_for_same_text(self) -> None:
+        snapshot = {
+            "url": "https://games.gg/news/patch/",
+            "visible_text": "Diablo 4 patch 3.1.1 released July 14, 2026 with class fixes.",
+        }
+        first = _content_collect_key(snapshot, "patch notes July 14 2026")
+        second = _content_collect_key(snapshot, "patch notes July 14 2026")
+        self.assertEqual(first, second)
+        self.assertIn("|", first)
+        self.assertIn("games.gg", first)
+
+    def test_content_collect_key_changes_when_text_changes(self) -> None:
+        base = {
+            "url": "https://games.gg/news/patch/",
+            "visible_text": "Short summary only.",
+        }
+        expanded = {
+            **base,
+            "visible_text": "Short summary only. Full patch notes with detailed class fixes.",
+        }
+        self.assertNotEqual(
+            _content_collect_key(base, "patch notes"),
+            _content_collect_key(expanded, "patch notes"),
+        )
+
+    def test_content_collect_signature_includes_action(self) -> None:
+        key = "https://example.com/|abc123"
+        self.assertEqual(_content_collect_signature("extract", key), "extract|https://example.com/|abc123")
+
+    def test_curate_browse_context_marks_report_ready_after_collect(self) -> None:
+        payload = curate_browse_context(
+            query="Diablo 4 patch notes July 14 2026",
+            step_id="step_012",
+            snapshot={
+                "url": "https://games.gg/news/patch/",
+                "title": "Patch notes",
+                "visible_text": "Diablo 4 patch 3.1.1 released July 14, 2026.",
+                "interactables": [],
+            },
+            discovered_routes=[],
+            collected_evidence=[
+                {
+                    "url": "https://games.gg/news/patch/",
+                    "step_id": "step_011",
+                    "chars": 1200,
+                }
+            ],
+            helper_guidance=[
+                {
+                    "step_id": "step_011",
+                    "kind": "content_collected",
+                    "instruction": "Use action=report now.",
+                }
+            ],
+        )
+        self.assertTrue(payload.get("report_ready"))
+        self.assertIn("already collected", str(payload.get("evidence_collected") or "").lower())
+        self.assertIn("report", str(payload.get("guidance") or []))
+
+
 class StateDiffTests(unittest.TestCase):
+    def test_progress_fingerprint_ignores_form_values(self) -> None:
+        from ui_test.state_diff import progress_fingerprint
+
+        before = {
+            "url": "https://example.com/",
+            "blocking_overlays": [{"id": "gate", "text": "Age gate"}],
+            "interactables": [
+                {"id": "year", "kind": "select", "disabled": False, "value": "2026"},
+            ],
+        }
+        after = {
+            **before,
+            "interactables": [
+                {"id": "year", "kind": "select", "disabled": False, "value": "1990"},
+            ],
+        }
+        self.assertEqual(progress_fingerprint(before), progress_fingerprint(after))
+
+    def test_is_no_progress_treats_successful_field_fill_as_progress(self) -> None:
+        from ui_test.state_diff import is_no_progress
+
+        before = {
+            "url": "https://example.com/",
+            "blocking_overlays": [{"id": "gate", "text": "Age gate"}],
+            "interactables": [{"id": "year", "kind": "select", "value": "2026"}],
+        }
+        after = {
+            **before,
+            "interactables": [{"id": "year", "kind": "select", "value": "1990"}],
+        }
+        delta = diff_page_states(before, after)
+        self.assertTrue(delta["meaningful_change"])
+        self.assertFalse(is_no_progress(before, after, delta))
+
+    def test_is_no_progress_when_nothing_changed(self) -> None:
+        from ui_test.state_diff import is_no_progress
+
+        snapshot = {
+            "url": "https://example.com/",
+            "blocking_overlays": [{"id": "gate", "text": "Age gate"}],
+            "interactables": [{"id": "year", "kind": "select", "value": "1990"}],
+        }
+        delta = diff_page_states(snapshot, snapshot)
+        self.assertTrue(is_no_progress(snapshot, snapshot, delta))
+
     def test_form_values_are_redacted_from_agent_snapshots(self) -> None:
         snapshot = {
             "visible_text": "Birth date: 2000-01-01",
@@ -336,6 +883,30 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(facts[0]["source_session_id"], "web_session")
         self.assertEqual(facts[0]["source_step_id"], "step_004")
         self.assertEqual(facts[0]["source_snapshot_id"], "snap_abc")
+
+    def test_extract_preview_reports_accepted_and_rejected_facts(self) -> None:
+        parsed = {
+            "page_summary": "Patch notes",
+            "facts": [
+                {"field": "date", "value": "July 14", "quote": "July 14, 2026"},
+                {"field": "change", "value": "fixed bug", "quote": "not on page"},
+            ],
+        }
+        previews: list[dict] = []
+        with patch("web_surf.extract._ollama_json", return_value=parsed):
+            with patch("web_surf.extract.events.extract_preview", side_effect=lambda payload: previews.append(payload)):
+                facts, _ = extract_facts_from_page(
+                    page_text="Patch notes for July 14, 2026 include balance changes.",
+                    page_url="https://example.com/patch",
+                    page_title="Patch",
+                    research_spec={"data_needed": ["patch notes"]},
+                    ollama_url="http://ollama",
+                    model="model",
+                )
+        self.assertEqual(len(facts), 1)
+        self.assertEqual(previews[-1]["accepted_count"], 1)
+        self.assertEqual(previews[-1]["rejected_count"], 1)
+        self.assertIn("July 14, 2026", previews[-1]["text_preview"])
 
 
 class ExplorationSeedingTests(unittest.TestCase):

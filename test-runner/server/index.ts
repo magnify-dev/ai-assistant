@@ -275,9 +275,10 @@ function resetRunStateForNewRun(
 }
 
 function pushEvent(event: StoredEvent) {
-  eventLog.push({ ...event, ts: event.ts ?? new Date().toISOString() });
+  const stamped = { ...event, ts: event.ts ?? new Date().toISOString() };
+  eventLog.push(stamped);
   if (eventLog.length > 2000) eventLog.splice(0, eventLog.length - 2000);
-  appendRunLogs(event);
+  appendRunLogs(stamped);
 
   if (event.type === "phase" && typeof event.phase === "string") {
     runState.phase = event.phase;
@@ -471,6 +472,8 @@ function pushEvent(event: StoredEvent) {
       };
     }
   }
+
+  systemEvents.emit("event", stamped);
 }
 
 pythonRunner.on("event", pushEvent);
@@ -481,6 +484,7 @@ collaborationLoop.on("event", pushEvent);
 function runStartBlocked(): string | null {
   collaborationLoop.resetIfStale();
   if (
+    runState.running ||
     pythonRunner.running ||
     webResearchRunner.running ||
     cursorRunner.isRunning ||
@@ -524,37 +528,11 @@ function taskRunKind(task: string, noOllama = false): "web_research" | "ui_test"
   return classifyTaskRunKind(task, noOllama);
 }
 
-function startCollaborationRun(body: Record<string, unknown>, res: express.Response): void {
-  const project = typeof body.project === "string" ? body.project : "";
-  if (!project) {
-    res.status(400).json({ error: "project is required" });
-    return;
-  }
-
-  const task = typeof body.task === "string" ? body.task : "";
-  const target = resolveRunTargetOptions(
-    typeof body.testTarget === "string" ? body.testTarget : undefined,
-  );
-  const apiKey = process.env.CURSOR_API_KEY;
-  const cursorRuntime = body.cursorRuntime === "local" ? "local" : "cloud";
-  const repoUrl = typeof body.repoUrl === "string" ? body.repoUrl : undefined;
-  const cursorTarget = resolveCursorRuntime(cursorRuntime, repoUrl);
-  if (cursorTarget.error) {
-    res.status(400).json({ error: cursorTarget.error });
-    return;
-  }
-
-  const archivedRunId = archivePreviousRun(project);
-  eventLog.length = 0;
-  resetRunStateForNewRun(project, "ui_test", task);
-  initRunLogs(project);
-  if (archivedRunId) {
-    pushEvent({
-      type: "log",
-      message: `Archived previous run to .agent/history/${archivedRunId}`,
-      level: "info",
-    });
-  }
+function emitRunPreflightWarnings(
+  apiKey: string | undefined,
+  cursorRuntime: "local" | "cloud",
+  project: string,
+): void {
   if (!apiKey) {
     pushEvent({
       type: "log",
@@ -578,38 +556,107 @@ function startCollaborationRun(body: Record<string, unknown>, res: express.Respo
       });
     }
   }
+}
 
-  void collaborationLoop
-    .run({
-      project,
-      task,
-      push: target.push,
-      skipDeploy: target.skipDeploy,
-      testTarget: target.testTarget,
-      skipStructure: Boolean(body.skipStructure),
-      skipUi: Boolean(body.skipUi),
-      noOllama: Boolean(body.noOllama),
-      cursorRuntime,
-      repoUrl,
-      apiKey,
-    })
-    .then((result) => {
+type CollaborationRunBody = {
+  project: string;
+  task: string;
+  target: ReturnType<typeof resolveRunTargetOptions>;
+  apiKey: string | undefined;
+  cursorRuntime: "local" | "cloud";
+  repoUrl: string | undefined;
+  skipStructure: boolean;
+  skipUi: boolean;
+  noOllama: boolean;
+  resumeFrom?: import("./collaboration-transcript.js").CollaborationTranscript;
+  userNote?: string;
+};
+
+async function beginCollaborationRun(options: CollaborationRunBody): Promise<void> {
+  try {
+    const archivedRunId = archivePreviousRun(options.project);
+    initRunLogs(options.project);
+    if (archivedRunId) {
       pushEvent({
-        type: "done",
-        overall_ok: result.ok,
-        error: result.error,
-        answer: result.answer,
+        type: "log",
+        message: `Archived previous run to .agent/history/${archivedRunId}`,
+        level: "info",
       });
-    })
-    .catch((err) => {
-      pushEvent({
-        type: "collaboration_done",
-        ok: false,
-        error: err instanceof Error ? err.message : String(err),
-      });
+    }
+    emitRunPreflightWarnings(options.apiKey, options.cursorRuntime, options.project);
+
+    const result = await collaborationLoop.run({
+      project: options.project,
+      task: options.task,
+      push: options.target.push,
+      skipDeploy: options.target.skipDeploy,
+      testTarget: options.target.testTarget,
+      skipStructure: options.skipStructure,
+      skipUi: options.skipUi,
+      noOllama: options.noOllama,
+      cursorRuntime: options.cursorRuntime,
+      repoUrl: options.repoUrl,
+      apiKey: options.apiKey,
+      resumeFrom: options.resumeFrom,
+      userNote: options.userNote,
     });
+    pushEvent({
+      type: "done",
+      overall_ok: result.ok,
+      error: result.error,
+      answer: result.answer,
+    });
+  } catch (err) {
+    pushEvent({
+      type: "collaboration_done",
+      ok: false,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
+function startCollaborationRun(body: Record<string, unknown>, res: express.Response): void {
+  const project = typeof body.project === "string" ? body.project : "";
+  if (!project) {
+    res.status(400).json({ error: "project is required" });
+    return;
+  }
+
+  const task = typeof body.task === "string" ? body.task : "";
+  const target = resolveRunTargetOptions(
+    typeof body.testTarget === "string" ? body.testTarget : undefined,
+  );
+  const apiKey = process.env.CURSOR_API_KEY;
+  const cursorRuntime = body.cursorRuntime === "local" ? "local" : "cloud";
+  const repoUrl = typeof body.repoUrl === "string" ? body.repoUrl : undefined;
+  const cursorTarget = resolveCursorRuntime(cursorRuntime, repoUrl);
+  if (cursorTarget.error) {
+    res.status(400).json({ error: cursorTarget.error });
+    return;
+  }
+
+  eventLog.length = 0;
+  resetRunStateForNewRun(project, "ui_test", task);
+  pushEvent({
+    type: "phase",
+    phase: "collaboration",
+    status: "running",
+    message: "Preparing run…",
+  });
 
   res.json({ started: true });
+
+  void beginCollaborationRun({
+    project,
+    task,
+    target,
+    apiKey,
+    cursorRuntime,
+    repoUrl,
+    skipStructure: Boolean(body.skipStructure),
+    skipUi: Boolean(body.skipUi),
+    noOllama: Boolean(body.noOllama),
+  });
 }
 
 const app = express();
@@ -827,7 +874,14 @@ app.get("/api/project/run-history", (req, res) => {
     res.status(400).json({ error: "path query param is required" });
     return;
   }
-  res.json(listRunHistory(projectPath));
+  const offset = req.query.offset;
+  const limit = req.query.limit;
+  res.json(
+    listRunHistory(projectPath, {
+      offset: typeof offset === "string" ? Number(offset) : undefined,
+      limit: typeof limit === "string" ? Number(limit) : undefined,
+    }),
+  );
 });
 
 app.get("/api/project/run", (req, res) => {
@@ -1034,10 +1088,6 @@ app.get("/api/events", (req, res) => {
   }
 
   const onEvent = (event: StoredEvent) => send(event);
-  pythonRunner.on("event", onEvent);
-  webResearchRunner.on("event", onEvent);
-  cursorRunner.on("event", onEvent);
-  collaborationLoop.on("event", onEvent);
   systemEvents.on("event", onEvent);
 
   const heartbeat = setInterval(() => {
@@ -1047,10 +1097,6 @@ app.get("/api/events", (req, res) => {
 
   req.on("close", () => {
     clearInterval(heartbeat);
-    pythonRunner.off("event", onEvent);
-    webResearchRunner.off("event", onEvent);
-    cursorRunner.off("event", onEvent);
-    collaborationLoop.off("event", onEvent);
     systemEvents.off("event", onEvent);
   });
 });
@@ -1266,45 +1312,32 @@ app.post("/api/run/resume", async (req, res) => {
   }
 
   eventLog.length = 0;
-  resetRunStateForNewRun(project);
-  initRunLogs(project);
+  resetRunStateForNewRun(project, "ui_test", transcript.task);
+  pushEvent({
+    type: "phase",
+    phase: "collaboration",
+    status: "running",
+    message: "Resuming run…",
+  });
+
+  res.json({ started: true, resumedFrom: runId, task: transcript.task });
 
   const apiKey = process.env.CURSOR_API_KEY;
   const target = resolveRunTargetOptions(body.testTarget);
 
-  void collaborationLoop
-    .run({
-      project,
-      task: transcript.task,
-      push: target.push,
-      skipDeploy: target.skipDeploy,
-      testTarget: target.testTarget,
-      skipStructure: body.skipStructure,
-      skipUi: body.skipUi,
-      noOllama: body.noOllama,
-      cursorRuntime: body.cursorRuntime === "local" ? "local" : "cloud",
-      repoUrl: body.repoUrl,
-      apiKey,
-      resumeFrom: transcript,
-      userNote: typeof body.note === "string" ? body.note : undefined,
-    })
-    .then((result) => {
-      pushEvent({
-        type: "done",
-        overall_ok: result.ok,
-        error: result.error,
-        answer: result.answer,
-      });
-    })
-    .catch((err) => {
-      pushEvent({
-        type: "collaboration_done",
-        ok: false,
-        error: err instanceof Error ? err.message : String(err),
-      });
-    });
-
-  res.json({ started: true, resumedFrom: runId, task: transcript.task });
+  void beginCollaborationRun({
+    project,
+    task: transcript.task,
+    target,
+    apiKey,
+    cursorRuntime: body.cursorRuntime === "local" ? "local" : "cloud",
+    repoUrl: typeof body.repoUrl === "string" ? body.repoUrl : undefined,
+    skipStructure: Boolean(body.skipStructure),
+    skipUi: Boolean(body.skipUi),
+    noOllama: Boolean(body.noOllama),
+    resumeFrom: transcript,
+    userNote: typeof body.note === "string" ? body.note : undefined,
+  });
 });
 
 app.post("/api/run/full", (req, res) => {
@@ -1339,17 +1372,17 @@ const server = app.listen(PORT, "127.0.0.1", () => {
       console.log(`Ollama: model ${ollama.model} not installed — run: ollama pull ${ollama.model}`);
       return;
     }
-    if (status.modelLoaded) {
-      console.log(`Ollama: ${ollama.model} already loaded`);
+    if (!status.modelLoaded) {
+      console.log(`Ollama: preloading ${ollama.model} into VRAM…`);
+      try {
+        await switchOllamaModel(ollama.model, () => {});
+        console.log(`Ollama: ${ollama.model} ready`);
+      } catch (err) {
+        console.log(`Ollama preload skipped: ${err instanceof Error ? err.message : String(err)}`);
+      }
       return;
     }
-    console.log(`Ollama: preloading ${ollama.model} into VRAM…`);
-    try {
-      await preloadOllamaModel(ollama);
-      console.log(`Ollama: ${ollama.model} ready`);
-    } catch (err) {
-      console.log(`Ollama preload skipped: ${err instanceof Error ? err.message : String(err)}`);
-    }
+    console.log(`Ollama: ${ollama.model} already loaded`);
   })();
 });
 

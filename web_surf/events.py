@@ -37,6 +37,10 @@ def decision(payload: dict[str, Any]) -> None:
     _dispatch({"type": "web_decision", **payload})
 
 
+def agent_memory(payload: dict[str, Any]) -> None:
+    _dispatch({"type": "web_agent_memory", **payload})
+
+
 def playwright_session(payload: dict[str, Any]) -> None:
     _dispatch({"type": "playwright_session", **payload})
 
@@ -59,6 +63,11 @@ def llm_exchange(payload: dict[str, Any]) -> None:
 
 def evidence(payload: dict[str, Any]) -> None:
     _dispatch({"type": "web_evidence", **payload})
+
+
+def extract_preview(payload: dict[str, Any]) -> None:
+    """Emit page text and fact-extraction diagnostics for run review."""
+    _dispatch({"type": "web_extract_preview", **payload})
 
 
 def help_request(payload: dict[str, Any]) -> None:

@@ -6,9 +6,9 @@
       "id": "db173deb-348c-4113-80ae-e8c747b97647",
       "name": "content-manager",
       "path": "C:\\Users\\marce\\Documents\\Programming\\content-manager",
-      "lastUsed": "2026-07-11T13:48:27.957Z",
+      "lastUsed": "2026-07-14T23:23:08.657Z",
       "settings": {
-        "task": "find me the latest diablo 4 patch notes",
+        "task": "find me diablo 4 patch notes that go live with 14.7.2026 date and write those full changes in the answer",
         "skipCursor": false,
         "cursorRuntime": "local",
         "repoUrl": "",

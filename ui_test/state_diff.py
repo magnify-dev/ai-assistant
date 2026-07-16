@@ -5,7 +5,8 @@ from typing import Any
 
 from ui_test.interactables import element_key
 
-_STATE_FIELDS = ("disabled", "expanded", "selected", "checked", "value")
+_STATE_FIELDS = ("disabled", "expanded", "collapsed", "selected", "checked", "value")
+_PROGRESS_FIELDS = ("disabled", "expanded", "collapsed", "kind", "role")
 
 
 def _text_hash(value: Any) -> str:
@@ -22,6 +23,49 @@ def _elements(state: dict[str, Any]) -> dict[str, dict[str, Any]]:
         if key:
             result[key] = item
     return result
+
+
+def progress_fingerprint(state: dict[str, Any]) -> str:
+    """Stable page identity for loop detection — ignores transient form values."""
+    url = str(state.get("url") or "").strip()
+    blockers = sorted(
+        f"{item.get('id') or ''}:{item.get('text') or item.get('label') or ''}"
+        for item in (state.get("blocking_overlays") or [])
+        if isinstance(item, dict)
+    )
+    controls: list[str] = []
+    for item in state.get("interactables") or []:
+        if not isinstance(item, dict):
+            continue
+        control_id = str(item.get("id") or "").strip()
+        if not control_id:
+            continue
+        parts = [control_id]
+        for field in _PROGRESS_FIELDS:
+            parts.append(f"{field}={item.get(field)!s}")
+        controls.append("|".join(parts))
+    return _text_hash(f"{url}\n{'\n'.join(blockers)}\n{'\n'.join(sorted(controls))}")
+
+
+def action_signature(action: dict[str, Any]) -> str:
+    return "|".join(
+        [
+            str(action.get("action") or ""),
+            str(action.get("target_id") or ""),
+            str(action.get("url") or ""),
+            str(action.get("value_key") or ""),
+            str(action.get("value") or ""),
+        ]
+    )
+
+
+def is_no_progress(
+    before: dict[str, Any],
+    after: dict[str, Any],
+    delta: dict[str, Any],
+) -> bool:
+    """True only when the action changed nothing observable on the page."""
+    return not bool(delta.get("meaningful_change"))
 
 
 def diff_page_states(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:

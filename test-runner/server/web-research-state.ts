@@ -11,12 +11,14 @@ export type WebResearchState = JsonRecord & {
   candidates?: JsonRecord[];
   visitGraph?: JsonRecord;
   evidence?: JsonRecord[];
+  extractPreviews?: JsonRecord[];
   criteria?: JsonRecord[];
   unmetCriteria?: string[];
   helperExchanges?: JsonRecord[];
   transitions?: JsonRecord[];
   formValuePlans?: JsonRecord[];
   llmExchanges?: JsonRecord[];
+  agentMemory?: JsonRecord[];
   runFinished?: boolean;
   progress?: JsonRecord | null;
   indexPages?: JsonRecord[];
@@ -39,12 +41,14 @@ const WEB_EVENT_TYPES = new Set([
   "web_candidates",
   "web_visit_graph",
   "web_evidence",
+  "web_extract_preview",
   "web_criteria",
   "web_help_request",
   "web_help_response",
   "web_state_transition",
   "web_form_values_plan",
   "web_llm_exchange",
+  "web_agent_memory",
 ]);
 
 function record(value: unknown): JsonRecord | undefined {
@@ -112,6 +116,9 @@ export function composeWebResearchState(
     if (Array.isArray(event.llm_exchanges)) {
       next.llmExchanges = records(event.llm_exchanges) ?? [];
     }
+    if (Array.isArray(event.agent_memory)) {
+      next.agentMemory = records(event.agent_memory) ?? [];
+    }
   } else if (type === "web_index") {
     const pages = record(event.pages);
     if (pages) {
@@ -152,6 +159,23 @@ export function composeWebResearchState(
     } else {
       next.llmExchanges = appendBounded(existing, { ...event, ts }, 500);
     }
+  } else if (type === "web_agent_memory") {
+    const entry = record(event.entry);
+    const batch = records(event.memory);
+    if (batch?.length) {
+      next.agentMemory = batch;
+    } else if (entry) {
+      const existing = next.agentMemory ?? [];
+      const stepId = String(entry.step_id ?? "");
+      const updated = event.updated === true;
+      if (updated && stepId && existing.some((item) => String(item.step_id ?? "") === stepId)) {
+        next.agentMemory = existing.map((item) =>
+          String(item.step_id ?? "") === stepId ? { ...item, ...entry, ts } : item,
+        );
+      } else if (!stepId || !existing.some((item) => String(item.step_id ?? "") === stepId)) {
+        next.agentMemory = appendBounded(existing, { ...entry, ts });
+      }
+    }
   } else if (type === "web_candidates") {
     next.candidates = records(event.candidates ?? event.items) ?? [];
   } else if (type === "web_visit_graph") {
@@ -159,6 +183,8 @@ export function composeWebResearchState(
   } else if (type === "web_evidence") {
     const batch = records(event.evidence ?? event.items);
     next.evidence = batch ?? appendBounded(next.evidence, { ...eventPayload(event, "item"), ts });
+  } else if (type === "web_extract_preview") {
+    next.extractPreviews = appendBounded(next.extractPreviews, { ...event, ts }, 100);
   } else if (type === "web_criteria") {
     next.criteria = records(event.criteria ?? event.items) ?? next.criteria;
     next.unmetCriteria =
