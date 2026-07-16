@@ -69,6 +69,7 @@ _LOW_VALUE_HOSTS = (
     "tiktok.com",
     "pinterest.",
     "quora.com",
+    "forums.",
 )
 
 _TASK_WRAPPER_MARKER = re.compile(r"original user task:\s*", re.I)
@@ -120,6 +121,38 @@ def is_secondary_host(url: str) -> bool:
     """True for aggregators, social, and forums that rarely hold primary-source data."""
     host = urlsplit(str(url or "").lower()).netloc
     return any(marker in host for marker in _LOW_VALUE_HOSTS)
+
+
+def is_publisher_content_url(url: str) -> bool:
+    """True for article/news/support pages on a publisher domain (not forums or homepages)."""
+    if is_secondary_host(url):
+        return False
+    path = urlsplit(str(url or "").lower()).path
+    return any(
+        hint in path
+        for hint in (
+            "/article/",
+            "/news/",
+            "/patch",
+            "/changelog",
+            "/release",
+            "/blue-tracker/",
+            "/feed/",
+        )
+    )
+
+
+def seed_url_priority(url: str, query: str) -> tuple[int, int]:
+    """Rank candidate landing pages — higher is better."""
+    parsed = urlsplit(str(url or "").lower())
+    score = score_result_url(url, query)
+    if is_secondary_host(url):
+        score -= 80
+    if is_publisher_content_url(url):
+        score += 60
+    if "patch" in parsed.path and "note" in parsed.path:
+        score += 30
+    return (score, score)
 
 
 def registrable_domain(netloc: str) -> str:
@@ -485,7 +518,11 @@ def goal_is_satisfied(
     if not domains:
         return True
     if url_on_publisher_domain(source_url, domains):
-        return True
+        if is_secondary_host(source_url):
+            return page_has_substantive_content(text, query)
+        if is_publisher_content_url(source_url):
+            return True
+        return page_has_substantive_content(text, query)
     routes = publisher_routes or set()
     if any(url_on_publisher_domain(str(route), domains) for route in routes):
         return False

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type Dispatch, type SetStateAction } from "react";
 import { CollaborationPanel } from "@/components/CollaborationPanel";
 import { CurrentRunStatus } from "@/components/CurrentRunStatus";
 import { CheatsheetPanel } from "@/components/CheatsheetPanel";
@@ -30,11 +30,52 @@ import {
   type WebResearchState,
 } from "@/lib/webResearchTypes";
 import type { PhaseMap, RunEvent } from "@/types";
-import type { WebCapture, WebCaptureElement, WebCaptureReview } from "@/lib/webCaptureTypes";
+import type { WebCapture, WebCaptureBuildStatus, WebCaptureElement, WebCaptureReview } from "@/lib/webCaptureTypes";
 import { buildUiDisplaySnapshot, isUiDebugEnabled, traceUiDisplay } from "@/lib/uiRunDebug";
 import { UiRunDebugPanel } from "@/components/UiRunDebugPanel";
 
 const BROWSER_PHASES = ["exploration", "ui_test", "web_research"] as const;
+
+function applyWebCaptureProgress(
+  event: RunEvent & {
+    phase?: string;
+    message?: string;
+    capture?: WebCapture;
+    error?: string;
+    element_count?: number;
+    screenshot_b64?: string;
+    title?: string;
+    interactables?: BrowserState["interactables"];
+  },
+  setCaptureBuild: (value: WebCaptureBuildStatus | null) => void,
+  setWebCapture: (value: WebCapture | null) => void,
+  setBrowserState: Dispatch<SetStateAction<BrowserState | null>>,
+) {
+  const phase = (event.phase ?? "geometry") as WebCaptureBuildStatus["phase"];
+  setCaptureBuild({
+    phase,
+    url: event.url ? String(event.url) : undefined,
+    message: event.message ? String(event.message) : undefined,
+    error: event.error ? String(event.error) : undefined,
+    elementCount: typeof event.element_count === "number" ? event.element_count : undefined,
+    updatedAt: event.ts,
+  });
+  if (event.capture && typeof event.capture === "object") {
+    setWebCapture(event.capture);
+  }
+  if (event.url) {
+    setBrowserState((prev) => ({
+      url: String(event.url),
+      title: event.title ? String(event.title) : prev?.title,
+      interactables: Array.isArray(event.interactables) ? event.interactables : (prev?.interactables ?? []),
+      context: prev?.context ?? "web_exploration",
+      node_url: prev?.node_url,
+      ts: event.ts,
+      screenshot_b64: event.screenshot_b64 ? String(event.screenshot_b64) : prev?.screenshot_b64,
+      error: prev?.error,
+    }));
+  }
+}
 
 const SETTINGS_KEY = "test_runner_settings_v2";
 const VIEW_KEY = "test_runner_view_v1";
@@ -356,6 +397,7 @@ export default function App() {
   const [collaborationResult, setCollaborationResult] = useState<CollaborationResult | null>(null);
   const [webResearch, setWebResearch] = useState<WebResearchState | null>(null);
   const [webCapture, setWebCapture] = useState<WebCapture | null>(null);
+  const [captureBuild, setCaptureBuild] = useState<WebCaptureBuildStatus | null>(null);
   const [latestWebCaptureReview, setLatestWebCaptureReview] = useState<WebCaptureReview | null>(null);
   const [collabConfig, setCollabConfig] = useState<CollaborationConfig | null>(null);
   const [helperPromptDraft, setHelperPromptDraft] = useState("");
@@ -401,6 +443,7 @@ export default function App() {
     setCollaborationResult(null);
     setWebResearch(null);
     setWebCapture(null);
+    setCaptureBuild(null);
     setLatestWebCaptureReview(null);
   }, []);
 
@@ -729,6 +772,14 @@ export default function App() {
         );
       }
     }
+    if (event.type === "web_capture_progress") {
+      applyWebCaptureProgress(
+        event as RunEvent & { phase?: string; message?: string; capture?: WebCapture },
+        setCaptureBuild,
+        setWebCapture,
+        setBrowserState,
+      );
+    }
     if (event.type === "browser_state" && event.url) {
       setBrowserState({
         url: event.url,
@@ -741,7 +792,16 @@ export default function App() {
         error: (event as { error?: string }).error,
       });
       const capture = (event as RunEvent & { web_capture?: WebCapture }).web_capture;
-      if (capture) setWebCapture(capture);
+      if (capture) {
+        setWebCapture(capture);
+        setCaptureBuild({
+          phase: "complete",
+          url: event.url,
+          elementCount: capture.elements?.length,
+          message: "Map ready — inspect below",
+          updatedAt: event.ts,
+        });
+      }
       if (String(event.context ?? "").startsWith("web_")) {
         setWebResearch((prev) =>
           applyWebResearchEvent(prev, {
@@ -826,7 +886,16 @@ export default function App() {
             error: snapshot.error,
           });
         }
-        if (snapshot.web_capture) setWebCapture(snapshot.web_capture);
+        if (snapshot.web_capture) {
+          setWebCapture(snapshot.web_capture);
+          setCaptureBuild({
+            phase: "complete",
+            url: snapshot.url,
+            elementCount: snapshot.web_capture.elements?.length,
+            message: "Map ready — inspect below",
+            updatedAt: event.ts,
+          });
+        }
       }
       if (event.type === "web_research_progress" || event.type === "web_help_request") {
         setLogOpen(true);
@@ -2040,12 +2109,18 @@ export default function App() {
             </section>
           ) : null}
 
-          {(showLiveSession || webCapture || browserState?.url) ? (
-            <section className="surface-card shrink-0 p-4">
+          {(showLiveSession || webCapture || browserState?.url || captureBuild) ? (
+            <section
+              className={cn(
+                "surface-card shrink-0 p-4 transition-shadow duration-700",
+                captureBuild?.phase === "complete" && "ring-2 ring-violet-400/70 shadow-[0_0_28px_rgba(167,139,250,0.25)]",
+              )}
+            >
               <PageInspectPanel
                 state={replayMode ? null : browserState}
                 session={playwrightSession}
                 capture={webCapture}
+                captureBuild={captureBuild}
                 frameIndex={sessionFrameIndex}
                 onFrameIndexChange={setSessionFrameIndex}
                 lastAction={lastActionLine}

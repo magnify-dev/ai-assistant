@@ -3,7 +3,11 @@ from __future__ import annotations
 import unittest
 
 from web_surf.context_curate import curate_browse_context
-from web_surf.explore_branches import build_exploration_menu, summarize_exploration_branches
+from web_surf.explore_branches import (
+    build_exploration_menu,
+    summarize_exploration_branches,
+    unexplored_seed_urls,
+)
 
 
 class ExploreBranchTests(unittest.TestCase):
@@ -24,6 +28,21 @@ class ExploreBranchTests(unittest.TestCase):
         self.assertEqual(summary["current"]["status"], "active")
         self.assertEqual(len(summary["alternatives"]), 1)
         self.assertEqual(summary["alternatives"][0]["url"], "https://b.example/patch-notes")
+
+    def test_unexplored_seed_urls_tracks_opened_branches(self) -> None:
+        seeds = [
+            "https://eu.forums.blizzard.com/en/d4/t/patch-notes-for-july-14th-2026/25487",
+            "https://news.blizzard.com/en-us/article/24287406/diablo-iv-patch-notes",
+        ]
+        history = [
+            {
+                "ok": True,
+                "action": "extract",
+                "branch_url": seeds[0],
+            }
+        ]
+        pending = unexplored_seed_urls(seeds, history, active_branch_url=seeds[0])
+        self.assertEqual(pending, [seeds[1]])
 
     def test_summarize_marks_stalled_branch(self) -> None:
         history = [

@@ -13,14 +13,18 @@ from web_surf import events
 from web_surf.agent_memory import commit_agent_memory
 from web_surf.context_curate import curate_browse_context, normalize_decision
 from web_surf.fetch import PageResult
+from web_surf.explore_branches import unexplored_seed_urls
 from web_surf.page_match import (
     focus_query,
     goal_is_satisfied,
+    is_publisher_content_url,
+    is_secondary_host,
     page_contains_target_date,
     page_has_goal_links,
     page_matches_query,
     page_text_for_goal,
     parse_target_dates,
+    seed_url_priority,
     url_on_publisher_domain,
 )
 from web_surf.form_values import (
@@ -31,7 +35,6 @@ from web_surf.form_values import (
     overlay_blocks_collect,
     report_is_negative,
     sanitize_form_values,
-    suggest_overlay_action,
 )
 from web_surf.llm import ollama_chat
 from web_surf.spec import _get_prompt
@@ -410,17 +413,34 @@ def _snapshot(
     from ui_test.browser_state import attach_web_capture, collect_page_state
 
     state = _redact_form_values(collect_page_state(page, include_screenshot=True), form_values)
+    try:
+        from web_capture.capture import build_capture
+        from web_capture.progress import capture_progress_event
+
+        draft = build_capture(state, context=context)
+        capture_progress_event(
+            phase="geometry",
+            url=str(state.get("url") or ""),
+            capture=draft,
+            element_count=len(draft.get("elements") or []),
+            screenshot_b64=state.get("screenshot_b64"),
+            title=str(state.get("title") or ""),
+            interactables=list(state.get("interactables") or []),
+        )
+    except Exception:
+        pass
     attach_web_capture(page, state, context=context, analyze=True)
     state["snapshot_id"] = f"snap_{uuid.uuid4().hex[:12]}"
     state["session_id"] = session_id
     state["step_id"] = step_id
     state["context"] = context
-    events.snapshot(state)
+    events.snapshot(_compact_snapshot(state))
     return state
 
 
 def _compact_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
-    return {key: value for key, value in snapshot.items() if key != "screenshot_b64"}
+    """Event-safe snapshot for the test-runner map and screenshot panes."""
+    return dict(snapshot)
 
 
 def _locator_for(page: Any, item: dict[str, Any]) -> Any:
@@ -860,6 +880,7 @@ def explore_candidates_in_browser(
         url = _safe_normalize(str(getattr(row, "url", "")))
         if url and url not in seed_urls:
             seed_urls.append(url)
+    seed_urls.sort(key=lambda url: seed_url_priority(url, goal), reverse=True)
     origins = list(dict.fromkeys(origin_url(url) for url in seed_urls))
     allowed_origins = set(origins)
     # Search results are trusted starting points: land on them directly and let
@@ -1152,33 +1173,21 @@ def explore_candidates_in_browser(
                             "max_steps": max_steps,
                         }
                     )
-                    overlay_suggestion = None
-                    if _snapshot_blockers(snapshot):
-                        overlay_suggestion = suggest_overlay_action(
-                            snapshot,
-                            session_form_values,
-                            field_mapping,
-                            recent_history=history,
+                    if blocked_attempts:
+                        helper_guidance.append(
+                            {
+                                "step_id": step_id,
+                                "kind": "repeat_blocked",
+                                "instruction": (
+                                    "Blocked actions on this page: try a different control "
+                                    "from menu[] — fill age-gate fields, swap_branch, or report."
+                                ),
+                            }
                         )
-                    if overlay_suggestion:
-                        raw_decision = {
-                            **overlay_suggestion,
-                            "reason": str(
-                                overlay_suggestion.get("reason")
-                                or "Deterministic overlay step"
-                            ),
-                        }
-                        events.log(
-                            "Using deterministic overlay action: "
-                            f"{overlay_suggestion.get('action')} "
-                            f"{overlay_suggestion.get('target_id') or ''}".strip(),
-                            level="info",
-                        )
-                    else:
-                        try:
-                            raw_decision = decide(model_context)
-                        except Exception as exc:
-                            raw_decision = {"action": "help", "question": f"Decision model unavailable: {exc}"}
+                    try:
+                        raw_decision = decide(model_context)
+                    except Exception as exc:
+                        raw_decision = {"action": "help", "question": f"Decision model unavailable: {exc}"}
                     coerced = normalize_decision(raw_decision)
                     if coerced is not None:
                         raw_decision = coerced
@@ -1519,13 +1528,35 @@ def explore_candidates_in_browser(
                                     "report rejected: reason indicates the answer was not found — "
                                     "click a goal-relevant link or extract more evidence first"
                                 )
-                            elif page_has_goal_links(snapshot, goal):
+                            else:
+                                pending_seeds = unexplored_seed_urls(
+                                    seed_urls,
+                                    history,
+                                    active_branch_url=active_branch_url,
+                                )
+                                if pending_seeds:
+                                    reject_report = True
+                                    reject_error = (
+                                        "report rejected: other search candidates were not tried yet — "
+                                        f"use swap_branch to explore {pending_seeds[0][:120]}"
+                                    )
+                            if not reject_report and page_has_goal_links(snapshot, goal):
                                 reject_report = True
                                 reject_error = (
                                     "report rejected: goal-relevant links are still available — "
                                     "click one of them before reporting"
                                 )
-                            elif (
+                            elif not reject_report and (
+                                publisher_domain_set
+                                and is_secondary_host(str(snapshot.get("url") or ""))
+                                and any(is_publisher_content_url(str(route)) for route in discovered_routes)
+                            ):
+                                reject_report = True
+                                reject_error = (
+                                    "report rejected: official publisher article pages are still available — "
+                                    "swap_branch or follow a news/article link before reporting from forums"
+                                )
+                            elif not reject_report and (
                                 publisher_domain_set
                                 and not url_on_publisher_domain(
                                     str(snapshot.get("url") or ""),
@@ -1539,7 +1570,8 @@ def explore_candidates_in_browser(
                                     "follow a publisher link before reporting from a secondary site"
                                 )
                             elif (
-                                not report_rejected
+                                not reject_report
+                                and not report_rejected
                                 and not _goal_satisfied_for_page(
                                     page_result.text,
                                     goal,

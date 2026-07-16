@@ -117,3 +117,21 @@ export type WebCaptureReview = {
   note?: string;
   ts?: string;
 };
+
+export type WebCaptureBuildPhase =
+  | "idle"
+  | "geometry"
+  | "locators"
+  | "analyzing"
+  | "visual"
+  | "complete"
+  | "error";
+
+export type WebCaptureBuildStatus = {
+  phase: WebCaptureBuildPhase;
+  url?: string;
+  message?: string;
+  error?: string;
+  elementCount?: number;
+  updatedAt?: string;
+};

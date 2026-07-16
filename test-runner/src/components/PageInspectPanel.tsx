@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { apiUrl } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import type { BrowserState, PlaywrightSession, PlaywrightSessionFrame } from "@/lib/projectTypes";
-import type { WebCapture, WebCaptureElement, WebCaptureReview } from "@/lib/webCaptureTypes";
+import type { WebCapture, WebCaptureBuildStatus, WebCaptureElement, WebCaptureReview } from "@/lib/webCaptureTypes";
 import {
   boxTone,
   captureBoxStyle,
@@ -18,6 +18,7 @@ type Props = {
   state: BrowserState | null;
   session?: PlaywrightSession | null;
   capture?: WebCapture | null;
+  captureBuild?: WebCaptureBuildStatus | null;
   frameIndex?: number;
   onFrameIndexChange?: (index: number) => void;
   lastAction?: string;
@@ -25,6 +26,90 @@ type Props = {
   latestReview?: WebCaptureReview | null;
   onReview?: (review: Omit<WebCaptureReview, "captureId" | "ts"> & { element?: WebCaptureElement }) => Promise<void>;
 };
+
+const BUILDING_PHASES = new Set(["geometry", "locators", "analyzing", "visual"]);
+
+function CaptureBuildBanner({
+  captureBuild,
+  capture,
+}: {
+  captureBuild?: WebCaptureBuildStatus | null;
+  capture?: WebCapture | null;
+}) {
+  const phase = captureBuild?.phase ?? (capture ? "complete" : "idle");
+  if (phase === "idle") return null;
+
+  const building = BUILDING_PHASES.has(phase);
+  const draft = capture && capture.ai?.status === "pending";
+  const complete = phase === "complete";
+  const failed = phase === "error";
+
+  return (
+    <div
+      className={cn(
+        "flex flex-wrap items-center gap-2 rounded-lg border px-3 py-2 text-xs",
+        building && "border-sky-400/30 bg-sky-500/10 text-sky-100",
+        draft && !building && "border-amber-400/30 bg-amber-500/10 text-amber-100",
+        complete && "border-violet-400/40 bg-violet-500/15 text-violet-100",
+        failed && "border-rose-400/35 bg-rose-500/10 text-rose-100",
+      )}
+    >
+      {building ? (
+        <span className="inline-flex h-3 w-3 animate-spin rounded-full border-2 border-sky-200/30 border-t-sky-100" />
+      ) : complete ? (
+        <span className="inline-flex h-2.5 w-2.5 rounded-full bg-violet-300 shadow-[0_0_10px_rgba(196,181,253,0.9)]" />
+      ) : failed ? (
+        <span className="inline-flex h-2.5 w-2.5 rounded-full bg-rose-300" />
+      ) : (
+        <span className="inline-flex h-2.5 w-2.5 rounded-full bg-amber-300" />
+      )}
+      <span className="font-medium">
+        {failed
+          ? "Map build failed"
+          : complete
+            ? "Map ready — inspect below"
+            : draft
+              ? "Draft map visible — finishing analysis…"
+              : captureBuild?.message ?? "Building page map…"}
+      </span>
+      {captureBuild?.elementCount != null ? (
+        <span className="rounded-full bg-black/20 px-2 py-0.5 text-[10px] text-white/70">
+          {captureBuild.elementCount} controls
+        </span>
+      ) : capture?.elements?.length ? (
+        <span className="rounded-full bg-black/20 px-2 py-0.5 text-[10px] text-white/70">
+          {capture.elements.length} controls
+        </span>
+      ) : null}
+      {failed && captureBuild?.error ? (
+        <span className="text-[10px] text-rose-200/90">{captureBuild.error}</span>
+      ) : null}
+    </div>
+  );
+}
+
+function MapBuildSkeleton({ capture }: { capture?: WebCapture | null }) {
+  const cols = capture?.visual?.cols ?? 12;
+  const rows = capture?.visual?.rows ?? 8;
+  const cells = Array.from({ length: Math.min(cols * rows, 96) }, (_, index) => index);
+  return (
+    <div
+      className="grid gap-px overflow-hidden rounded bg-neutral-800/80 p-1"
+      style={{
+        gridTemplateColumns: `repeat(${cols}, minmax(0, 1fr))`,
+        aspectRatio: capture ? `${capture.viewport.width} / ${capture.viewport.height}` : "16 / 10",
+      }}
+    >
+      {cells.map((cell) => (
+        <div
+          key={cell}
+          className="min-h-[8px] animate-pulse bg-gradient-to-br from-white/10 to-white/5"
+          style={{ animationDelay: `${(cell % 7) * 120}ms` }}
+        />
+      ))}
+    </div>
+  );
+}
 
 function elementLabel(element: WebCaptureElement): string {
   return (
@@ -123,6 +208,7 @@ export function PageInspectPanel({
   state,
   session,
   capture,
+  captureBuild,
   frameIndex = 0,
   onFrameIndexChange,
   lastAction,
@@ -185,12 +271,18 @@ export function PageInspectPanel({
         ? "No saved map for this page yet — your corrections will create one"
         : null;
 
-  const showMap = Boolean(capture) && (view === "map" || view === "split");
-  const showPixels = Boolean(capture) && view === "pixels";
+  const building = BUILDING_PHASES.has(captureBuild?.phase ?? "");
+  const hasDraftCapture = Boolean(capture?.elements?.length);
+  const showWorkingMap = Boolean(capture) && (view === "map" || view === "split");
+  const showMap = showWorkingMap && (hasDraftCapture || !building);
+  const showPixels = Boolean(capture) && view === "pixels" && !building;
   const showScreenshot = view === "screenshot" || view === "split" || !capture;
+  const showEmpty = !capture && !screenshotSrc && !building && !captureBuild;
 
   return (
     <div className="space-y-3">
+      <CaptureBuildBanner captureBuild={captureBuild} capture={capture} />
+
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div className="min-w-0">
           <h2 className="text-sm font-semibold uppercase tracking-wide text-white/55">Page inspect</h2>
@@ -204,18 +296,20 @@ export function PageInspectPanel({
             </p>
           ) : null}
         </div>
-        {capture ? (
+        {capture || screenshotSrc || building ? (
           <div className="flex flex-wrap gap-1">
             {(["map", "pixels", "screenshot", "split"] as InspectView[]).map((mode) => (
               <button
                 key={mode}
                 type="button"
+                disabled={mode !== "screenshot" && building && !hasDraftCapture}
                 onClick={() => setView(mode)}
                 className={cn(
                   "rounded-md border px-2.5 py-1 text-xs capitalize",
                   view === mode
                     ? "border-sky-400/50 bg-sky-500/15 text-sky-100"
                     : "border-white/10 text-white/55 hover:bg-white/5",
+                  mode !== "screenshot" && building && !hasDraftCapture && "opacity-40",
                 )}
               >
                 {mode}
@@ -245,12 +339,19 @@ export function PageInspectPanel({
         </div>
       ) : null}
 
-      {!capture && !screenshotSrc ? (
+      {showEmpty ? (
         <div className="flex min-h-[200px] flex-col items-center justify-center rounded-lg border border-dashed border-white/15 bg-black/20 p-8 text-center">
           <p className="text-sm text-white/50">Run a task with browser activity to inspect the page map.</p>
         </div>
       ) : (
         <div className={cn("grid gap-3", view === "split" ? "xl:grid-cols-2" : "grid-cols-1")}>
+          {building && !hasDraftCapture && (view === "map" || view === "split" || view === "pixels") ? (
+            <div className="space-y-2">
+              <p className="text-[10px] text-white/45">Sampling page geometry and controls…</p>
+              <MapBuildSkeleton capture={capture ?? undefined} />
+            </div>
+          ) : null}
+
           {showMap && capture ? (
             <div className="space-y-3">
               <div className="flex flex-wrap gap-1 text-[10px]">

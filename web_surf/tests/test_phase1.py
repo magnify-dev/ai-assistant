@@ -166,7 +166,22 @@ class PageMatchTests(unittest.TestCase):
 
     def test_is_secondary_host_detects_social(self) -> None:
         self.assertTrue(is_secondary_host("https://www.reddit.com/r/game"))
+        self.assertTrue(is_secondary_host("https://eu.forums.blizzard.com/en/d4/t/patch-notes/1"))
         self.assertFalse(is_secondary_host("https://news.examplegame.com/patch-notes"))
+
+    def test_seed_url_priority_prefers_publisher_articles_over_forums(self) -> None:
+        from web_surf.page_match import seed_url_priority
+
+        query = "diablo 4 patch notes 14.7.2026"
+        news = seed_url_priority(
+            "https://news.blizzard.com/en-us/article/24287406/diablo-iv-patch-notes",
+            query,
+        )
+        forum = seed_url_priority(
+            "https://eu.forums.blizzard.com/en/d4/t/patch-notes-for-july-14th-2026/25487",
+            query,
+        )
+        self.assertGreater(news[0], forum[0])
 
     def test_publisher_article_urls_are_official(self) -> None:
         self.assertTrue(

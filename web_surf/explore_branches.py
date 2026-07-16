@@ -41,6 +41,36 @@ def _visited_urls(history: list[dict[str, Any]]) -> set[str]:
     return visited
 
 
+def _explored_branch_urls(history: list[dict[str, Any]]) -> set[str]:
+    explored: set[str] = set()
+    for item in history:
+        if not item.get("ok"):
+            continue
+        branch = _safe_norm(str(item.get("branch_url") or ""))
+        if branch:
+            explored.add(branch)
+    return explored
+
+
+def unexplored_seed_urls(
+    seed_urls: list[str],
+    history: list[dict[str, Any]],
+    *,
+    active_branch_url: str = "",
+) -> list[str]:
+    """Seed URLs from search that have not yet been opened as an exploration branch."""
+    explored = _explored_branch_urls(history)
+    active = _safe_norm(active_branch_url)
+    if active:
+        explored.add(active)
+    pending: list[str] = []
+    for url in seed_urls:
+        norm = _safe_norm(url)
+        if norm and norm not in explored:
+            pending.append(norm)
+    return pending
+
+
 def _branch_history(
     history: list[dict[str, Any]],
     *,

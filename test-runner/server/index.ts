@@ -319,6 +319,30 @@ function pushEvent(event: StoredEvent) {
       runState.webCapture = event.web_capture;
     }
   }
+  if (event.type === "web_capture_progress") {
+    runState.captureBuild = {
+      phase: event.phase,
+      url: event.url,
+      message: event.message,
+      error: event.error,
+      elementCount: event.element_count,
+      updatedAt: event.ts,
+    };
+    if (event.capture && typeof event.capture === "object") {
+      runState.webCapture = event.capture;
+    }
+    if (event.url && (event.screenshot_b64 || event.interactables)) {
+      runState.browserState = {
+        ...(runState.browserState as Record<string, unknown> | null),
+        url: event.url,
+        title: event.title,
+        interactables: event.interactables ?? [],
+        screenshot_b64: event.screenshot_b64,
+        context: "web_exploration",
+        ts: event.ts,
+      };
+    }
+  }
   if (event.type === "test_target") {
     runState.testTarget = {
       url: event.url,

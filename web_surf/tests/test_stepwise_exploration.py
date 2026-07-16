@@ -414,6 +414,7 @@ class DecisionTests(unittest.TestCase):
 
     def test_report_is_negative_detects_failure_reasons(self) -> None:
         self.assertTrue(report_is_negative("patch notes are not available on this page"))
+        self.assertTrue(report_is_negative("community feedback discussing patch 3.1.1, but no official patch notes"))
         self.assertFalse(report_is_negative("found patch notes for July 14, 2026"))
 
     def test_suggest_overlay_action_fills_birth_year_first(self) -> None:
@@ -546,6 +547,64 @@ class DecisionTests(unittest.TestCase):
         self.assertEqual(action["action"], "select")
         self.assertEqual(action["target_id"], "el-select-month")
         self.assertEqual(action["value_key"], "birth_month")
+
+    def test_suggest_overlay_skips_blocked_cookie_and_fills_age_gate(self) -> None:
+        """After a failed cookie dismiss, fill age-gate fields instead of retrying the same click."""
+        snapshot = {
+            "blocking_overlays": [
+                {"id": "privacy-banner", "text": "Cookie consent and privacy"},
+                {"id": "age-gate", "text": "Age Verification date of birth"},
+            ],
+            "interactables": [
+                {
+                    "id": "el-button-allow-all",
+                    "kind": "button",
+                    "text": "Allow All",
+                    "landmark": "Privacy",
+                },
+                {"id": "el-select-year", "kind": "select", "name": "year", "text": "year"},
+                {"id": "el-select-month", "kind": "select", "name": "month", "text": "month"},
+                {"id": "el-select-day", "kind": "select", "name": "day", "text": "day"},
+            ],
+        }
+        history = [
+            {
+                "ok": False,
+                "progress": False,
+                "action": "click",
+                "target_id": "el-button-allow-all",
+                "reason": "Dismiss consent/cookie overlay (Allow All)",
+            }
+        ]
+        action = suggest_overlay_action(
+            snapshot,
+            {"birth_year": "1990", "birth_month": "Jan", "birth_day": "1"},
+            {
+                "el-select-year": "birth_year",
+                "el-select-month": "birth_month",
+                "el-select-day": "birth_day",
+            },
+            recent_history=history,
+            blocked_attempts=["click|el-button-allow-all|||"],
+        )
+        self.assertEqual(action["action"], "select")
+        self.assertEqual(action["target_id"], "el-select-year")
+
+    def test_suggest_overlay_skips_blocked_signature(self) -> None:
+        snapshot = {
+            "blocking_overlays": [{"id": "privacy-banner", "text": "Cookie consent"}],
+            "interactables": [
+                {"id": "reject", "kind": "button", "text": "Reject All", "landmark": "Privacy"},
+                {"id": "accept", "kind": "button", "text": "Accept All Cookies", "landmark": "Privacy"},
+            ],
+        }
+        action = suggest_overlay_action(
+            snapshot,
+            {},
+            {},
+            blocked_attempts=["click|reject|||"],
+        )
+        self.assertEqual(action["target_id"], "accept")
 
     def test_summarize_overlay_actions_maps_modal_controls(self) -> None:
         from web_surf.form_values import summarize_overlay_actions

@@ -139,6 +139,7 @@ const WEB_EVENT_TYPES = new Set([
   "web_form_values_plan",
   "web_llm_exchange",
   "web_agent_memory",
+  "web_capture_progress",
 ]);
 
 type UnknownEvent = Record<string, unknown> & { type?: string; ts?: string };

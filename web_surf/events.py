@@ -33,6 +33,34 @@ def snapshot(payload: dict[str, Any]) -> None:
     _dispatch({"type": "web_snapshot", **payload})
 
 
+def capture_progress(
+    *,
+    phase: str,
+    url: str = "",
+    message: str = "",
+    capture: dict[str, Any] | None = None,
+    error: str | None = None,
+    element_count: int | None = None,
+    screenshot_b64: str | None = None,
+    title: str = "",
+    interactables: list[dict[str, Any]] | None = None,
+) -> None:
+    _dispatch(
+        {
+            "type": "web_capture_progress",
+            "phase": phase,
+            "url": url,
+            "message": message,
+            "capture": capture,
+            "error": error,
+            "element_count": element_count,
+            "screenshot_b64": screenshot_b64,
+            "title": title,
+            "interactables": interactables,
+        }
+    )
+
+
 def decision(payload: dict[str, Any]) -> None:
     _dispatch({"type": "web_decision", **payload})
 

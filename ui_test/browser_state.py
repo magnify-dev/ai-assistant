@@ -316,11 +316,41 @@ _DIALOG_FORM_CONTROLS_JS = """() => {
     const parent = el.closest("li,td,th,p,div,section,form,label") || el.parentElement;
     return parent ? clean(parent.innerText || parent.textContent, 220) : "";
   }
+  function isVisible(el) {
+    const rect = el.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return false;
+    const style = getComputedStyle(el);
+    if (style.visibility === "hidden" || style.display === "none" || style.opacity === "0") return false;
+    return true;
+  }
+  function cssPath(el) {
+    if (el.id) return `#${CSS.escape(el.id)}`;
+    const parts = [];
+    let node = el;
+    while (node && node.nodeType === Node.ELEMENT_NODE && parts.length < 6) {
+      let part = node.tagName.toLowerCase();
+      const testId = node.getAttribute("data-testid");
+      if (testId) {
+        parts.unshift(`[data-testid="${CSS.escape(testId)}"]`);
+        break;
+      }
+      if (node.parentElement) {
+        const siblings = Array.from(node.parentElement.children).filter(
+          (candidate) => candidate.tagName === node.tagName
+        );
+        if (siblings.length > 1) part += `:nth-of-type(${siblings.indexOf(node) + 1})`;
+      }
+      parts.unshift(part);
+      node = node.parentElement;
+    }
+    return parts.join(" > ");
+  }
   function collectFromRoot(root, modalRoot) {
     const selector =
       "select, input:not([type='hidden']), textarea, button, blz-button, blz-select, [role='combobox'], [role='textbox'], [role='spinbutton'], [role='button']";
     const rows = [];
     for (const el of root.querySelectorAll(selector)) {
+      if (!isVisible(el)) continue;
       const tag = el.tagName.toLowerCase();
       const role = el.getAttribute("role") || "";
       let kind = tag;
@@ -337,6 +367,7 @@ _DIALOG_FORM_CONTROLS_JS = """() => {
       } else if (kind === "textbox" || kind === "combobox" || kind === "spinbutton") {
         text = aria || fieldName || associatedLabel(el) || clean(el.getAttribute("placeholder") || "", 80) || text.slice(0, 40);
       }
+      const bounds = el.getBoundingClientRect();
       const row = {
         index: rows.length,
         kind,
@@ -360,6 +391,13 @@ _DIALOG_FORM_CONTROLS_JS = """() => {
         nearby_text: nearbyText(el) || null,
         in_dialog: true,
         dialog_label: clean(modalRoot.getAttribute("aria-label") || modalRoot.getAttribute("aria-labelledby") || textOf(modalRoot).slice(0, 80), 120) || null,
+        rect: {
+          x: bounds.x,
+          y: bounds.y,
+          width: bounds.width,
+          height: bounds.height,
+        },
+        css_path: cssPath(el),
       };
       if (tag === "select") {
         const optEntries = Array.from(el.options || []).slice(0, 40);
@@ -802,6 +840,33 @@ def capture_screenshot_b64(page: Page) -> str | None:
         return None
 
 
+def _resolve_viewport(page: Page, raw_viewport: Any) -> dict[str, Any]:
+    """Use browser-reported viewport, falling back to Playwright viewport size."""
+    if isinstance(raw_viewport, dict) and raw_viewport.get("width") and raw_viewport.get("height"):
+        return raw_viewport
+    try:
+        size = page.viewport_size
+        if size and size.get("width") and size.get("height"):
+            return {
+                "width": float(size["width"]),
+                "height": float(size["height"]),
+                "scroll_x": 0.0,
+                "scroll_y": 0.0,
+                "document_width": float(size["width"]),
+                "document_height": float(size["height"]),
+            }
+    except Exception:
+        pass
+    return {
+        "width": 1280.0,
+        "height": 720.0,
+        "scroll_x": 0.0,
+        "scroll_y": 0.0,
+        "document_width": 1280.0,
+        "document_height": 720.0,
+    }
+
+
 def collect_page_state(page: Page, *, include_screenshot: bool = True) -> dict[str, Any]:
     """Create a compact semantic snapshot with stable IDs and page context."""
     try:
@@ -856,11 +921,11 @@ def collect_page_state(page: Page, *, include_screenshot: bool = True) -> dict[s
         "url": page_url,
         "title": title,
         "interactables": interactables,
-        "viewport": (
+        "viewport": _resolve_viewport(
+            page,
             raw_interactables.get("viewport")
             if isinstance(raw_interactables, dict)
-            and isinstance(raw_interactables.get("viewport"), dict)
-            else {}
+            else {},
         ),
         "interactables_total": interactable_total,
         "interactables_truncated": interactable_total > len(interactables),
@@ -883,8 +948,38 @@ def attach_web_capture(
     *,
     context: str = "",
     analyze: bool = True,
+    emit_progress: bool = True,
 ) -> dict[str, Any]:
     """Build a spatial capture while the originating Playwright page is still live."""
+    url = str(state.get("url") or "")
+
+    def _progress(
+        phase: str,
+        *,
+        capture: dict[str, Any] | None = None,
+        error: str | None = None,
+    ) -> None:
+        if not emit_progress:
+            return
+        try:
+            from web_capture.progress import capture_progress_event
+
+            element_count = None
+            if capture and isinstance(capture.get("elements"), list):
+                element_count = len(capture["elements"])
+            capture_progress_event(
+                phase=phase,
+                url=url,
+                capture=capture,
+                error=error,
+                element_count=element_count,
+                screenshot_b64=state.get("screenshot_b64"),
+                title=str(state.get("title") or ""),
+                interactables=list(state.get("interactables") or []),
+            )
+        except Exception:
+            pass
+
     try:
         from web_capture.analyzer import analyze_capture
         from web_capture.capture import build_capture
@@ -893,12 +988,19 @@ def attach_web_capture(
         from web_capture.maps import apply_site_map, sync_interactables_from_capture
         from web_capture.visual import collect_visual_tiles, resolve_visual_map
 
+        _progress("geometry")
         capture = build_capture(state, context=context)
+        _progress("geometry", capture=capture)
+        _progress("locators")
         validate_capture_locators(page, capture)
+        capture.setdefault("ai", {"status": "pending"})
+        _progress("locators", capture=capture)
         if analyze:
+            _progress("analyzing")
             analyze_capture(capture)
         project = get_active_project()
         apply_site_map(capture, project)
+        _progress("visual")
         fresh_tiles = collect_visual_tiles(page)
         capture["visual"] = resolve_visual_map(
             project,
@@ -910,8 +1012,10 @@ def attach_web_capture(
         )
         sync_interactables_from_capture(state, capture)
         state["web_capture"] = capture
+        _progress("complete", capture=capture)
     except Exception as exc:
         state["web_capture_error"] = str(exc)[:300]
+        _progress("error", error=str(exc)[:300])
     return state
 
 

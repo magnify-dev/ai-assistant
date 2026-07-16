@@ -75,6 +75,7 @@ NEGATIVE_REPORT_RE = re.compile(
     r"\b("
     r"not available|not found|unable to find|cannot find|could not find|"
     r"no .{0,40}found|does not contain|does not display|aren't available|are not available|"
+    r"no official|not official|without official|community feedback|"
     r"unavailable|no relevant|without finding|not present|doesn't contain"
     r")\b",
     re.I,
@@ -239,12 +240,65 @@ def _consent_action_score(item: dict[str, Any], *, reject: bool) -> int:
     return -1
 
 
+def _action_signature(action: dict[str, Any]) -> str:
+    from ui_test.state_diff import action_signature
+
+    return action_signature(action)
+
+
+def _blocked_action_signatures(
+    recent_history: list[dict[str, Any]] | None,
+    blocked_attempts: list[str] | None = None,
+) -> set[str]:
+    """Signatures of actions that already failed or made no progress on this page."""
+    blocked = {str(sig).strip() for sig in (blocked_attempts or []) if str(sig).strip()}
+    for row in recent_history or []:
+        if not isinstance(row, dict):
+            continue
+        if row.get("ok") is True:
+            continue
+        if row.get("progress") is not False and row.get("ok") is not False:
+            continue
+        sig = _action_signature(
+            {
+                "action": row.get("action"),
+                "target_id": row.get("target_id"),
+                "url": row.get("url") or row.get("target_href"),
+                "value_key": row.get("value_key"),
+                "value": row.get("value"),
+            }
+        )
+        if sig.strip("|"):
+            blocked.add(sig)
+    return blocked
+
+
+def _action_is_blocked(action: dict[str, Any] | None, blocked: set[str]) -> bool:
+    return bool(action and _action_signature(action) in blocked)
+
+
+def _cookie_dismiss_failed(recent_history: list[dict[str, Any]] | None) -> bool:
+    for row in recent_history or []:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("action") or "") != "click":
+            continue
+        if row.get("ok") is True or row.get("progress") is True:
+            continue
+        reason = str(row.get("reason") or "").lower()
+        if "consent" in reason or "cookie" in reason or "overlay" in reason:
+            return True
+    return False
+
+
 def _pick_consent_action(
     controls: list[dict[str, Any]],
     *,
     prefer_reject: bool = True,
     reason: str = "Reject consent/cookie overlay",
+    blocked: set[str] | None = None,
 ) -> dict[str, Any] | None:
+    blocked = blocked or set()
     buttons = [item for item in controls if _is_overlay_button(item)]
     if prefer_reject:
         ranked = sorted(
@@ -255,11 +309,13 @@ def _pick_consent_action(
         for item, score in ranked:
             if score >= 0:
                 label = _primary_label(item) or item.get("id")
-                return {
+                action = {
                     "action": "click",
                     "target_id": str(item["id"]),
                     "reason": f"{reason} ({label})",
                 }
+                if not _action_is_blocked(action, blocked):
+                    return action
     ranked = sorted(
         ((item, _consent_action_score(item, reject=False)) for item in buttons),
         key=lambda pair: pair[1],
@@ -268,25 +324,90 @@ def _pick_consent_action(
     for item, score in ranked:
         if score >= 0:
             label = _primary_label(item) or item.get("id")
-            return {
+            action = {
                 "action": "click",
                 "target_id": str(item["id"]),
                 "reason": f"Dismiss consent/cookie overlay ({label})",
             }
+            if not _action_is_blocked(action, blocked):
+                return action
     return None
 
 
-def _pick_age_gate_confirm(interactables: list[Any]) -> dict[str, Any] | None:
+def _pick_age_gate_confirm(
+    interactables: list[Any],
+    *,
+    blocked: set[str] | None = None,
+) -> dict[str, Any] | None:
+    blocked = blocked or set()
     for raw in interactables:
         if not isinstance(raw, dict) or not _is_overlay_button(raw):
             continue
         primary = _primary_label(raw)
         if GATE_CONFIRM_RE.search(primary):
-            return {
+            action = {
                 "action": "click",
                 "target_id": str(raw["id"]),
                 "reason": "Confirm age verification after filling gate fields",
             }
+            if not _action_is_blocked(action, blocked):
+                return action
+    return None
+
+
+def _suggest_gate_field_action(
+    snapshot: dict[str, Any],
+    form_values: dict[str, str],
+    field_mapping: dict[str, str],
+    *,
+    recent_history: list[dict[str, Any]] | None = None,
+    blocked: set[str] | None = None,
+) -> dict[str, Any] | None:
+    blocked = blocked or set()
+    interactables = snapshot.get("interactables") or []
+    filled_ids = {
+        str(row.get("target_id") or "")
+        for row in (recent_history or [])
+        if row.get("ok") and row.get("action") in {"fill", "select"} and row.get("target_id")
+    }
+    gate_fields = sorted(collect_gate_fields(snapshot), key=_gate_field_rank)
+    for field in gate_fields:
+        if not _field_is_unfilled(field, filled_ids=filled_ids, require_explicit_fill=True):
+            continue
+        semantic_key = field_mapping.get(field["id"])
+        if not semantic_key:
+            continue
+        value = (form_values or {}).get(semantic_key)
+        if not value:
+            continue
+        raw_field = next(
+            (
+                item
+                for item in interactables
+                if isinstance(item, dict) and str(item.get("id") or "") == field["id"]
+            ),
+            field,
+        )
+        value = normalize_gate_select_value(str(value), raw_field if isinstance(raw_field, dict) else field)
+        action_name = "select" if str(field.get("kind") or "").lower() in {"select", "combobox"} else "fill"
+        action = {
+            "action": action_name,
+            "target_id": field["id"],
+            "value_key": semantic_key,
+            "value": value,
+            "reason": f"Fill {semantic_key} to clear age verification overlay",
+        }
+        if not _action_is_blocked(action, blocked):
+            return action
+
+    if gate_fields and looks_like_age_gate(snapshot):
+        unfilled = [
+            field
+            for field in gate_fields
+            if _field_is_unfilled(field, filled_ids=filled_ids, require_explicit_fill=True)
+        ]
+        if not unfilled:
+            return _pick_age_gate_confirm(interactables, blocked=blocked)
     return None
 
 
@@ -477,95 +598,95 @@ def _cookie_buttons_from_interactables(interactables: list[Any]) -> list[dict[st
     ]
 
 
+def snapshot_needs_overlay_action(snapshot: dict[str, Any]) -> bool:
+    """True when deterministic overlay handling should run before the LLM decides."""
+    if _snapshot_blockers(snapshot):
+        return True
+    if looks_like_age_gate(snapshot):
+        return True
+    return _infer_cookie_overlay(snapshot) is not None
+
+
 def suggest_overlay_action(
     snapshot: dict[str, Any],
     form_values: dict[str, str],
     field_mapping: dict[str, str],
     *,
     recent_history: list[dict[str, Any]] | None = None,
+    blocked_attempts: list[str] | None = None,
 ) -> dict[str, Any] | None:
     """Deterministic next step to clear a blocking overlay (cookie consent, age gate, etc.)."""
+    blocked = _blocked_action_signatures(recent_history, blocked_attempts)
     overlays = list(_snapshot_blockers(snapshot))
     inferred_cookie = _infer_cookie_overlay(snapshot)
     if inferred_cookie and not any(classify_overlay(overlay) == "cookie" for overlay in overlays):
         overlays.append(inferred_cookie)
     interactables = snapshot.get("interactables") or []
+    gate_fields = sorted(collect_gate_fields(snapshot), key=_gate_field_rank)
+    has_gate_work = bool(
+        gate_fields
+        and any(field_mapping.get(str(field.get("id") or "")) for field in gate_fields)
+        and any((form_values or {}).get(field_mapping[str(field["id"])]) for field in gate_fields if field_mapping.get(str(field.get("id") or "")))
+    )
+
     if not overlays:
         if looks_like_age_gate(snapshot):
             overlays.append({"id": "inferred-age-gate", "text": "Age Verification"})
         else:
             cookie_buttons = _cookie_buttons_from_interactables(interactables)
             if cookie_buttons:
-                action = _pick_consent_action(cookie_buttons)
+                action = _pick_consent_action(cookie_buttons, blocked=blocked)
                 if action:
                     return action
-            return None
+            return _suggest_gate_field_action(
+                snapshot,
+                form_values,
+                field_mapping,
+                recent_history=recent_history,
+                blocked=blocked,
+            )
 
-    filled_ids = {
-        str(row.get("target_id") or "")
-        for row in (recent_history or [])
-        if row.get("ok") and row.get("action") in {"fill", "select"} and row.get("target_id")
-    }
+    if _cookie_dismiss_failed(recent_history) and has_gate_work:
+        action = _suggest_gate_field_action(
+            snapshot,
+            form_values,
+            field_mapping,
+            recent_history=recent_history,
+            blocked=blocked,
+        )
+        if action:
+            return action
+
     for overlay_kind, overlay in _prioritized_overlays(overlays, snapshot):
         if overlay_kind != "cookie":
             continue
         controls = _controls_for_overlay(interactables, overlay, overlay_kind, all_overlays=overlays)
-        action = _pick_consent_action(controls)
+        action = _pick_consent_action(controls, blocked=blocked)
         if action:
             return action
 
     cookie_buttons = _cookie_buttons_from_interactables(interactables)
     if cookie_buttons:
-        action = _pick_consent_action(cookie_buttons)
+        action = _pick_consent_action(cookie_buttons, blocked=blocked)
         if action:
             return action
 
-    # Age-gate fields — require explicit agent fills, not incidental DOM defaults.
-    gate_fields = sorted(collect_gate_fields(snapshot), key=_gate_field_rank)
-    for field in gate_fields:
-        if not _field_is_unfilled(field, filled_ids=filled_ids, require_explicit_fill=True):
-            continue
-        semantic_key = field_mapping.get(field["id"])
-        if not semantic_key:
-            continue
-        value = (form_values or {}).get(semantic_key)
-        if not value:
-            continue
-        raw_field = next(
-            (
-                item
-                for item in interactables
-                if isinstance(item, dict) and str(item.get("id") or "") == field["id"]
-            ),
-            field,
-        )
-        value = normalize_gate_select_value(str(value), raw_field if isinstance(raw_field, dict) else field)
-        action = "select" if str(field.get("kind") or "").lower() in {"select", "combobox"} else "fill"
-        return {
-            "action": action,
-            "target_id": field["id"],
-            "value_key": semantic_key,
-            "value": value,
-            "reason": f"Fill {semantic_key} to clear age verification overlay",
-        }
+    action = _suggest_gate_field_action(
+        snapshot,
+        form_values,
+        field_mapping,
+        recent_history=recent_history,
+        blocked=blocked,
+    )
+    if action:
+        return action
 
-    if gate_fields and looks_like_age_gate(snapshot):
-        unfilled = [
-            field
-            for field in gate_fields
-            if _field_is_unfilled(field, filled_ids=filled_ids, require_explicit_fill=True)
-        ]
-        if not unfilled:
-            action = _pick_age_gate_confirm(interactables)
-            if action:
-                return action
-
-    # 3. Generic overlays — still prefer reject, then accept/dismiss.
+    # Generic overlays — still prefer reject, then accept/dismiss.
     for overlay_kind, overlay in _prioritized_overlays(overlays, snapshot):
         if overlay_kind == "age_gate":
             continue
         controls = _controls_for_overlay(interactables, overlay, overlay_kind, all_overlays=overlays)
-        action = _pick_consent_action(controls, reason="Dismiss blocking overlay")
+        action = _pick_consent_action(controls, reason="Dismiss blocking overlay", blocked=blocked)
         if action:
             return action
 
@@ -947,9 +1068,7 @@ def ensure_form_values(
             provider=provider,
         )
     except Exception as exc:
-        logger.warning("Form value planning failed, using fallback: %s", exc)
-        result = fallback_form_values(snapshot)
-        result["merged_values"] = {**form_values, **sanitize_form_values(result.get("form_values"))}
-        result["form_values"] = sanitize_form_values(result.get("form_values"))
+        logger.warning("Form value planning failed: %s", exc)
+        return None
     planned_fingerprints.add(fingerprint)
     return result
