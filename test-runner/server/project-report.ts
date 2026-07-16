@@ -3,6 +3,12 @@ import path from "node:path";
 import { parse as parseYaml } from "yaml";
 import { canResumeTranscript, readCollaborationTranscript } from "./collaboration-transcript.js";
 import { classifyTaskRunKindHeuristic } from "./task-router.js";
+import {
+  appendTrainingRecord,
+  applySavedMapToCapture,
+  saveElementCorrection,
+} from "./web-capture-maps.js";
+import { attachVisualToCapture, stampVisualCorrection } from "./web-capture-visual.js";
 
 type ExplorationDoc = {
   version?: number;
@@ -521,6 +527,7 @@ export function readRunBundle(projectPath: string, runId: string) {
     (task?.structured_task as Record<string, unknown> | undefined) ??
     (report?.requested as Record<string, unknown> | undefined);
   const status = readJsonFile<Record<string, unknown>>(path.join(root, "status.json"));
+  const webCapture = readWebCapture(projectPath, runId);
   return {
     runId,
     root,
@@ -534,6 +541,8 @@ export function readRunBundle(projectPath: string, runId: string) {
     status,
     hasRun: Boolean(report || collaborationTranscript || session.manifest),
     collaborationTranscript,
+    webCapture: webCapture.capture,
+    webCaptureReviews: webCapture.reviews,
   };
 }
 
@@ -721,6 +730,100 @@ export function resolveRunArtifact(projectPath: string, runId: string, fileRel: 
     throw new Error("Artifact not found");
   }
   return full;
+}
+
+export function readWebCapture(projectPath: string, runId = "current") {
+  const root = runRoot(projectPath, runId);
+  let capture = readJsonFile<Record<string, unknown>>(
+    path.join(root, "web-capture", "latest.json"),
+  );
+  if (!capture) {
+    capture = readJsonFile<Record<string, unknown>>(
+      path.join(projectPath, ".agent", "web-capture", "latest.json"),
+    );
+  }
+  if (capture) {
+    capture = applySavedMapToCapture(projectPath, capture);
+  }
+  const reviewsPath = path.join(root, "web-capture", "reviews.jsonl");
+  const reviews: Record<string, unknown>[] = [];
+  if (fs.existsSync(reviewsPath)) {
+    try {
+      for (const line of fs.readFileSync(reviewsPath, "utf8").split(/\r?\n/)) {
+        if (!line.trim()) continue;
+        const row = JSON.parse(line);
+        if (row && typeof row === "object") reviews.push(row as Record<string, unknown>);
+      }
+    } catch {
+      reviews.length = 0;
+    }
+  }
+  return { capture, reviews: reviews.slice(-100) };
+}
+
+export function saveWebCaptureReview(
+  projectPath: string,
+  runId: string,
+  review: Record<string, unknown>,
+) {
+  const root = runRoot(projectPath, runId);
+  if (!fs.existsSync(root)) throw new Error("Run not found");
+  const captureDir = path.join(root, "web-capture");
+  fs.mkdirSync(captureDir, { recursive: true });
+  const entry = {
+    ...review,
+    ts: new Date().toISOString(),
+  };
+  fs.appendFileSync(
+    path.join(captureDir, "reviews.jsonl"),
+    JSON.stringify(entry) + "\n",
+    "utf8",
+  );
+
+  const capture =
+    readJsonFile<Record<string, unknown>>(path.join(captureDir, "latest.json")) ??
+    readJsonFile<Record<string, unknown>>(path.join(projectPath, ".agent", "web-capture", "latest.json"));
+
+  if (review.verdict === "element_correction" && capture && review.element && typeof review.element === "object") {
+    saveElementCorrection(projectPath, {
+      url: String(capture.url ?? ""),
+      captureId: String(review.captureId ?? capture.capture_id ?? ""),
+      element: review.element as Record<string, unknown>,
+      interactive: Boolean(review.correctedInteractive),
+      note: typeof review.note === "string" ? review.note : undefined,
+    });
+    stampVisualCorrection(projectPath, {
+      url: String(capture.url ?? ""),
+      element: review.element as Record<string, unknown>,
+      interactive: Boolean(review.correctedInteractive),
+    });
+  } else if (capture) {
+    appendTrainingRecord(projectPath, {
+      kind: String(review.verdict ?? "review"),
+      capture_id: review.captureId ?? capture.capture_id,
+      url: capture.url,
+      fingerprint: capture.fingerprint,
+      note: review.note ?? null,
+    });
+  }
+
+  const updatedCapture = capture
+    ? attachVisualToCapture(projectPath, applySavedMapToCapture(projectPath, capture))
+    : null;
+  if (updatedCapture) {
+    const payload = JSON.stringify(updatedCapture, null, 2) + "\n";
+    for (const target of [
+      path.join(captureDir, "latest.json"),
+      path.join(projectPath, ".agent", "web-capture", "latest.json"),
+    ]) {
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      const tmp = `${target}.tmp`;
+      fs.writeFileSync(tmp, payload, "utf8");
+      fs.renameSync(tmp, target);
+    }
+  }
+
+  return { entry, capture: updatedCapture };
 }
 
 export function readLocalDevStatus(projectPath: string) {

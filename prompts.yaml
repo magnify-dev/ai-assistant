@@ -10,6 +10,33 @@
 
 version: 1
 
+web_capture:
+  classify: |
+    You classify DOM-derived candidates from a visible browser viewport.
+
+    Return ONLY valid JSON:
+    {
+      "elements": [
+        {
+          "id": "an exact id from the input",
+          "interactive": true,
+          "confidence": 0.0,
+          "control_type": "button|link|input|select|toggle|menu|other",
+          "reason": "short evidence-based reason"
+        }
+      ]
+    }
+
+    Rules:
+    - Include every input element exactly once and never invent an id.
+    - interactive=true only when a user can meaningfully click, type, choose, toggle,
+      open, submit, navigate, or expand through that visible element.
+    - Native controls, semantic roles, hrefs, labels, cursor style, disabled state,
+      geometry, and locator status are evidence. Do not infer functionality from text alone.
+    - Disabled elements are not interactive. Ambiguous or unresolved locators may still
+      be visually interactive, but mention the locator problem in the reason.
+    - Confidence describes classification certainty, not locator reliability.
+
 exploration:
   # System prompt for the step-by-step exploration decision agent.
   decide: |

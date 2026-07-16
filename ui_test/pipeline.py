@@ -81,6 +81,12 @@ def run_ui_test_loop(
     structure_blocks: bool = True,
 ) -> dict[str, Any]:
     reset_run_state()
+    try:
+        from web_capture.context import set_active_project
+
+        set_active_project(project)
+    except ImportError:
+        pass
     set_running(True)
 
     setup = ensure_project_setup(project)

@@ -49,7 +49,9 @@ import {
   readRunReport,
   readSiteMap,
   readWebResearch,
+  readWebCapture,
   resolveRunArtifact,
+  saveWebCaptureReview,
   prepareCurrentForNewRun,
   sessionWithArtifactUrls,
 } from "./project-report.js";
@@ -266,6 +268,7 @@ function resetRunStateForNewRun(
     webFacts: null,
     webResearchProgress: null,
     playwrightSession: null,
+    webCapture: null,
   };
   pushEvent({ type: "run_cleared" });
   pushEvent({ type: "run_state", running: true });
@@ -312,6 +315,9 @@ function pushEvent(event: StoredEvent) {
       error: event.error,
       ts: event.ts,
     };
+    if (event.web_capture && typeof event.web_capture === "object") {
+      runState.webCapture = event.web_capture;
+    }
   }
   if (event.type === "test_target") {
     runState.testTarget = {
@@ -443,6 +449,9 @@ function pushEvent(event: StoredEvent) {
         error: nested.error,
         ts: event.ts,
       };
+      if (nested.web_capture && typeof nested.web_capture === "object") {
+        runState.webCapture = nested.web_capture;
+      }
     }
   } else if (
     event.type === "browser_state" &&
@@ -942,6 +951,7 @@ app.get("/api/project/run-report", (req, res) => {
     return;
   }
   const bundle = readRunReport(projectPath);
+  const webCapture = readWebCapture(projectPath, "current");
   const playwrightSession = sessionWithArtifactUrls(
     projectPath,
     "current",
@@ -950,6 +960,8 @@ app.get("/api/project/run-report", (req, res) => {
   );
   res.json({
     ...bundle,
+    webCapture: webCapture.capture,
+    webCaptureReviews: webCapture.reviews,
     playwrightSession: playwrightSession
       ? { ...playwrightSession, source: bundle.sessionSource ?? "ui" }
       : null,
@@ -981,6 +993,62 @@ app.get("/api/project/web-research", (req, res) => {
     return;
   }
   res.json(readWebResearch(projectPath));
+});
+
+app.get("/api/project/web-capture", (req, res) => {
+  const projectPath = req.query.path;
+  const runId = typeof req.query.runId === "string" ? req.query.runId : "current";
+  if (!projectPath || typeof projectPath !== "string") {
+    res.status(400).json({ error: "path query param is required" });
+    return;
+  }
+  if (runId !== "current" && !/^[A-Za-z0-9_-]+$/.test(runId)) {
+    res.status(400).json({ error: "invalid runId" });
+    return;
+  }
+  res.json(readWebCapture(projectPath, runId));
+});
+
+app.post("/api/project/web-capture/review", (req, res) => {
+  const {
+    project: projectPath,
+    runId = "current",
+    captureId,
+    verdict,
+    elementId,
+    element,
+    correctedInteractive,
+    note,
+  } = req.body ?? {};
+  if (!projectPath || typeof projectPath !== "string") {
+    res.status(400).json({ error: "project is required" });
+    return;
+  }
+  if (!captureId || typeof captureId !== "string") {
+    res.status(400).json({ error: "captureId is required" });
+    return;
+  }
+  if (String(runId) !== "current" && !/^[A-Za-z0-9_-]+$/.test(String(runId))) {
+    res.status(400).json({ error: "invalid runId" });
+    return;
+  }
+  if (!["good", "needs_work", "element_correction"].includes(String(verdict))) {
+    res.status(400).json({ error: "invalid verdict" });
+    return;
+  }
+  try {
+    const result = saveWebCaptureReview(projectPath, String(runId), {
+      captureId,
+      verdict,
+      ...(typeof elementId === "string" ? { elementId } : {}),
+      ...(element && typeof element === "object" ? { element } : {}),
+      ...(typeof correctedInteractive === "boolean" ? { correctedInteractive } : {}),
+      ...(typeof note === "string" && note.trim() ? { note: note.trim().slice(0, 1000) } : {}),
+    });
+    res.json({ ok: true, review: result.entry, capture: result.capture });
+  } catch (err) {
+    res.status(404).json({ error: err instanceof Error ? err.message : String(err) });
+  }
 });
 
 app.get("/api/project/site-map", (req, res) => {

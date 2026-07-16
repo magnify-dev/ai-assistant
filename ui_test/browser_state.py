@@ -84,8 +84,30 @@ _INTERACTABLE_JS = """() => {
     const parent = el.closest("li,td,th,p,div,section,form") || el.parentElement;
     return parent ? clean(parent.innerText || parent.textContent, 220) : "";
   }
+  function cssPath(el) {
+    if (el.id) return `#${CSS.escape(el.id)}`;
+    const parts = [];
+    let node = el;
+    while (node && node.nodeType === Node.ELEMENT_NODE && parts.length < 6) {
+      let part = node.tagName.toLowerCase();
+      const testId = node.getAttribute("data-testid");
+      if (testId) {
+        parts.unshift(`[data-testid="${CSS.escape(testId)}"]`);
+        break;
+      }
+      if (node.parentElement) {
+        const siblings = Array.from(node.parentElement.children).filter(
+          (candidate) => candidate.tagName === node.tagName
+        );
+        if (siblings.length > 1) part += `:nth-of-type(${siblings.indexOf(node) + 1})`;
+      }
+      parts.unshift(part);
+      node = node.parentElement;
+    }
+    return parts.join(" > ");
+  }
   const selector =
-    "a[href], button, blz-button, blz-select, input:not([type='hidden']), select, textarea, summary, [role='button'], [role='link'], [role='menuitem'], [role='textbox'], [role='combobox'], [role='spinbutton'], [role='searchbox'], [contenteditable=''], [contenteditable='true'], [tabindex]:not([tabindex='-1']), [data-toggle='collapse'], [data-bs-toggle='collapse']";
+    "a[href], button, blz-button, blz-select, input:not([type='hidden']), select, textarea, summary, [role='button'], [role='link'], [role='menuitem'], [role='textbox'], [role='combobox'], [role='spinbutton'], [role='searchbox'], [contenteditable=''], [contenteditable='true'], [tabindex]:not([tabindex='-1']), [data-toggle='collapse'], [data-bs-toggle='collapse'], [onclick]";
   const roots = [document];
   const seenRoots = new Set(roots);
   const raw = [];
@@ -122,7 +144,8 @@ _INTERACTABLE_JS = """() => {
     }
     const href = el.href || "";
     const disabled = Boolean(el.disabled || el.getAttribute("aria-disabled") === "true");
-    const key = `${kind}|${testId}|${text}|${aria}|${href}|${fieldName}`;
+    const bounds = el.getBoundingClientRect();
+    const key = `${kind}|${testId}|${text}|${aria}|${href}|${fieldName}|${Math.round(bounds.x)}|${Math.round(bounds.y)}`;
     if (seen.has(key)) continue;
     seen.add(key);
     if (!text && !aria && !testId && !href && !fieldName && kind !== "input" && kind !== "select" && kind !== "textarea" && kind !== "textbox" && kind !== "combobox" && kind !== "spinbutton") continue;
@@ -149,6 +172,21 @@ _INTERACTABLE_JS = """() => {
       expanded: el.getAttribute("aria-expanded"),
       selected: Boolean(el.selected || el.getAttribute("aria-selected") === "true"),
       checked: Boolean(el.checked || el.getAttribute("aria-checked") === "true"),
+      tag,
+      rect: {
+        x: bounds.x,
+        y: bounds.y,
+        width: bounds.width,
+        height: bounds.height,
+      },
+      css_path: cssPath(el),
+      z_index: getComputedStyle(el).zIndex || null,
+      pointer_events: getComputedStyle(el).pointerEvents || null,
+      cursor: getComputedStyle(el).cursor || null,
+      frame_url: location.href,
+      shadow_host: el.getRootNode() instanceof ShadowRoot
+        ? el.getRootNode().host.tagName.toLowerCase()
+        : null,
     };
     if (collapse) Object.assign(row, collapse);
     out.push(row);
@@ -169,7 +207,80 @@ _INTERACTABLE_JS = """() => {
       }
     }
   }
-  return { items: out.slice(0, 400), total: out.length };
+  return {
+    items: out.slice(0, 400),
+    total: out.length,
+    viewport: {
+      width: window.innerWidth,
+      height: window.innerHeight,
+      scroll_x: window.scrollX,
+      scroll_y: window.scrollY,
+      document_width: Math.max(document.documentElement.scrollWidth, document.body?.scrollWidth || 0),
+      document_height: Math.max(document.documentElement.scrollHeight, document.body?.scrollHeight || 0),
+    },
+  };
+}"""
+
+VISUAL_TILE_JS = """() => {
+  const cols = 48;
+  const rows = 32;
+  const width = window.innerWidth;
+  const height = window.innerHeight;
+  if (width <= 0 || height <= 0) return null;
+  const cellW = width / cols;
+  const cellH = height / rows;
+  function cleanColor(value) {
+    const raw = String(value || "").trim();
+    if (!raw || raw === "transparent" || raw === "rgba(0, 0, 0, 0)") return "";
+    return raw.slice(0, 32);
+  }
+  function backgroundColor(el) {
+    let node = el;
+    while (node && node !== document.documentElement) {
+      const style = getComputedStyle(node);
+      const bg = cleanColor(style.backgroundColor);
+      if (bg) return bg;
+      node = node.parentElement;
+    }
+    return cleanColor(getComputedStyle(el).color) || "#e5e7eb";
+  }
+  function kindOf(el) {
+    const tag = el.tagName.toLowerCase();
+    const role = el.getAttribute("role") || "";
+    if (tag === "button" || role === "button") return "button";
+    if (tag === "a" || role === "link") return "link";
+    if (tag === "input" || tag === "textarea" || tag === "select") return "input";
+    if (tag === "img" || tag === "video" || tag === "svg") return "media";
+    if (["h1", "h2", "h3", "h4", "h5", "h6", "p", "span", "label"].includes(tag)) return "text";
+    if (["nav", "header", "footer", "aside", "main"].includes(tag)) return tag;
+    return "chrome";
+  }
+  const cells = [];
+  for (let row = 0; row < rows; row++) {
+    for (let col = 0; col < cols; col++) {
+      const x = Math.min(width - 1, Math.floor(col * cellW + cellW / 2));
+      const y = Math.min(height - 1, Math.floor(row * cellH + cellH / 2));
+      const el = document.elementFromPoint(x, y);
+      if (!el) {
+        cells.push({ color: "#ffffff", kind: "empty" });
+        continue;
+      }
+      cells.push({ color: backgroundColor(el), kind: kindOf(el) });
+    }
+  }
+  return {
+    cols,
+    rows,
+    cells,
+    viewport: {
+      width,
+      height,
+      scroll_x: window.scrollX,
+      scroll_y: window.scrollY,
+      document_width: Math.max(document.documentElement.scrollWidth, document.body?.scrollWidth || 0),
+      document_height: Math.max(document.documentElement.scrollHeight, document.body?.scrollHeight || 0),
+    },
+  };
 }"""
 
 _DIALOG_FORM_CONTROLS_JS = """() => {
@@ -514,10 +625,15 @@ def _stable_interactable_id(item: dict[str, Any], occurrence: int) -> str:
 
 
 def _interactable_dedupe_key(item: dict[str, Any]) -> str:
-    return "|".join(
+    semantic = "|".join(
         str(item.get(key) or "").strip().lower()
-        for key in ("kind", "role", "test_id", "text", "aria", "href", "name", "placeholder", "label")
+        for key in (
+            "kind", "role", "test_id", "text", "aria", "href", "name",
+            "placeholder", "label", "frame_url",
+        )
     )
+    rect = item.get("rect") if isinstance(item.get("rect"), dict) else {}
+    return f"{semantic}|{round(float(rect.get('x') or 0))}|{round(float(rect.get('y') or 0))}"
 
 
 def _merge_interactables(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -594,6 +710,40 @@ def _enrich_interactables(items: Any, page_url: str) -> list[dict[str, Any]]:
         item["action_hint"] = _interactable_action_hint(item)
         result.append(item)
     return result
+
+
+def _collect_iframe_interactables(page: Page) -> list[dict[str, Any]]:
+    """Collect visible controls from child frames and translate them to viewport coordinates."""
+    collected: list[dict[str, Any]] = []
+    try:
+        frames = list(page.frames)[1:]
+    except Exception:
+        return collected
+    for frame_index, frame in enumerate(frames):
+        try:
+            raw = frame.evaluate(_INTERACTABLE_JS)
+            handle = frame.frame_element()
+            bounds = handle.bounding_box()
+        except Exception:
+            continue
+        if not isinstance(raw, dict) or not isinstance(bounds, dict):
+            continue
+        for item in raw.get("items") or []:
+            if not isinstance(item, dict):
+                continue
+            row = dict(item)
+            rect = row.get("rect") if isinstance(row.get("rect"), dict) else {}
+            row["rect"] = {
+                "x": float(bounds.get("x") or 0) + float(rect.get("x") or 0),
+                "y": float(bounds.get("y") or 0) + float(rect.get("y") or 0),
+                "width": float(rect.get("width") or 0),
+                "height": float(rect.get("height") or 0),
+            }
+            row["frame_url"] = str(frame.url)
+            row["frame_name"] = str(frame.name or "")
+            row["frame_index"] = frame_index
+            collected.append(row)
+    return collected
 
 
 def capture_screenshot_b64(page: Page) -> str | None:
@@ -676,6 +826,7 @@ def collect_page_state(page: Page, *, include_screenshot: bool = True) -> dict[s
         title = ""
     page_url = str(page.url)
     raw_items = raw_interactables.get("items") if isinstance(raw_interactables, dict) else raw_interactables
+    iframe_items = _collect_iframe_interactables(page)
     filtered_overlays = filter_blocking_overlays(
         blocking_overlays if isinstance(blocking_overlays, list) else []
     )
@@ -683,12 +834,13 @@ def collect_page_state(page: Page, *, include_screenshot: bool = True) -> dict[s
     inferred_items = _infer_gate_interactables_from_overlays(filtered_overlays)
     merged_items = _merge_interactables(
         raw_items if isinstance(raw_items, list) else [],
+        iframe_items,
         dialog_items,
         inferred_items,
     )
     interactables = _enrich_interactables(merged_items, page_url)
     interactable_total = (
-        int(raw_interactables.get("total") or len(interactables))
+        int(raw_interactables.get("total") or len(interactables)) + len(iframe_items)
         if isinstance(raw_interactables, dict)
         else len(interactables)
     )
@@ -704,6 +856,12 @@ def collect_page_state(page: Page, *, include_screenshot: bool = True) -> dict[s
         "url": page_url,
         "title": title,
         "interactables": interactables,
+        "viewport": (
+            raw_interactables.get("viewport")
+            if isinstance(raw_interactables, dict)
+            and isinstance(raw_interactables.get("viewport"), dict)
+            else {}
+        ),
         "interactables_total": interactable_total,
         "interactables_truncated": interactable_total > len(interactables),
         "headings": semantic.get("headings") if isinstance(semantic.get("headings"), list) else [],
@@ -719,6 +877,44 @@ def collect_page_state(page: Page, *, include_screenshot: bool = True) -> dict[s
     return state
 
 
+def attach_web_capture(
+    page: Page,
+    state: dict[str, Any],
+    *,
+    context: str = "",
+    analyze: bool = True,
+) -> dict[str, Any]:
+    """Build a spatial capture while the originating Playwright page is still live."""
+    try:
+        from web_capture.analyzer import analyze_capture
+        from web_capture.capture import build_capture
+        from web_capture.context import get_active_project
+        from web_capture.locators import validate_capture_locators
+        from web_capture.maps import apply_site_map, sync_interactables_from_capture
+        from web_capture.visual import collect_visual_tiles, resolve_visual_map
+
+        capture = build_capture(state, context=context)
+        validate_capture_locators(page, capture)
+        if analyze:
+            analyze_capture(capture)
+        project = get_active_project()
+        apply_site_map(capture, project)
+        fresh_tiles = collect_visual_tiles(page)
+        capture["visual"] = resolve_visual_map(
+            project,
+            url=str(capture.get("url") or ""),
+            capture_id=str(capture.get("capture_id") or ""),
+            viewport=capture.get("viewport") if isinstance(capture.get("viewport"), dict) else {},
+            elements=list(capture.get("elements") or []),
+            fresh_tiles=fresh_tiles,
+        )
+        sync_interactables_from_capture(state, capture)
+        state["web_capture"] = capture
+    except Exception as exc:
+        state["web_capture_error"] = str(exc)[:300]
+    return state
+
+
 def emit_page_state(
     page: Page,
     *,
@@ -729,6 +925,7 @@ def emit_page_state(
 ) -> dict[str, Any]:
     """Collect and emit browser_state event for the test-runner UI."""
     state = collect_page_state(page, include_screenshot=include_screenshot)
+    attach_web_capture(page, state, context=context, analyze=True)
     try:
         from ui_test.events import browser_state_event
 
@@ -740,6 +937,7 @@ def emit_page_state(
             node_url=node_url,
             screenshot_b64=state.get("screenshot_b64"),
             error=error or None,
+            web_capture=state.get("web_capture"),
         )
     except ImportError:
         pass

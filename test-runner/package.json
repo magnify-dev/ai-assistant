@@ -7,7 +7,8 @@
     "dev": "concurrently -n api,vite -c green,blue \"node --import tsx --watch server/index.ts\" \"wait-on -t 30000 http://127.0.0.1:8767/api/config && vite\"",
     "build": "tsc -b && vite build && tsc -p tsconfig.server.json",
     "start": "node dist-server/index.js",
-    "typecheck": "tsc --noEmit --project tsconfig.app.json && tsc --noEmit --project tsconfig.server.json"
+    "typecheck": "tsc --noEmit --project tsconfig.app.json && tsc --noEmit --project tsconfig.server.json",
+    "test:web-capture": "node --import tsx --test tests/web-capture-view.test.mjs"
   },
   "dependencies": {
     "@cursor/sdk": "^1.0.23",

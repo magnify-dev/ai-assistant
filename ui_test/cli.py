@@ -64,6 +64,13 @@ def main(argv: list[str] | None = None) -> int:
         logging.error("Project path does not exist: %s", project)
         return 1
 
+    try:
+        from web_capture.context import set_active_project
+
+        set_active_project(project)
+    except ImportError:
+        pass
+
     if args.init_project:
         result = ensure_project_setup(project)
         print(f"Project: {project}")

@@ -333,6 +333,12 @@ def run_web_research(
     cfg = {**default_config(), **(config or {})}
     project_path = Path(project or cfg["project"]).resolve()
     project_path.mkdir(parents=True, exist_ok=True)
+    try:
+        from web_capture.context import set_active_project
+
+        set_active_project(project_path)
+    except ImportError:
+        pass
     run_id = f"research_{uuid.uuid4().hex}"
     save_run_state(
         project_path,

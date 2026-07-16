@@ -58,9 +58,18 @@ class PlaywrightSessionRecorder:
                 "context": context,
                 "screenshot": screenshot_rel,
                 "interactables": list((snapshot or {}).get("interactables") or []),
+                "web_capture": (snapshot or {}).get("web_capture"),
                 "ts": datetime.now(timezone.utc).isoformat(),
             }
         )
+        capture = (snapshot or {}).get("web_capture")
+        if isinstance(capture, dict):
+            try:
+                from web_capture.storage import persist_capture
+
+                persist_capture(self.session_dir, capture)
+            except Exception:
+                pass
         self._persist_manifest()
 
     def record_decision(self, decision: dict[str, Any]) -> None:

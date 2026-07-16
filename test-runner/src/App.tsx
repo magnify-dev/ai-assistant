@@ -3,7 +3,7 @@ import { CollaborationPanel } from "@/components/CollaborationPanel";
 import { CurrentRunStatus } from "@/components/CurrentRunStatus";
 import { CheatsheetPanel } from "@/components/CheatsheetPanel";
 import { ExplorationPanel } from "@/components/ExplorationPanel";
-import { PagePreview } from "@/components/PagePreview";
+import { PageInspectPanel } from "@/components/PageInspectPanel";
 import { ProjectSelector } from "@/components/ProjectSelector";
 import { RunHistoryPanel } from "@/components/RunHistoryPanel";
 import { RunProgressPanel } from "@/components/RunProgressPanel";
@@ -30,6 +30,7 @@ import {
   type WebResearchState,
 } from "@/lib/webResearchTypes";
 import type { PhaseMap, RunEvent } from "@/types";
+import type { WebCapture, WebCaptureElement, WebCaptureReview } from "@/lib/webCaptureTypes";
 import { buildUiDisplaySnapshot, isUiDebugEnabled, traceUiDisplay } from "@/lib/uiRunDebug";
 import { UiRunDebugPanel } from "@/components/UiRunDebugPanel";
 
@@ -162,6 +163,7 @@ function applyStateFromServer(
     collaborationResult?: CollaborationResult | null;
     webResearch?: WebResearchState | null;
     playwrightSession?: PlaywrightSession | null;
+    webCapture?: WebCapture | null;
   },
   setters: {
     setRunning: (v: boolean) => void;
@@ -177,6 +179,7 @@ function applyStateFromServer(
     setCollaborationResult?: (v: CollaborationResult | null) => void;
     setWebResearch?: (v: WebResearchState | null) => void;
     setPlaywrightSession?: (v: PlaywrightSession | null) => void;
+    setWebCapture?: (v: WebCapture | null) => void;
   },
   options?: { protectActiveRun?: boolean; protectInspectedSession?: boolean },
 ) {
@@ -238,6 +241,9 @@ function applyStateFromServer(
     !(protectSession && data.playwrightSession === null)
   ) {
     setters.setPlaywrightSession(data.playwrightSession as PlaywrightSession | null);
+  }
+  if (data.webCapture !== undefined && setters.setWebCapture) {
+    setters.setWebCapture(data.webCapture as WebCapture | null);
   }
 }
 
@@ -349,6 +355,8 @@ export default function App() {
   const [agentCards, setAgentCards] = useState<AgentRunCard[]>([]);
   const [collaborationResult, setCollaborationResult] = useState<CollaborationResult | null>(null);
   const [webResearch, setWebResearch] = useState<WebResearchState | null>(null);
+  const [webCapture, setWebCapture] = useState<WebCapture | null>(null);
+  const [latestWebCaptureReview, setLatestWebCaptureReview] = useState<WebCaptureReview | null>(null);
   const [collabConfig, setCollabConfig] = useState<CollaborationConfig | null>(null);
   const [helperPromptDraft, setHelperPromptDraft] = useState("");
   const [savingCollabConfig, setSavingCollabConfig] = useState(false);
@@ -392,6 +400,8 @@ export default function App() {
     setAgentCards([]);
     setCollaborationResult(null);
     setWebResearch(null);
+    setWebCapture(null);
+    setLatestWebCaptureReview(null);
   }, []);
 
   const persistSettings = useCallback(() => {
@@ -461,6 +471,7 @@ export default function App() {
             setCollaborationResult,
             setWebResearch,
             setPlaywrightSession,
+            setWebCapture,
           },
           {
             protectActiveRun: runningRef.current || startingRunRef.current,
@@ -567,7 +578,14 @@ export default function App() {
     if (!project.trim() || running) return;
     apiFetch(`/api/project/run-report?path=${encodeURIComponent(project)}`)
       .then((r) => r.json())
-      .then((data: { report?: RunReport | null; pageReport?: string; hasRun?: boolean; playwrightSession?: PlaywrightSession | null }) => {
+      .then((data: {
+        report?: RunReport | null;
+        pageReport?: string;
+        hasRun?: boolean;
+        playwrightSession?: PlaywrightSession | null;
+        webCapture?: WebCapture | null;
+        webCaptureReviews?: WebCaptureReview[];
+      }) => {
         if (runningRef.current) return;
         if (viewingRunIdRef.current && viewingRunIdRef.current !== "current") return;
         if (data.report) {
@@ -585,6 +603,13 @@ export default function App() {
           } else if (!running && viewingRunIdRef.current === "current") {
             setPlaywrightSession(data.playwrightSession ?? report.playwright_session ?? null);
           }
+        }
+        if (data.webCapture) {
+          setWebCapture(data.webCapture);
+          setLatestWebCaptureReview(data.webCaptureReviews?.at(-1) ?? null);
+        } else {
+          setWebCapture(null);
+          setLatestWebCaptureReview(null);
         }
         setHasLatestRun(Boolean(data.hasRun));
       })
@@ -715,6 +740,8 @@ export default function App() {
         screenshot_b64: (event as { screenshot_b64?: string }).screenshot_b64,
         error: (event as { error?: string }).error,
       });
+      const capture = (event as RunEvent & { web_capture?: WebCapture }).web_capture;
+      if (capture) setWebCapture(capture);
       if (String(event.context ?? "").startsWith("web_")) {
         setWebResearch((prev) =>
           applyWebResearchEvent(prev, {
@@ -781,11 +808,12 @@ export default function App() {
         event.type === "web_semantic_snapshot"
       ) {
         const e = event as RunEvent & {
-          snapshot?: Partial<BrowserState>;
-          page?: Partial<BrowserState>;
+          snapshot?: Partial<BrowserState> & { web_capture?: WebCapture };
+          page?: Partial<BrowserState> & { web_capture?: WebCapture };
+          web_capture?: WebCapture;
         };
-        const snapshot: Partial<BrowserState> =
-          e.snapshot ?? e.page ?? (e as unknown as Partial<BrowserState>);
+        const snapshot: Partial<BrowserState> & { web_capture?: WebCapture } =
+          e.snapshot ?? e.page ?? (e as unknown as Partial<BrowserState> & { web_capture?: WebCapture });
         if (snapshot.url) {
           setBrowserState({
             url: snapshot.url,
@@ -798,6 +826,7 @@ export default function App() {
             error: snapshot.error,
           });
         }
+        if (snapshot.web_capture) setWebCapture(snapshot.web_capture);
       }
       if (event.type === "web_research_progress" || event.type === "web_help_request") {
         setLogOpen(true);
@@ -867,6 +896,8 @@ export default function App() {
         setLastResult(null);
         setViewingRunId(null);
         setWebResearch(null);
+        setWebCapture(null);
+        setLatestWebCaptureReview(null);
         return;
       }
       setStructuredTask(null);
@@ -883,6 +914,8 @@ export default function App() {
       setAgentCards([]);
       setCollaborationResult(null);
       setWebResearch(null);
+      setWebCapture(null);
+      setLatestWebCaptureReview(null);
     }
     if (event.type === "done" && !collabActiveRef.current && !startingRunRef.current) {
       setRunning(false);
@@ -1108,6 +1141,8 @@ export default function App() {
           pageReport?: string;
           structuredTask?: StructuredTask;
           playwrightSession?: PlaywrightSession | null;
+          webCapture?: WebCapture | null;
+          webCaptureReviews?: WebCaptureReview[];
           collaborationTranscript?: {
             task?: string;
             agentCards?: AgentRunCard[];
@@ -1128,6 +1163,8 @@ export default function App() {
         );
 
         setPlaywrightSession(data.playwrightSession ?? null);
+        setWebCapture(data.webCapture ?? null);
+        setLatestWebCaptureReview(data.webCaptureReviews?.at(-1) ?? null);
         setSessionFrameIndex(0);
 
         if (data.report) {
@@ -1529,6 +1566,8 @@ export default function App() {
     setSessionFrameIndex(0);
     setCollaborationResult(null);
     setWebResearch(null);
+    setWebCapture(null);
+    setLatestWebCaptureReview(null);
     try {
       const res = await apiFetch("/api/run", {
         method: "POST",
@@ -1570,6 +1609,31 @@ export default function App() {
       );
     }
   };
+
+  const saveWebCaptureReview = useCallback(
+    async (review: Omit<WebCaptureReview, "captureId" | "ts"> & { element?: WebCaptureElement }) => {
+      if (!webCapture || !project.trim()) return;
+      const res = await apiFetch("/api/project/web-capture/review", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          project,
+          runId: viewingRunId ?? "current",
+          captureId: webCapture.capture_id,
+          ...review,
+        }),
+      });
+      const body = (await res.json()) as {
+        error?: string;
+        review?: WebCaptureReview;
+        capture?: WebCapture;
+      };
+      if (!res.ok) throw new Error(body.error ?? "Failed to save web capture review");
+      if (body.review) setLatestWebCaptureReview(body.review);
+      if (body.capture) setWebCapture(body.capture);
+    },
+    [project, viewingRunId, webCapture],
+  );
 
   return (
     <div className="mx-auto max-w-7xl px-4 py-8">
@@ -1976,22 +2040,18 @@ export default function App() {
             </section>
           ) : null}
 
-          {showLiveSession ? (
+          {(showLiveSession || webCapture || browserState?.url) ? (
             <section className="surface-card shrink-0 p-4">
-              <h2 className="mb-3 text-sm font-semibold uppercase tracking-wide text-white/50">
-                {replayMode
-                  ? "Recorded session"
-                  : webBrowseActive
-                    ? "Live browser — web research"
-                    : "Live page — agent testing"}
-              </h2>
-              <PagePreview
+              <PageInspectPanel
                 state={replayMode ? null : browserState}
                 session={playwrightSession}
+                capture={webCapture}
                 frameIndex={sessionFrameIndex}
                 onFrameIndexChange={setSessionFrameIndex}
                 lastAction={lastActionLine}
                 replayMode={replayMode}
+                latestReview={latestWebCaptureReview}
+                onReview={saveWebCaptureReview}
               />
             </section>
           ) : null}
@@ -2016,21 +2076,7 @@ export default function App() {
                   running={inRunMode}
                 />
               </section>
-            ) : (
-              <section className="surface-card p-4">
-                <h2 className="mb-3 text-sm font-semibold uppercase tracking-wide text-white/50">
-                  {replayMode ? "Recorded session" : "Live page"}
-                </h2>
-                <PagePreview
-                  state={replayMode ? null : browserState}
-                  session={playwrightSession}
-                  frameIndex={sessionFrameIndex}
-                  onFrameIndexChange={setSessionFrameIndex}
-                  lastAction={lastActionLine}
-                  replayMode={replayMode}
-                />
-              </section>
-            )}
+            ) : null}
 
             <section className="surface-card flex max-h-[calc(100vh-10rem)] flex-col p-4 lg:sticky lg:top-4">
               <RunProgressPanel

@@ -407,9 +407,10 @@ def _snapshot(
     context: str,
     form_values: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    from ui_test.browser_state import collect_page_state
+    from ui_test.browser_state import attach_web_capture, collect_page_state
 
     state = _redact_form_values(collect_page_state(page, include_screenshot=True), form_values)
+    attach_web_capture(page, state, context=context, analyze=True)
     state["snapshot_id"] = f"snap_{uuid.uuid4().hex[:12]}"
     state["session_id"] = session_id
     state["step_id"] = step_id

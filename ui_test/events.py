@@ -244,6 +244,7 @@ def browser_state_event(
     node_url: str = "",
     screenshot_b64: str | None = None,
     error: str | None = None,
+    web_capture: dict[str, Any] | None = None,
 ) -> None:
     entry = {
         "url": url,
@@ -253,6 +254,7 @@ def browser_state_event(
         "node_url": node_url,
         "screenshot_b64": screenshot_b64,
         "error": error,
+        "web_capture": web_capture,
     }
     _run_state["browser_state"] = entry
     _dispatch({"type": "browser_state", **entry})
