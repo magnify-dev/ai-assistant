@@ -4,6 +4,7 @@ from ui_test.browser_state import (
     _enrich_interactables,
     _infer_gate_interactables_from_overlays,
     _merge_interactables,
+    build_semantic_snapshot,
 )
 from web_surf.form_values import collect_gate_fields, fallback_form_values, needs_form_value_plan
 
@@ -51,6 +52,17 @@ class BrowserStateGateFieldTests(unittest.TestCase):
             [{"kind": "select", "name": "year", "text": "year"}],
         )
         self.assertEqual(len(merged), 2)
+
+    def test_build_semantic_snapshot_includes_visible_text(self) -> None:
+        snapshot = build_semantic_snapshot(
+            {
+                "title": "Patch Notes",
+                "headings": ["Diablo IV", "July 14"],
+                "visible_text": "Fixed an issue where players could not claim rewards.",
+            }
+        )
+        self.assertIn("Patch Notes", snapshot)
+        self.assertIn("Fixed an issue", snapshot)
 
 
 if __name__ == "__main__":

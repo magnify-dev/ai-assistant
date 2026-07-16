@@ -1,5 +1,6 @@
 import { useMemo } from "react";
 import { Loader2 } from "lucide-react";
+import { OperationWaitBanner } from "@/components/OperationWaitBanner";
 import type { AgentRunCard } from "@/lib/collaborationTypes";
 import {
   resolveActiveRunStep,
@@ -8,6 +9,9 @@ import {
   stepLabel,
   type RunStepKey,
 } from "@/lib/runProgress";
+import type { WebCaptureBuildStatus } from "@/lib/webCaptureTypes";
+import type { WebResearchState } from "@/lib/webResearchTypes";
+import { resolveWebResearchWaitState } from "@/lib/webResearchWait";
 import type { PhaseKey, PhaseMap } from "@/types";
 import { cn } from "@/lib/utils";
 
@@ -21,6 +25,8 @@ type Props = {
   showPipelineStrip?: boolean;
   testTargetMode?: "local" | "deployed";
   skipDeploy?: boolean;
+  webResearch?: WebResearchState | null;
+  captureBuild?: WebCaptureBuildStatus | null;
   onStop?: () => void;
 };
 
@@ -61,11 +67,20 @@ export function CurrentRunStatus({
   showPipelineStrip = false,
   testTargetMode = "deployed",
   skipDeploy = false,
+  webResearch,
+  captureBuild,
   onStop,
 }: Props) {
   const status = useMemo(
     () => resolveActiveRunStep(phases, agentCards, running),
     [phases, agentCards, running],
+  );
+  const webWait = useMemo(
+    () =>
+      phases.web_research?.status === "running"
+        ? resolveWebResearchWaitState(webResearch, captureBuild, running)
+        : null,
+    [phases.web_research?.status, webResearch, captureBuild, running],
   );
   const hasHelper = Boolean(agentCards.find((c) => c.agent === "helper"));
   const uiPhase = phases.ui_test ? "ui_test" : "exploration";
@@ -79,8 +94,11 @@ export function CurrentRunStatus({
   const activeKey = status.key;
   const isPipeline = PIPELINE_KEYS.has(status.key);
 
+  const displayLabel = webWait && status.key === "web_research" ? webWait.label : status.label;
+  const displayMessage = webWait && status.key === "web_research" ? webWait.message : status.message;
+
   return (
-    <section className="surface-card shrink-0 px-4 py-3">
+    <section className="surface-card shrink-0 space-y-3 px-4 py-3">
       <div className="flex flex-wrap items-center gap-3">
         <div className="flex min-w-0 flex-1 items-start gap-2.5">
           <Loader2
@@ -91,8 +109,8 @@ export function CurrentRunStatus({
           />
           <div className="min-w-0">
             <p className="text-[10px] font-semibold uppercase tracking-wide text-white/45">Current step</p>
-            <p className="text-sm font-medium text-white/95">{status.label}</p>
-            <p className="mt-0.5 text-sm leading-snug text-white/65">{status.message}</p>
+            <p className="text-sm font-medium text-white/95">{displayLabel}</p>
+            <p className="mt-0.5 text-sm leading-snug text-white/65">{displayMessage}</p>
           </div>
         </div>
 
@@ -125,6 +143,9 @@ export function CurrentRunStatus({
           </div>
         ) : null}
       </div>
+      {webWait && status.key === "web_research" ? (
+        <OperationWaitBanner wait={webWait} compact />
+      ) : null}
     </section>
   );
 }

@@ -1420,10 +1420,17 @@ export default function App() {
   const logLines = useMemo(() => events.map(formatEventLine).filter(Boolean), [events]);
 
   const lastActionLine = useMemo(() => {
+    const webSteps = webResearch?.steps;
+    if (webSteps?.length) {
+      const last = webSteps[webSteps.length - 1];
+      const mark = last.ok === false || last.progress === false ? "✗" : last.ok === true ? "✓" : "…";
+      const err = last.error ?? last.message;
+      return `${last.action ?? "action"} ${last.target_id ?? ""} ${mark}${err ? ` — ${err}` : ""}`.trim();
+    }
     if (!lastStep || lastStep.type !== "step") return undefined;
     const mark = lastStep.ok ? "✓" : "✗";
     return `${lastStep.action} ${lastStep.target} ${mark}${lastStep.message ? ` — ${lastStep.message}` : ""}`.trim();
-  }, [lastStep]);
+  }, [lastStep, webResearch?.steps]);
 
   const replayMode = Boolean(playwrightSession?.frames?.length) && !running;
   const viewingRunLabel = runHistory.find((run) => run.id === viewingRunId)?.label;
@@ -2080,6 +2087,8 @@ export default function App() {
               showPipelineStrip={hasCollaboration}
               testTargetMode={testTargetMode}
               skipDeploy={runApiOptions.skipDeploy}
+              webResearch={webResearch}
+              captureBuild={captureBuild}
               onStop={() => void stopRun()}
             />
           ) : null}
@@ -2133,7 +2142,7 @@ export default function App() {
 
           {webResearch ? (
             <section className="surface-card shrink-0 p-4">
-              <WebResearchPanel state={webResearch} />
+              <WebResearchPanel state={webResearch} captureBuild={captureBuild} running={inRunMode} />
             </section>
           ) : null}
 

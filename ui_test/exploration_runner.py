@@ -14,9 +14,6 @@ from ui_test.exploration_match import (
     find_task_path_in_site_map,
     history_has_interaction,
     path_key,
-    pick_button_for_task,
-    pick_nav_action_to_path,
-    pick_unexplored_button,
     task_mentions_hidden_content,
     task_requires_interaction,
 )
@@ -223,7 +220,10 @@ def _discover_and_persist(
     nav_tree: dict[str, Any],
     page: Page,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any], bool, int, bool, int]:
-    state = collect_page_state(page, include_screenshot=False)
+    from ui_test.browser_state import attach_web_capture, collect_page_state
+
+    state = collect_page_state(page, include_screenshot=True)
+    attach_web_capture(page, state, context="ui_exploration", analyze=True)
     visible = extract_visible_content(page)
     interactables = state.get("interactables") or []
 
@@ -247,6 +247,19 @@ def _discover_and_persist(
 
     state["visible_content"] = visible
     state["semantic_summary"] = semantic_summary_from_visible(visible)
+    try:
+        from ui_test.events import browser_state_event
+
+        browser_state_event(
+            url=state["url"],
+            title=state.get("title") or "",
+            interactables=interactables,
+            context="ui_exploration",
+            screenshot_b64=state.get("screenshot_b64"),
+            web_capture=state.get("web_capture"),
+        )
+    except ImportError:
+        pass
     return registry, nav_tree, state, visible, site_changed, new_capabilities, nav_changed, new_interactables
 
 
@@ -590,32 +603,6 @@ def run_exploration(
                 decision: dict[str, Any] | None = None
                 if exploration_status == "report_ready":
                     decision = {"action": "report", "reason": status_detail}
-                elif exploration_status == "go_to_known":
-                    known_path, _ = find_task_path_in_site_map(registry, task_text)
-                    if known_path:
-                        nav_decision = pick_nav_action_to_path(
-                            known_path, current_path, interactables, nav_tree
-                        )
-                        if nav_decision:
-                            decision = nav_decision
-                        else:
-                            button_decision = pick_button_for_task(
-                                task_text, interactables, nav_tree, current_path
-                            )
-                            if button_decision:
-                                decision = button_decision
-                                exploration_status = "explore_buttons"
-                            else:
-                                exploration_status = "explore_next"
-                                status_detail = (
-                                    f"Data may be on {known_path} but no link from here — "
-                                    "explore controls on current page"
-                                )
-
-                if decision is None and exploration_status in ("explore_buttons", "interact"):
-                    decision = pick_button_for_task(task_text, interactables, nav_tree, current_path)
-                    if decision is None:
-                        decision = pick_unexplored_button(interactables, nav_tree, current_path)
 
                 if decision is None:
                     unexplored = _unexplored_link_paths(nav_tree, page.url, interactables)

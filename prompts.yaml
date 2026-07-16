@@ -141,6 +141,7 @@ web_research:
 
     Rules:
     - summary keeps the user's goal exactly — do not generalize it.
+    - If the user names a specific site (e.g. "go to wowhead"), keep that site in summary verbatim.
     - data_needed: the concrete facts the answer must contain (dates, version numbers, names).
     - search_queries: 2-4 diverse strings, no URLs. When the task is about updates,
       releases, or announcements, make one query target the official source
@@ -156,6 +157,8 @@ web_research:
 
     Rules:
     - task and publishers[] describe what the user needs and who publishes the canonical source.
+    - preferred_sources[] lists sites the user explicitly asked to use — always tier those as official
+      for this task, even if they are fan wikis or aggregators like Wowhead.
     - Use your knowledge of those publishers and the result title/url/snippet.
     - tier=official only for pages on the publisher's own site or their direct announcement
       (news blog, support docs, official forums). Fan wikis, aggregators, Reddit, and
@@ -168,7 +171,7 @@ web_research:
     Pick ONE browser action per step. Return JSON only:
     {"action":"click|navigate|swap_branch|fill|select|press|scroll|back|wait|extract|filter|report|provide_values","target_id":"","url":"","value":"","value_key":"","form_values":{},"reason":""}
 
-    Read first: stuck, branch_note, failed[], avoid[], menu[].
+    Read first: user_directive, stuck, branch_note, failed[], avoid[], menu[].
     - stuck: why this page is blocked right now
     - branch_note: active branch, steps, last swap_branch choice
     - failed[]: prior steps that failed and why

@@ -566,26 +566,113 @@ def filter_blocking_overlays(overlays: list[Any]) -> list[dict[str, Any]]:
     return filtered
 
 _SEMANTIC_JS = """() => {
-  function visible(el) {
-    const r = el.getBoundingClientRect();
-    const s = getComputedStyle(el);
-    return r.width > 0 && r.height > 0 && s.visibility !== "hidden" && s.display !== "none";
-  }
   function clean(value, limit) {
     return String(value || "").trim().replace(/\\s+/g, " ").slice(0, limit);
   }
-  const headings = Array.from(document.querySelectorAll("h1,h2,h3,[role='heading']"))
-    .filter(visible).map(el => clean(el.innerText || el.textContent, 180)).filter(Boolean).slice(0, 30);
+  function isVisible(el) {
+    if (!el || el.nodeType !== 1) return false;
+    const tag = el.tagName;
+    if (tag === "SCRIPT" || tag === "STYLE" || tag === "NOSCRIPT" || tag === "SVG") return false;
+    const r = el.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) return false;
+    const s = getComputedStyle(el);
+    if (s.visibility === "hidden" || s.display === "none" || parseFloat(s.opacity || "1") === 0) return false;
+    return true;
+  }
+  function inViewport(el) {
+    const r = el.getBoundingClientRect();
+    return r.bottom >= 0 && r.top <= window.innerHeight && r.right >= 0 && r.left <= window.innerWidth;
+  }
+  function textFromNode(root, limit) {
+    const parts = [];
+    const seen = new Set();
+    function add(text) {
+      text = clean(text, limit);
+      if (!text || text.length < 2) return;
+      const key = text.slice(0, 96);
+      if (seen.has(key)) return;
+      seen.add(key);
+      parts.push(text);
+    }
+    function walk(node, allowHidden) {
+      if (!node) return;
+      if (node.nodeType === 3) {
+        const t = (node.textContent || "").trim();
+        if (t.length >= 2) add(t);
+        return;
+      }
+      if (node.nodeType !== 1) return;
+      const el = node;
+      const tag = el.tagName;
+      if (tag === "SCRIPT" || tag === "STYLE" || tag === "NOSCRIPT" || tag === "SVG") return;
+      const visible = allowHidden || isVisible(el);
+      if (!visible) return;
+      if (el.shadowRoot) walk(el.shadowRoot, true);
+      for (const child of el.childNodes) walk(child, false);
+    }
+    walk(root, false);
+    return clean(parts.join(" "), limit);
+  }
+  function blockText(el, limit) {
+    if (!el || !isVisible(el)) return "";
+    return clean(el.innerText || el.textContent || "", limit);
+  }
+  function collectVisibleText(limit) {
+    const candidates = [];
+    const regionSelectors = [
+      "main",
+      "[role='main']",
+      "article",
+      "[role='article']",
+      ".article-body",
+      ".article-content",
+      ".article__content",
+      ".content",
+      ".post-content",
+      ".entry-content",
+      "#content",
+      "#main-content",
+    ];
+    for (const sel of regionSelectors) {
+      for (const el of document.querySelectorAll(sel)) {
+        const t = blockText(el, limit);
+        if (t) candidates.push(t);
+      }
+    }
+    for (const el of document.querySelectorAll("*")) {
+      if (!el.shadowRoot || !isVisible(el)) continue;
+      const t = textFromNode(el.shadowRoot, limit);
+      if (t) candidates.push(t);
+    }
+    const viewportBlocks = [];
+    for (const el of document.querySelectorAll("p,li,h1,h2,h3,h4,h5,blockquote,pre,td,th,figcaption,span,div")) {
+      if (!isVisible(el) || !inViewport(el)) continue;
+      if (el.children.length > 8) continue;
+      const t = blockText(el, 2000);
+      if (t && t.length >= 12) viewportBlocks.push(t);
+    }
+    if (viewportBlocks.length) {
+      candidates.push(clean(viewportBlocks.join("\\n"), limit));
+    }
+    if (document.body) {
+      candidates.push(blockText(document.body, limit));
+      candidates.push(textFromNode(document.body, limit));
+    }
+    candidates.sort((a, b) => b.length - a.length);
+    return clean(candidates[0] || "", limit);
+  }
+  const limit = 24000;
+  const headings = Array.from(document.querySelectorAll("h1,h2,h3,h4,[role='heading']"))
+    .filter(isVisible).map(el => clean(el.innerText || el.textContent, 180)).filter(Boolean).slice(0, 40);
   const landmarks = Array.from(document.querySelectorAll("main,nav,aside,header,footer,[role='main'],[role='navigation'],[role='region']"))
-    .filter(visible).map(el => ({
+    .filter(isVisible).map(el => ({
       kind: el.getAttribute("role") || el.tagName.toLowerCase(),
       label: clean(el.getAttribute("aria-label") || el.getAttribute("aria-labelledby"), 120),
     })).slice(0, 20);
-  const root = document.querySelector("main,[role='main'],article") || document.body;
   return {
     headings,
     landmarks,
-    visible_text: clean(root ? (root.innerText || root.textContent) : "", 12000),
+    visible_text: collectVisibleText(limit),
   };
 }"""
 
@@ -867,6 +954,49 @@ def _resolve_viewport(page: Page, raw_viewport: Any) -> dict[str, Any]:
     }
 
 
+def _collect_iframe_visible_text(page: Page, *, limit: int = 12000) -> str:
+    """Merge readable text from child frames into the main snapshot."""
+    chunks: list[str] = []
+    try:
+        frames = list(page.frames)[1:]
+    except Exception:
+        return ""
+    for frame in frames:
+        try:
+            text = frame.evaluate(
+                """(limit) => {
+                  function clean(v, lim) {
+                    return String(v || "").trim().replace(/\\s+/g, " ").slice(0, lim);
+                  }
+                  const body = document.body;
+                  if (!body) return "";
+                  return clean(body.innerText || body.textContent || "", limit);
+                }""",
+                limit,
+            )
+        except Exception:
+            continue
+        if isinstance(text, str) and text.strip():
+            chunks.append(text.strip())
+    merged = "\n\n".join(chunks)
+    return merged[:limit]
+
+
+def build_semantic_snapshot(state: dict[str, Any], *, max_chars: int = 10000) -> str:
+    """Human-readable page text for prompts and UI — not limited to interactables."""
+    parts: list[str] = []
+    title = str(state.get("title") or "").strip()
+    if title:
+        parts.append(f"# {title}")
+    headings = state.get("headings")
+    if isinstance(headings, list) and headings:
+        parts.append("## " + " · ".join(str(item) for item in headings[:12] if str(item).strip()))
+    visible = str(state.get("visible_text") or "").strip()
+    if visible:
+        parts.append(visible)
+    return "\n\n".join(parts)[:max_chars]
+
+
 def collect_page_state(page: Page, *, include_screenshot: bool = True) -> dict[str, Any]:
     """Create a compact semantic snapshot with stable IDs and page context."""
     try:
@@ -910,6 +1040,12 @@ def collect_page_state(page: Page, *, include_screenshot: bool = True) -> dict[s
         else len(interactables)
     )
     semantic = semantic if isinstance(semantic, dict) else {}
+    visible_text = str(semantic.get("visible_text") or "")
+    iframe_text = _collect_iframe_visible_text(page)
+    if iframe_text:
+        if iframe_text not in visible_text:
+            visible_text = f"{visible_text}\n\n{iframe_text}".strip() if visible_text else iframe_text
+        visible_text = visible_text[:24000]
     routes = sorted(
         {
             str(item["href"])
@@ -931,10 +1067,11 @@ def collect_page_state(page: Page, *, include_screenshot: bool = True) -> dict[s
         "interactables_truncated": interactable_total > len(interactables),
         "headings": semantic.get("headings") if isinstance(semantic.get("headings"), list) else [],
         "landmarks": semantic.get("landmarks") if isinstance(semantic.get("landmarks"), list) else [],
-        "visible_text": str(semantic.get("visible_text") or ""),
+        "visible_text": visible_text,
         "discovered_routes": routes,
         "blocking_overlays": filtered_overlays,
     }
+    state["semantic_snapshot"] = build_semantic_snapshot(state)
     if include_screenshot:
         shot = capture_screenshot_b64(page)
         if shot:

@@ -5,6 +5,8 @@ import unittest
 from web_surf.context_curate import curate_browse_context
 from web_surf.explore_branches import (
     build_exploration_menu,
+    match_seed_url,
+    resolve_active_branch_url,
     summarize_exploration_branches,
     unexplored_seed_urls,
 )
@@ -43,6 +45,43 @@ class ExploreBranchTests(unittest.TestCase):
         ]
         pending = unexplored_seed_urls(seeds, history, active_branch_url=seeds[0])
         self.assertEqual(pending, [seeds[1]])
+
+    def test_unexplored_seed_urls_excludes_current_seed_page(self) -> None:
+        seeds = [
+            "https://eu.forums.blizzard.com/en/d4/t/patch-notes-for-july-14th-2026/25487",
+            "https://news.blizzard.com/en-us/article/24267939/mists-of-pandaria-classic-escalation-now-live",
+        ]
+        history = [
+            {
+                "ok": True,
+                "action": "click",
+                "branch_url": seeds[0],
+                "url": seeds[1],
+            }
+        ]
+        pending = unexplored_seed_urls(
+            seeds,
+            history,
+            active_branch_url=seeds[0],
+            current_page_url=seeds[1],
+        )
+        self.assertEqual(pending, [])
+
+    def test_resolve_active_branch_url_when_on_seed(self) -> None:
+        seeds = [
+            "https://news.blizzard.com/en-us/article/24267939/mists-of-pandaria-classic-escalation-now-live",
+        ]
+        resolved = resolve_active_branch_url(
+            page_url=seeds[0],
+            seed_urls=seeds,
+            active_branch_url="https://eu.forums.blizzard.com/en/d4/t/patch-notes-for-july-14th-2026/25487",
+        )
+        self.assertEqual(resolved, seeds[0])
+
+    def test_match_seed_url_normalizes(self) -> None:
+        seed = "https://news.blizzard.com/en-us/article/24267939/mists-of-pandaria-classic-escalation-now-live/"
+        matched = match_seed_url(seed, [seed.rstrip("/")])
+        self.assertTrue(matched)
 
     def test_summarize_marks_stalled_branch(self) -> None:
         history = [
@@ -116,7 +155,7 @@ class ExploreBranchTests(unittest.TestCase):
         self.assertIn("branch", payload)
         self.assertIn("menu", payload)
         self.assertIn("explore_note", payload)
-        self.assertIn("redirect", payload["explore_note"].lower())
+        self.assertIn("menu[]", payload["explore_note"].lower())
         self.assertTrue(any(row.get("action") == "swap_branch" for row in payload["menu"]))
 
 

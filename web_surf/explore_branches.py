@@ -21,6 +21,31 @@ def _safe_norm(url: str) -> str:
         return str(url or "").strip()
 
 
+def match_seed_url(url: str, seed_urls: list[str]) -> str:
+    """Return the canonical normalized seed URL matching url, or empty string."""
+    norm = _safe_norm(url)
+    if not norm:
+        return ""
+    seed_norms = {_safe_norm(seed): seed for seed in seed_urls}
+    if norm in seed_norms:
+        return _safe_norm(seed_norms[norm])
+    return ""
+
+
+def resolve_active_branch_url(
+    *,
+    page_url: str,
+    seed_urls: list[str],
+    active_branch_url: str,
+) -> str:
+    """Keep branch identity in sync when the browser lands on a search-result seed."""
+    matched = match_seed_url(page_url, seed_urls)
+    if matched:
+        return matched
+    active = _safe_norm(active_branch_url)
+    return active or matched
+
+
 def _visited_urls(history: list[dict[str, Any]]) -> set[str]:
     visited: set[str] = set()
     for item in history:
@@ -41,14 +66,27 @@ def _visited_urls(history: list[dict[str, Any]]) -> set[str]:
     return visited
 
 
-def _explored_branch_urls(history: list[dict[str, Any]]) -> set[str]:
+def _explored_branch_urls(
+    history: list[dict[str, Any]],
+    *,
+    seed_urls: list[str] | None = None,
+) -> set[str]:
     explored: set[str] = set()
+    seed_norms = {_safe_norm(seed) for seed in (seed_urls or []) if _safe_norm(seed)}
     for item in history:
         if not item.get("ok"):
             continue
         branch = _safe_norm(str(item.get("branch_url") or ""))
         if branch:
             explored.add(branch)
+        action = str(item.get("action") or "")
+        navigated = _safe_norm(str(item.get("url") or ""))
+        if navigated and action in {"navigate", "swap_branch", "origin", "click"}:
+            if not seed_norms or navigated in seed_norms:
+                explored.add(navigated)
+            matched = match_seed_url(navigated, list(seed_urls or []))
+            if matched:
+                explored.add(matched)
     return explored
 
 
@@ -57,12 +95,16 @@ def unexplored_seed_urls(
     history: list[dict[str, Any]],
     *,
     active_branch_url: str = "",
+    current_page_url: str = "",
 ) -> list[str]:
     """Seed URLs from search that have not yet been opened as an exploration branch."""
-    explored = _explored_branch_urls(history)
+    explored = _explored_branch_urls(history, seed_urls=seed_urls)
     active = _safe_norm(active_branch_url)
     if active:
         explored.add(active)
+    on_seed = match_seed_url(current_page_url, seed_urls)
+    if on_seed:
+        explored.add(on_seed)
     pending: list[str] = []
     for url in seed_urls:
         norm = _safe_norm(url)

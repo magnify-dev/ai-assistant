@@ -1,13 +1,19 @@
-import { useEffect, useRef, useState } from "react";
+import { useState, type ReactNode } from "react";
+import { OperationWaitBanner } from "@/components/OperationWaitBanner";
 import type {
   WebResearchItem,
   WebResearchLlmExchange,
   WebResearchMemoryEntry,
   WebResearchState,
 } from "@/lib/webResearchTypes";
+import { resolveWebResearchWaitState } from "@/lib/webResearchWait";
+import type { WebCaptureBuildStatus } from "@/lib/webCaptureTypes";
+import { cn } from "@/lib/utils";
 
 type Props = {
   state: WebResearchState;
+  captureBuild?: WebCaptureBuildStatus | null;
+  running?: boolean;
 };
 
 function text(value: unknown): string {
@@ -48,94 +54,105 @@ function interactableLabel(item: WebResearchItem): string {
   const kind = text(item.kind || item.role || "element");
   const label = text(item.text || item.aria || item.label || item.placeholder || "Unlabelled control");
   const action = text(item.action_hint);
-  const href = text(item.href);
-  return `${kind} #${text(item.id)} — ${label}${action ? ` · ${action}` : href ? ` · Opens ${href}` : ""}`;
+  return `${kind} #${text(item.id)} — ${label}${action ? ` · ${action}` : ""}`;
 }
 
-function InteractablesSection({ items }: { items?: WebResearchItem[] }) {
-  return (
-    <section className="rounded-md border border-white/10 bg-black/20 p-3">
-      <h3 className="mb-2 text-[10px] font-semibold uppercase tracking-wide text-white/45">
-        Available controls <span className="font-normal">({items?.length ?? 0})</span>
-      </h3>
-      <p className="mb-2 text-xs text-white/45">
-        Each control maps its stable ID to the action it performs. The agent chooses its next step from this list.
-      </p>
-      {items?.length ? (
-        <ul className="max-h-40 space-y-1 overflow-y-auto text-xs text-white/70">
-          {items.slice(-30).map((item, index) => (
-            <li key={text(item.id ?? index)} className="break-words rounded bg-white/[0.03] px-2 py-1">
-              {interactableLabel(item)}
-            </li>
-          ))}
-        </ul>
-      ) : (
-        <p className="text-xs text-white/35">Waiting for the page controls…</p>
-      )}
-    </section>
-  );
-}
-
-function ListSection({
+function CollapsibleSection({
   title,
-  items,
-  empty,
+  count,
+  defaultOpen = false,
+  children,
 }: {
   title: string;
-  items?: WebResearchItem[];
-  empty?: string;
+  count?: number;
+  defaultOpen?: boolean;
+  children: ReactNode;
 }) {
+  const [open, setOpen] = useState(defaultOpen);
   return (
-    <section className="rounded-md border border-white/10 bg-black/20 p-3">
-      <h3 className="mb-2 text-[10px] font-semibold uppercase tracking-wide text-white/45">
-        {title} <span className="font-normal">({items?.length ?? 0})</span>
-      </h3>
-      {items?.length ? (
-        <ul className="max-h-40 space-y-1 overflow-y-auto text-xs text-white/70">
-          {items.slice(-30).map((item, index) => (
-            <li key={text(item.id ?? item.url ?? index)} className="break-words rounded bg-white/[0.03] px-2 py-1">
-              {itemLabel(item)}
-              {item.status ? <span className="ml-2 text-white/40">{text(item.status)}</span> : null}
-            </li>
-          ))}
-        </ul>
-      ) : (
-        <p className="text-xs text-white/35">{empty ?? "Waiting…"}</p>
-      )}
+    <section className="rounded-md border border-white/10 bg-black/20">
+      <button
+        type="button"
+        onClick={() => setOpen((value) => !value)}
+        className="flex w-full cursor-pointer items-center justify-between gap-2 px-3 py-2 text-left"
+      >
+        <span className="text-[10px] font-semibold uppercase tracking-wide text-white/45">
+          {title}
+          {count != null ? <span className="font-normal"> ({count})</span> : null}
+        </span>
+        <span className="text-[10px] text-white/35">{open ? "▾" : "▸"}</span>
+      </button>
+      {open ? <div className="border-t border-white/10 p-3">{children}</div> : null}
     </section>
   );
 }
 
-function isRunFinished(state: WebResearchState): boolean {
-  if (state.runFinished) return true;
-  if (state.answer) return true;
-  const status = text(state.controller?.status ?? state.progress?.step);
-  return ["complete", "incomplete", "blocked"].includes(status);
-}
-
-function exchangeMeta(exchange: WebResearchLlmExchange): string {
-  const parts = [
-    exchange.label ?? exchange.prompt_key,
-    exchange.step_id ? `step ${exchange.step_id}` : "",
-    exchange.url ? exchange.url : "",
-    exchange.ok === false ? "failed" : "",
-  ].filter(Boolean);
-  return parts.join(" · ");
-}
-
-function PromptBlock({ title, body, tone }: { title: string; body: string; tone: "in" | "out" }) {
-  if (!body) return null;
-  const toneClass =
-    tone === "in"
-      ? "border-white/10 bg-black/30 text-white/75"
-      : "border-emerald-400/20 bg-emerald-400/5 text-emerald-50/90";
+function StepTimeline({ steps }: { steps?: WebResearchItem[] }) {
+  const items = steps ?? [];
+  if (!items.length) {
+    return <p className="text-xs text-white/35">No actions recorded yet.</p>;
+  }
   return (
-    <div className={`rounded border px-2 py-2 ${toneClass}`}>
-      <p className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-white/40">{title}</p>
-      <pre className="whitespace-pre-wrap break-words font-mono text-[11px] leading-relaxed">
-        {body}
-      </pre>
-    </div>
+    <ol className="max-h-48 space-y-1 overflow-y-auto text-xs">
+      {[...items].slice(-12).reverse().map((item, index) => {
+        const ok = item.ok;
+        const failed = ok === false || item.progress === false;
+        return (
+          <li
+            key={text(item.step_id ?? item.id ?? index)}
+            className={cn(
+              "rounded px-2 py-1.5",
+              failed ? "border border-rose-400/25 bg-rose-500/10 text-rose-50/90" : "bg-white/[0.03] text-white/75",
+            )}
+          >
+            <div className="flex items-start gap-2">
+              <span className="shrink-0 font-mono text-[10px]">{failed ? "✗" : ok === true ? "✓" : "…"}</span>
+              <div className="min-w-0">
+                <p className="font-medium">
+                  {[text(item.action), text(item.target_id)].filter(Boolean).join(" → ")}
+                </p>
+                {item.error || item.message ? (
+                  <p className="mt-0.5 text-[10px] text-white/55">{text(item.error ?? item.message)}</p>
+                ) : null}
+              </div>
+            </div>
+          </li>
+        );
+      })}
+    </ol>
+  );
+}
+
+function InteractablesList({
+  items,
+  highlightId,
+}: {
+  items?: WebResearchItem[];
+  highlightId?: string;
+}) {
+  if (!items?.length) {
+    return <p className="text-xs text-white/35">Waiting for page controls…</p>;
+  }
+  return (
+    <ul className="max-h-48 space-y-1 overflow-y-auto text-xs">
+      {items.slice(-40).map((item, index) => {
+        const id = text(item.id ?? index);
+        const active = highlightId && id === highlightId;
+        return (
+          <li
+            key={id}
+            className={cn(
+              "break-words rounded px-2 py-1",
+              active
+                ? "border border-sky-400/40 bg-sky-500/15 text-sky-50"
+                : "bg-white/[0.03] text-white/70",
+            )}
+          >
+            {interactableLabel(item)}
+          </li>
+        );
+      })}
+    </ul>
   );
 }
 
@@ -149,287 +166,154 @@ function memoryLabel(entry: WebResearchMemoryEntry): string {
   return [text(entry.step_id), action, reason, status].filter(Boolean).join(" — ");
 }
 
-function AgentMemorySection({
-  entries,
-  finished,
-}: {
-  entries?: WebResearchMemoryEntry[];
-  finished: boolean;
-}) {
-  const listRef = useRef<HTMLOListElement>(null);
-  const stickToBottom = useRef(true);
-  const items = entries ?? [];
-
-  useEffect(() => {
-    const el = listRef.current;
-    if (el && stickToBottom.current && !finished) {
-      el.scrollTop = el.scrollHeight;
-    }
-  }, [items.length, finished]);
-
-  return (
-    <section className="rounded-md border border-cyan-400/25 bg-cyan-400/5 p-3">
-      <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
-        <div>
-          <h3 className="text-[10px] font-semibold uppercase tracking-wide text-cyan-100/80">
-            Agent memory
-          </h3>
-          <p className="mt-1 text-xs text-white/50">
-            Structured log of every decision and outcome — injected into each new prompt.
-          </p>
-        </div>
-        <span className="rounded-full bg-cyan-400/15 px-2 py-0.5 text-[10px] text-cyan-50/90">
-          {items.length} steps
-        </span>
-      </div>
-      {items.length ? (
-        <ol
-          ref={listRef}
-          onScroll={(e) => {
-            const el = e.currentTarget;
-            stickToBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
-          }}
-          className="max-h-56 space-y-1 overflow-y-auto overscroll-y-contain pr-1 text-xs text-white/75"
-        >
-          {items.map((entry, index) => (
-            <li
-              key={text(entry.step_id ?? index)}
-              className="rounded border border-white/10 bg-black/25 px-2 py-1.5"
-            >
-              <p className="font-mono text-[11px] leading-relaxed">{memoryLabel(entry)}</p>
-              {entry.page_url ? (
-                <p className="mt-1 truncate text-[10px] text-white/40">{text(entry.page_url)}</p>
-              ) : null}
-            </li>
-          ))}
-        </ol>
-      ) : (
-        <p className="text-xs text-white/35">
-          {finished ? "No agent memory recorded." : "Waiting for first completed step…"}
-        </p>
-      )}
-    </section>
-  );
-}
-
-function LlmPromptTrace({ exchanges, finished }: { exchanges?: WebResearchLlmExchange[]; finished: boolean }) {
-  const listRef = useRef<HTMLOListElement>(null);
-  const stickToBottom = useRef(true);
-  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+function LlmPromptTrace({ exchanges }: { exchanges?: WebResearchLlmExchange[] }) {
   const items = [...(exchanges ?? [])].sort((a, b) => Number(a.seq ?? 0) - Number(b.seq ?? 0));
-
-  useEffect(() => {
-    if (!items.length) return;
-    const latestKey = String(items[items.length - 1].seq ?? items.length - 1);
-    setExpanded((prev) => ({ ...prev, [latestKey]: true }));
-  }, [items.length, items[items.length - 1]?.seq]);
-
-  useEffect(() => {
-    const el = listRef.current;
-    if (el && stickToBottom.current && !finished) {
-      el.scrollTop = el.scrollHeight;
-    }
-  }, [items, finished, expanded]);
-
   if (!items.length) {
-    if (!finished) return null;
-    return (
-      <section className="rounded-md border border-white/10 bg-black/20 p-3">
-        <h3 className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-white/45">Local AI prompt trace</h3>
-        <p className="text-xs text-white/35">No Ollama exchanges were recorded for this run.</p>
-      </section>
-    );
+    return <p className="text-xs text-white/35">No model calls recorded yet.</p>;
   }
-
   return (
-    <section
-      className={`rounded-md border p-3 ${
-        finished ? "border-violet-400/30 bg-violet-400/5" : "border-white/10 bg-black/20"
-      }`}
-    >
-      <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
-        <div>
-          <h3 className="text-[10px] font-semibold uppercase tracking-wide text-white/45">Local AI prompt trace</h3>
-          <p className="mt-1 text-xs text-white/50">
-            {finished
-              ? "Ordered prompt inputs and model outputs from this run."
-              : "Recording exchanges as the run progresses…"}
-          </p>
-        </div>
-        <span className="rounded-full bg-white/10 px-2 py-0.5 text-[10px] text-white/70">{items.length} calls</span>
-      </div>
-      <ol
-        ref={listRef}
-        onScroll={(e) => {
-          const el = e.currentTarget;
-          stickToBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
-        }}
-        className="max-h-[32rem] min-h-0 space-y-2 overflow-y-auto overscroll-y-contain pr-1 scrollbar-thin"
-      >
-        {items.map((exchange, index) => {
-          const input = [
-            exchange.system_prompt ? `SYSTEM\n${exchange.system_prompt}` : "",
-            exchange.user_input ? `USER\n${exchange.user_input}` : "",
-          ]
-            .filter(Boolean)
-            .join("\n\n");
-          const key = String(exchange.seq ?? index);
-          const isExpanded = Boolean(expanded[key]);
-          return (
-            <li key={key} className="rounded-md border border-white/10 bg-black/25">
-              <button
-                type="button"
-                onClick={() => setExpanded((prev) => ({ ...prev, [key]: !prev[key] }))}
-                className="flex w-full cursor-pointer items-start gap-2 px-3 py-2 text-left text-xs text-white/80"
-              >
-                <span className="rounded bg-white/10 px-1.5 py-0.5 font-mono text-[10px] text-white/60">
-                  #{exchange.seq ?? index + 1}
-                </span>
-                <span className="min-w-0 flex-1 font-medium text-white/85">{exchangeMeta(exchange)}</span>
-                {exchange.ok === false ? (
-                  <span className="shrink-0 rounded-full bg-rose-500/15 px-2 py-0.5 text-[10px] text-rose-100">failed</span>
-                ) : (
-                  <span className="shrink-0 rounded-full bg-emerald-500/15 px-2 py-0.5 text-[10px] text-emerald-100">ok</span>
-                )}
-                {exchange.truncated ? (
-                  <span className="shrink-0 text-[10px] text-white/40">truncated</span>
-                ) : null}
-                <span className="shrink-0 text-[10px] text-white/40">{isExpanded ? "▾" : "▸"}</span>
-              </button>
-              {isExpanded ? (
-                <div className="space-y-2 border-t border-white/10 px-3 py-3">
-                  <PromptBlock title="Input" body={input} tone="in" />
-                  <PromptBlock title="Output" body={text(exchange.response)} tone="out" />
-                  {exchange.error ? (
-                    <p className="text-xs text-rose-200/90">Error: {text(exchange.error)}</p>
-                  ) : null}
-                </div>
-              ) : null}
-            </li>
-          );
-        })}
-      </ol>
-    </section>
+    <ol className="max-h-56 space-y-1 overflow-y-auto text-xs text-white/70">
+      {items.slice(-8).reverse().map((exchange, index) => (
+        <li key={String(exchange.seq ?? index)} className="rounded bg-white/[0.03] px-2 py-1">
+          <span className="font-mono text-[10px] text-white/45">#{exchange.seq ?? index + 1}</span>{" "}
+          {text(exchange.label ?? exchange.prompt_key)}
+          {exchange.ok === false ? (
+            <span className="ml-2 text-rose-200">failed</span>
+          ) : (
+            <span className="ml-2 text-emerald-200/80">ok</span>
+          )}
+        </li>
+      ))}
+    </ol>
   );
 }
 
-export function WebResearchPanel({ state }: Props) {
+export function WebResearchPanel({ state, captureBuild, running = true }: Props) {
+  const wait = resolveWebResearchWaitState(state, captureBuild, running);
   const snapshot = state.snapshot;
+  const interactables = (snapshot?.interactables ?? []) as WebResearchItem[];
+  const blockers = Array.isArray(snapshot?.blocking_overlays)
+    ? (snapshot.blocking_overlays as WebResearchItem[])
+    : [];
+  const highlightId = wait?.targetId || text(state.decision?.target);
   const semantic = text(
     snapshot?.semantic_snapshot ??
       snapshot?.semanticSnapshot ??
       snapshot?.visible_text ??
       snapshot?.text,
   );
-  const interactables = snapshot?.interactables ?? [];
-  const blockers = Array.isArray(snapshot?.blocking_overlays)
-    ? (snapshot.blocking_overlays as WebResearchItem[])
-    : [];
-  const controllerStatus = text(
-    state.controller?.status ?? state.controller?.phase ?? state.progress?.step ?? "running",
-  );
-  const graphNodes = Array.isArray(state.visitGraph?.nodes)
-    ? state.visitGraph.nodes
-    : state.visitGraph?.nodes && typeof state.visitGraph.nodes === "object"
-      ? Object.entries(state.visitGraph.nodes).map(([id, value]) => ({
-          id,
-          ...(typeof value === "object" && value ? value : { label: text(value) }),
-        }))
-      : [];
-  const graphEdges = Array.isArray(state.visitGraph?.edges) ? state.visitGraph.edges : [];
-  const runFinished = isRunFinished(state);
 
   return (
     <div className="flex min-h-0 flex-col gap-3">
       <div className="flex flex-wrap items-start justify-between gap-2">
-        <div className="min-w-0">
-          <h2 className="text-sm font-semibold uppercase tracking-wide text-white/50">Stepwise web exploration</h2>
-          <p className="mt-1 truncate font-mono text-xs text-sky-200/80">
-            {state.currentUrl ?? snapshot?.url ?? state.progress?.url ?? "Waiting for browser…"}
-          </p>
-        </div>
-        <span className="rounded-full bg-sky-500/15 px-2 py-0.5 text-[10px] text-sky-100">
-          {controllerStatus}
-        </span>
+        <h2 className="text-sm font-semibold uppercase tracking-wide text-white/50">Web exploration</h2>
       </div>
+
+      {wait ? <OperationWaitBanner wait={wait} /> : null}
+
+      {blockers.length ? (
+        <section className="rounded-md border border-amber-400/30 bg-amber-400/10 p-3">
+          <h3 className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-amber-100">
+            Blocking overlay
+          </h3>
+          <p className="text-xs text-amber-50/85">{blockers.map(itemLabel).join(" · ")}</p>
+        </section>
+      ) : null}
 
       {snapshot?.screenshot_b64 ? (
         <div className="overflow-hidden rounded-md border border-white/10 bg-black/30 p-1">
           <img
             src={`data:image/jpeg;base64,${snapshot.screenshot_b64}`}
             alt="Current web exploration page"
-            className="max-h-72 w-full object-contain"
+            className="max-h-80 w-full object-contain"
           />
         </div>
       ) : null}
 
-      {blockers.length ? (
-        <section className="rounded-md border border-amber-400/30 bg-amber-400/10 p-3">
-          <h3 className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-amber-100">
-            Blocking overlay detected
+      <div className="grid gap-3 lg:grid-cols-2">
+        <section className="rounded-md border border-white/10 bg-black/20 p-3">
+          <h3 className="mb-2 text-[10px] font-semibold uppercase tracking-wide text-white/45">Recent actions</h3>
+          <StepTimeline steps={state.steps} />
+        </section>
+        <section className="rounded-md border border-white/10 bg-black/20 p-3">
+          <h3 className="mb-2 text-[10px] font-semibold uppercase tracking-wide text-white/45">
+            Page controls
+            {highlightId ? (
+              <span className="ml-2 font-normal normal-case text-sky-200/80">target #{highlightId}</span>
+            ) : null}
           </h3>
-          <p className="text-xs text-amber-50/85">
-            {blockers.map(itemLabel).join(" · ")}
-          </p>
+          <InteractablesList items={interactables} highlightId={highlightId} />
+        </section>
+      </div>
+
+      {state.answer ? (
+        <section className="rounded-md border border-emerald-400/25 bg-emerald-400/5 p-3">
+          <h3 className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-emerald-100">Answer</h3>
+          <p className="whitespace-pre-wrap text-sm text-emerald-50/90">{state.answer}</p>
         </section>
       ) : null}
 
-      <div className="grid gap-3 xl:grid-cols-2">
-        <section className="rounded-md border border-white/10 bg-black/20 p-3">
-          <h3 className="mb-2 text-[10px] font-semibold uppercase tracking-wide text-white/45">Controller</h3>
-          <p className="text-xs text-white/70">
-            {text(state.controller?.reason ?? state.progress?.message ?? state.controller) || "Waiting for state…"}
-          </p>
-        </section>
-        <section className="rounded-md border border-white/10 bg-black/20 p-3">
-          <h3 className="mb-2 text-[10px] font-semibold uppercase tracking-wide text-white/45">Latest decision</h3>
-          <p className="text-xs text-white/75">
-            {state.decision
-              ? [state.decision.action, state.decision.target, state.decision.reason].filter(Boolean).map(text).join(" — ")
-              : "Waiting for decision…"}
-          </p>
-        </section>
-      </div>
-
-      <section className="rounded-md border border-white/10 bg-black/20 p-3">
-        <h3 className="mb-2 text-[10px] font-semibold uppercase tracking-wide text-white/45">Semantic snapshot</h3>
-        <p className="max-h-36 overflow-y-auto whitespace-pre-wrap text-xs leading-relaxed text-white/65">
-          {semantic || "No semantic snapshot yet."}
+      <CollapsibleSection title="Page text" count={semantic ? semantic.length : undefined} defaultOpen>
+        <p className="mb-1 text-[10px] text-white/40">
+          {snapshot?.visible_text
+            ? `${String(snapshot.visible_text).length.toLocaleString()} chars captured from the visible page`
+            : "Waiting for page text…"}
         </p>
-      </section>
+        <p className="max-h-56 overflow-y-auto whitespace-pre-wrap text-xs leading-relaxed text-white/65">
+          {semantic || "No page text captured yet."}
+        </p>
+      </CollapsibleSection>
 
-      <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
-        <InteractablesSection items={interactables as WebResearchItem[]} />
-        <ListSection title="Steps" items={state.steps} />
-        <ListSection title="Candidates" items={state.candidates} />
-        <ListSection title="Evidence" items={state.evidence} />
-        <ListSection
-          title="Unmet criteria"
-          items={state.unmetCriteria?.map((criterion) => ({ text: criterion }))}
-          empty="All reported criteria are met."
-        />
-        <ListSection title="Helper exchange" items={state.helperExchanges} />
-        <ListSection
-          title="Form value plans"
-          items={state.formValuePlans}
-          empty="No AI-generated form values yet."
-        />
-        <ListSection title="State changes" items={state.transitions} empty="No action transition captured yet." />
-      </div>
-
-      <section className="rounded-md border border-white/10 bg-black/20 p-3">
-        <h3 className="mb-2 text-[10px] font-semibold uppercase tracking-wide text-white/45">
-          Visit graph ({graphNodes.length} nodes / {graphEdges.length} edges)
-        </h3>
-        <div className="grid gap-2 md:grid-cols-2">
-          <ListSection title="Visited pages" items={graphNodes} empty="No visits reported." />
-          <ListSection title="Transitions" items={graphEdges} empty="No transitions reported." />
+      <CollapsibleSection title="Evidence & criteria" count={(state.evidence?.length ?? 0) + (state.unmetCriteria?.length ?? 0)}>
+        <div className="grid gap-3 md:grid-cols-2">
+          <div>
+            <p className="mb-1 text-[10px] uppercase text-white/40">Evidence ({state.evidence?.length ?? 0})</p>
+            {state.evidence?.length ? (
+              <ul className="max-h-32 space-y-1 overflow-y-auto text-xs text-white/70">
+                {state.evidence.slice(-10).map((item, index) => (
+                  <li key={text(item.id ?? index)} className="rounded bg-white/[0.03] px-2 py-1">
+                    {itemLabel(item)}
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <p className="text-xs text-white/35">None yet.</p>
+            )}
+          </div>
+          <div>
+            <p className="mb-1 text-[10px] uppercase text-white/40">Unmet criteria</p>
+            {state.unmetCriteria?.length ? (
+              <ul className="space-y-1 text-xs text-white/70">
+                {state.unmetCriteria.map((criterion) => (
+                  <li key={criterion} className="rounded bg-white/[0.03] px-2 py-1">
+                    {criterion}
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <p className="text-xs text-white/35">All criteria met or not reported.</p>
+            )}
+          </div>
         </div>
-      </section>
+      </CollapsibleSection>
 
-      <AgentMemorySection entries={state.agentMemory} finished={runFinished} />
+      <CollapsibleSection title="Agent memory" count={state.agentMemory?.length ?? 0}>
+        {state.agentMemory?.length ? (
+          <ol className="max-h-48 space-y-1 overflow-y-auto text-xs text-white/75">
+            {state.agentMemory.slice(-20).map((entry, index) => (
+              <li key={text(entry.step_id ?? index)} className="rounded bg-white/[0.03] px-2 py-1 font-mono text-[11px]">
+                {memoryLabel(entry)}
+              </li>
+            ))}
+          </ol>
+        ) : (
+          <p className="text-xs text-white/35">No memory entries yet.</p>
+        )}
+      </CollapsibleSection>
 
-      <LlmPromptTrace exchanges={state.llmExchanges} finished={runFinished} />
+      <CollapsibleSection title="Model calls" count={state.llmExchanges?.length ?? 0}>
+        <LlmPromptTrace exchanges={state.llmExchanges} />
+      </CollapsibleSection>
     </div>
   );
 }

@@ -279,6 +279,40 @@ class PageMatchTests(unittest.TestCase):
             )
         )
 
+    def test_user_preferred_wowhead_overrides_official_default(self) -> None:
+        from web_surf.page_match import (
+            goal_is_satisfied,
+            parse_user_preferred_domains,
+            seed_url_priority,
+        )
+
+        query = "go to wowhead and find wow mists of pandaria latest news"
+        preferred = parse_user_preferred_domains(query)
+        self.assertIn("wowhead.com", preferred)
+        wowhead = seed_url_priority("https://www.wowhead.com/mists-of-pandaria", query)
+        blizzard = seed_url_priority(
+            "https://news.blizzard.com/en-us/article/24267939/mists-of-pandaria-classic-escalation-now-live",
+            query,
+        )
+        self.assertGreater(wowhead[0], blizzard[0])
+        detailed = (
+            "Mists of Pandaria Classic Escalation is now live with new raid tuning. "
+            "Fixed an issue where players could not complete the weekly quest. "
+            "Increased the drop rate for rare mounts. Balance update for monk class abilities."
+        )
+        self.assertTrue(
+            goal_is_satisfied(
+                detailed,
+                query,
+                source_url="https://www.wowhead.com/mists-of-pandaria/news",
+                publisher_domains={"blizzard.com"},
+                publisher_routes={
+                    "https://news.blizzard.com/en-us/article/24267939/mists-of-pandaria-classic-escalation-now-live"
+                },
+                preferred_domains=preferred,
+            )
+        )
+
 
 class ExtractTests(unittest.TestCase):
     def test_quote_supported_exact_and_partial(self) -> None:

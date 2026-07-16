@@ -2,6 +2,7 @@ import { useMemo, useState } from "react";
 import type { RunReport, StructuredTask, TestTarget } from "@/lib/projectTypes";
 import type { AgentRunCard, CollaborationResult } from "@/lib/collaborationTypes";
 import type { WebResearchState } from "@/lib/webResearchTypes";
+import { resolveWebResearchWaitState } from "@/lib/webResearchWait";
 import { PHASES, type PhaseKey, type PhaseMap } from "@/types";
 import { CollaborationPanel } from "@/components/CollaborationPanel";
 import { ExplorationPanel } from "@/components/ExplorationPanel";
@@ -222,6 +223,10 @@ export function RunProgressPanel({
     Boolean(phases.web_research) ||
     Boolean(webResearch?.answer) ||
     Boolean(webResearch?.controller || webResearch?.currentUrl);
+  const webWait = useMemo(
+    () => resolveWebResearchWaitState(webResearch, null, running),
+    [webResearch, running],
+  );
 
   const activeStep = useMemo(
     () => resolveActiveRunStep(phases, agentCards, running),
@@ -312,7 +317,8 @@ export function RunProgressPanel({
                     : "idle"
             }
             summary={
-              webResearch?.progress?.step
+              webWait?.message ??
+              (webResearch?.progress?.step
                 ? `${webResearch.progress.step}${webResearch.progress.url ? `: ${webResearch.progress.url}` : ""}${
                     webResearch.progress.index && webResearch.progress.total
                       ? ` (${webResearch.progress.index}/${webResearch.progress.total})`
@@ -322,12 +328,12 @@ export function RunProgressPanel({
                   ? `${webResearch.decision.action}${webResearch.decision.target ? `: ${webResearch.decision.target}` : ""}`
                   : webResearch?.controller?.status || webResearch?.controller?.phase
                     ? String(webResearch.controller.status ?? webResearch.controller.phase)
-                : phases.web_research?.message ||
-                  (webResearch?.pages_fetched
-                    ? `${webResearch.pages_fetched} page(s), ${webResearch.facts_added ?? 0} fact(s)`
-                    : running
-                      ? "Searching and extracting…"
-                      : undefined)
+                    : phases.web_research?.message ||
+                      (webResearch?.pages_fetched
+                        ? `${webResearch.pages_fetched} page(s), ${webResearch.facts_added ?? 0} fact(s)`
+                        : running
+                          ? "Searching and extracting…"
+                          : undefined))
             }
             defaultOpen
             highlight

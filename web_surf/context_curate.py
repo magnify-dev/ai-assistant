@@ -471,6 +471,7 @@ def curate_browse_context(
     blocked_attempts: list[str] | None = None,
     publishers: list[str] | None = None,
     publisher_domains: set[str] | None = None,
+    preferred_domains: set[str] | None = None,
     seed_urls: list[str] | None = None,
     candidates: list[Any] | None = None,
     active_branch_url: str | None = None,
@@ -482,24 +483,27 @@ def curate_browse_context(
     from web_surf.form_values import _snapshot_blockers
 
     overlays = _snapshot_blockers(snapshot)
-    domain_set = set(publisher_domains or set())
-    publisher_names = [str(item).strip() for item in (publishers or []) if str(item).strip()]
     from web_surf.page_match import (
         filter_text_by_date,
         focus_query,
         page_contains_target_date,
+        page_matches_query,
         parse_target_dates,
+        parse_user_preferred_domains,
         url_on_publisher_domain,
     )
 
     focused_goal = focus_query(query)
+    domain_set = set(publisher_domains or set())
+    publisher_names = [str(item).strip() for item in (publishers or []) if str(item).strip()]
+    preferred_set = set(preferred_domains or set()) or parse_user_preferred_domains(focused_goal)
     visible_text = str(snapshot.get("visible_text") or "")
     target_dates = parse_target_dates(focused_goal)
-    curated_page_text = curate_text(visible_text, query=focused_goal)
+    curated_page_text = curate_text(visible_text, query=focused_goal, max_chars=4500)
     if target_dates and page_contains_target_date(visible_text, focused_goal):
-        filtered = filter_text_by_date(visible_text, focused_goal, max_chars=4000)
+        filtered = filter_text_by_date(visible_text, focused_goal, max_chars=8000)
         if len(filtered) >= 120:
-            curated_page_text = curate_text(filtered, query=focused_goal, max_chars=2200)
+            curated_page_text = curate_text(filtered, query=focused_goal, max_chars=4500)
     payload: dict[str, Any] = {
         "goal": focused_goal.strip(),
         "step": step_id,
@@ -507,6 +511,7 @@ def curate_browse_context(
             "url": str(snapshot.get("url") or ""),
             "title": str(snapshot.get("title") or "")[:140],
             "text": curated_page_text,
+            "text_chars": len(visible_text.strip()),
         },
         "overlays": compact_blockers(overlays),
         "controls": curate_controls(
@@ -525,6 +530,15 @@ def curate_browse_context(
     ]
     if publisher_names:
         payload["publishers"] = publisher_names[:8]
+    if preferred_set:
+        payload["preferred_sources"] = sorted(preferred_set)
+        payload["user_directive"] = (
+            "The user explicitly requested these sources: "
+            + ", ".join(sorted(preferred_set))
+            + ". Follow the user's site preference over official/publisher defaults. "
+            "Stay on these sites and extract/report there — do not swap to official sources "
+            "unless the requested site has no answer."
+        )
     if publisher_routes:
         payload["publisher_routes"] = compact_routes(publisher_routes)
     if target_dates:
@@ -536,6 +550,12 @@ def curate_browse_context(
                 "The current page already contains text for the target date. "
                 "Use action=filter or action=extract once to collect that section, "
                 "then action=report. Do not navigate away to other patch-note pages."
+            )
+        elif page_matches_query(visible_text, focused_goal):
+            payload["content_on_page"] = (
+                "The visible page text already looks relevant to the goal. "
+                "Use action=extract or action=filter once to capture it, then action=report. "
+                "Read page.text before clicking away."
             )
     current_url = str(snapshot.get("url") or "").strip().rstrip("/")
     prior_collects = [
@@ -657,7 +677,7 @@ def curate_browse_context(
     }
     payload["menu"] = menu
     payload["explore_note"] = (
-        "Pick ONE action from menu[]. Read stuck, branch_note, failed, avoid, guidance, "
+        "Pick ONE action from menu[]. Read user_directive, stuck, branch_note, failed, avoid, guidance, "
         "evidence_collected before choosing. "
         "Clear overlays before extract/report. Swap branch only when stalled."
     )

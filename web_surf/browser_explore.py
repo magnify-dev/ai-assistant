@@ -4,6 +4,7 @@ import json
 import logging
 import re
 import sys
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Callable
@@ -13,7 +14,11 @@ from web_surf import events
 from web_surf.agent_memory import commit_agent_memory
 from web_surf.context_curate import curate_browse_context, normalize_decision
 from web_surf.fetch import PageResult
-from web_surf.explore_branches import unexplored_seed_urls
+from web_surf.explore_branches import (
+    match_seed_url,
+    resolve_active_branch_url,
+    unexplored_seed_urls,
+)
 from web_surf.page_match import (
     focus_query,
     goal_is_satisfied,
@@ -24,7 +29,9 @@ from web_surf.page_match import (
     page_matches_query,
     page_text_for_goal,
     parse_target_dates,
+    parse_user_preferred_domains,
     seed_url_priority,
+    url_on_preferred_source,
     url_on_publisher_domain,
 )
 from web_surf.form_values import (
@@ -157,6 +164,7 @@ def ollama_decision_provider(
                     blocked_attempts=list(context.get("blocked_attempts") or []),
                     publishers=list(context.get("publishers") or publishers or []),
                     publisher_domains=set(context.get("publisher_domains") or publisher_domains or set()),
+                    preferred_domains=set(context.get("preferred_domains") or []),
                     seed_urls=list(context.get("seed_urls") or []),
                     candidates=list(context.get("candidates") or []),
                     active_branch_url=str(context.get("active_branch_url") or ""),
@@ -220,6 +228,8 @@ def validate_action(
     discovered_routes: set[str],
     allowed_origins: set[str] | None = None,
     form_values: dict[str, str] | None = None,
+    *,
+    seed_urls: list[str] | None = None,
 ) -> tuple[dict[str, Any] | None, str]:
     if not isinstance(decision, dict):
         return None, "decision must be an object"
@@ -234,6 +244,7 @@ def validate_action(
         "action": action,
         "reason": str(decision.get("reason") or "")[:500],
     }
+    raw_action_name = str(decision.get("action") or "").lower().strip()
     elements = {
         str(item.get("id")): item
         for item in snapshot.get("interactables") or []
@@ -252,6 +263,7 @@ def validate_action(
                 discovered_routes,
                 allowed_origins,
                 form_values,
+                seed_urls=seed_urls,
             )
     element_actions = {"click", "fill", "select", "press"}
     if action in element_actions:
@@ -260,6 +272,11 @@ def validate_action(
             return None, f"{action} target_id is not in the current snapshot"
         if elements[target_id].get("disabled"):
             return None, f"{action} target is disabled"
+        if elements[target_id].get("inferred_from_overlay"):
+            return None, (
+                f"{action} target is inferred from overlay text and has no reliable DOM locator — "
+                "try a visible control inside the overlay instead"
+            )
         target_kind = str(elements[target_id].get("kind") or "").lower()
         target_widget = str(elements[target_id].get("widget") or "").lower()
         if action == "fill" and (target_kind in {"select", "combobox"} or target_widget in {"select", "combobox"}):
@@ -272,6 +289,16 @@ def validate_action(
         validated["target"] = elements[target_id]
     if action == "navigate":
         url = _safe_normalize(str(decision.get("url") or ""))
+        if raw_action_name == "swap_branch" and seed_urls:
+            seed_match = match_seed_url(url, seed_urls)
+            if seed_match:
+                url = seed_match
+            elif url:
+                for seed in seed_urls:
+                    seed_norm = _safe_normalize(seed)
+                    if seed_norm and (url in seed_norm or seed_norm in url):
+                        url = seed_norm
+                        break
         link_id = _matching_link_id(url, elements, str(snapshot.get("url") or ""))
         if link_id:
             return validate_action(
@@ -280,6 +307,7 @@ def validate_action(
                 discovered_routes,
                 allowed_origins,
                 form_values,
+                seed_urls=seed_urls,
             )
         allowed = {_safe_normalize(route) for route in discovered_routes}
         # Links visible on the current page are discovered by definition.
@@ -304,6 +332,8 @@ def validate_action(
         if allowed_origins and origin_url(url) not in allowed_origins:
             return None, "navigate URL leaves the allowed candidate origins"
         validated["url"] = url
+        if raw_action_name == "swap_branch":
+            validated["swap_branch"] = True
     if action in {"fill", "select"}:
         value_key = str(decision.get("value_key") or "").strip()
         target = validated.get("target") if isinstance(validated.get("target"), dict) else {}
@@ -382,7 +412,7 @@ def _redact_form_values(snapshot: dict[str, Any], form_values: dict[str, str] | 
     if not values:
         return snapshot
     redacted = dict(snapshot)
-    for field in ("visible_text",):
+    for field in ("visible_text", "semantic_snapshot"):
         value = str(redacted.get(field) or "")
         for secret in values:
             value = value.replace(secret, "[user-provided]")
@@ -443,7 +473,31 @@ def _compact_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
     return dict(snapshot)
 
 
+def _frame_root(page: Any, item: dict[str, Any]) -> Any:
+    """Resolve Playwright frame for iframe-hosted controls."""
+    frame_index = item.get("frame_index")
+    if frame_index is not None:
+        try:
+            frames = list(page.frames)
+            idx = int(frame_index) + 1
+            if 0 <= idx < len(frames):
+                return frames[idx]
+        except (TypeError, ValueError, IndexError):
+            pass
+    frame_url = str(item.get("frame_url") or "").strip()
+    if frame_url:
+        for frame in page.frames:
+            if str(frame.url or "") == frame_url:
+                return frame
+    return page
+
+
+def _target_label(item: dict[str, Any]) -> str:
+    return str(item.get("text") or item.get("aria") or item.get("label") or item.get("name") or "").strip()
+
+
 def _locator_for(page: Any, item: dict[str, Any]) -> Any:
+    root = _frame_root(page, item)
     test_id = str(item.get("test_id") or "")
     kind = str(item.get("kind") or "").lower()
     widget = str(item.get("widget") or "").lower()
@@ -453,43 +507,48 @@ def _locator_for(page: Any, item: dict[str, Any]) -> Any:
     label = str(item.get("label") or "").strip()
     text = str(item.get("text") or aria or label or "")
     href = str(item.get("href") or "")
+    css_path = str(item.get("css_path") or "").strip()
     if test_id:
-        return page.get_by_test_id(test_id).first
+        return root.get_by_test_id(test_id).first
     if kind == "select" and name:
         if item.get("in_dialog"):
-            return page.locator(
+            return root.locator(
                 f"[role='dialog'] select[name={json.dumps(name)}], "
                 f"[aria-modal='true'] select[name={json.dumps(name)}], "
                 f"select[name={json.dumps(name)}]"
             ).first
-        return page.locator(f"select[name={json.dumps(name)}]").first
+        return root.locator(f"select[name={json.dumps(name)}]").first
     if widget in {"combobox"} or role == "combobox":
         if aria:
-            return page.get_by_role("combobox", name=aria, exact=False).first
+            return root.get_by_role("combobox", name=aria, exact=False).first
         if label:
-            return page.get_by_role("combobox", name=label, exact=False).first
+            return root.get_by_role("combobox", name=label, exact=False).first
         if name:
-            return page.locator(f"[role='combobox'][name={json.dumps(name)}]").first
+            return root.locator(f"[role='combobox'][name={json.dumps(name)}]").first
     if aria and kind in {"select", "input", "textarea", "textbox", "combobox", "spinbutton"}:
-        return page.get_by_label(aria, exact=False).first
+        return root.get_by_label(aria, exact=False).first
     if label and kind in {"input", "textarea", "textbox", "spinbutton"}:
-        return page.get_by_label(label, exact=False).first
+        return root.get_by_label(label, exact=False).first
     if name and kind in {"select", "input", "textarea", "textbox", "spinbutton"}:
         tag = "input" if kind in {"textbox", "spinbutton"} else kind
-        return page.locator(f"{tag}[name={json.dumps(name)}]").first
+        return root.locator(f"{tag}[name={json.dumps(name)}]").first
     if href and (not text or len(text) > 100):
-        return page.locator(f"a[href={json.dumps(href)}]").first
+        return root.locator(f"a[href={json.dumps(href)}]").first
     if role in {"link", "button", "menuitem", "textbox", "checkbox", "radio", "combobox", "spinbutton", "searchbox"} and text:
         if len(text) > 80:
-            return page.get_by_role(role, name=text[:80], exact=False).first
-        return page.get_by_role(role, name=text, exact=True).first
+            return root.get_by_role(role, name=text[:80], exact=False).first
+        return root.get_by_role(role, name=text, exact=True).first
     if href:
-        return page.locator(f"a[href={json.dumps(href)}]").first
+        return root.locator(f"a[href={json.dumps(href)}]").first
     if text and len(text) <= 80:
-        return page.get_by_text(text, exact=True).first
+        return root.get_by_text(text, exact=True).first
     placeholder = str(item.get("placeholder") or "")
     if placeholder:
-        return page.get_by_placeholder(placeholder, exact=True).first
+        return root.get_by_placeholder(placeholder, exact=True).first
+    if css_path:
+        loc = root.locator(css_path)
+        if loc.count() >= 1:
+            return loc.first
     raise ValueError("target has no usable semantic locator")
 
 
@@ -567,11 +626,13 @@ def _discover_official_outbound(
     publisher_domains: set[str],
     allowed_origins: set[str],
     discovered_routes: set[str],
+    *,
+    preferred_domains: set[str] | None = None,
 ) -> list[str]:
     """Promote outbound links to publisher domains identified for this research task."""
     from web_surf.page_match import url_on_publisher_domain
 
-    if not publisher_domains:
+    if not publisher_domains or preferred_domains:
         return []
 
     promoted: list[str] = []
@@ -640,10 +701,54 @@ def _sync_branch_navigation(
     return expanded
 
 
+def _wait_for_page_change(
+    page: Any,
+    *,
+    before_url: str,
+    before_title: str,
+    timeout_ms: int = 1800,
+) -> bool:
+    deadline = time.monotonic() + timeout_ms / 1000
+    while time.monotonic() < deadline:
+        try:
+            if str(page.url or "") != before_url:
+                return True
+            current_title = str(page.title() or "")
+            if current_title and current_title != before_title:
+                return True
+        except Exception:
+            pass
+        page.wait_for_timeout(150)
+    return False
+
+
+def _settle_after_action(page: Any, action: dict[str, Any], *, before_url: str, before_title: str) -> None:
+    from ui_test.expandable import is_collapse_toggle
+
+    kind = str(action.get("action") or "")
+    target = action.get("target") if isinstance(action.get("target"), dict) else {}
+    if kind in {"navigate", "click", "back", "press"}:
+        if _wait_for_page_change(page, before_url=before_url, before_title=before_title, timeout_ms=1800):
+            try:
+                page.wait_for_load_state("domcontentloaded", timeout=3000)
+            except Exception:
+                pass
+            page.wait_for_timeout(200)
+            return
+    if kind == "click" and is_collapse_toggle(target):
+        return
+    page.wait_for_timeout(350)
+
+
 def _execute(page: Any, action: dict[str, Any]) -> None:
     from ui_test.expandable import is_collapse_toggle, wait_for_section_expand
 
     kind = action["action"]
+    before_url = str(page.url or "")
+    try:
+        before_title = str(page.title() or "")
+    except Exception:
+        before_title = ""
     # Short element timeouts: a click blocked by an overlay should fail fast so the
     # next snapshot (which lists the overlay) reaches the model quickly.
     if kind == "navigate":
@@ -655,7 +760,7 @@ def _execute(page: Any, action: dict[str, Any]) -> None:
             loc.scroll_into_view_if_needed(timeout=3000)
         except Exception:
             pass
-        loc.click(timeout=8000)
+        loc.click(timeout=5000)
         if is_collapse_toggle(target):
             wait_for_section_expand(page, target, timeout_ms=5000)
     elif kind == "fill":
@@ -663,7 +768,7 @@ def _execute(page: Any, action: dict[str, Any]) -> None:
     elif kind == "select":
         _select_stable(page, action["target"], action["value"])
     elif kind == "press":
-        _locator_for(page, action["target"]).press(action["value"], timeout=8000)
+        _locator_for(page, action["target"]).press(action["value"], timeout=5000)
     elif kind == "scroll":
         page.mouse.wheel(0, action["amount"])
     elif kind == "back":
@@ -671,8 +776,7 @@ def _execute(page: Any, action: dict[str, Any]) -> None:
     elif kind == "wait":
         page.wait_for_timeout(action["duration_ms"])
     if kind in {"navigate", "click", "fill", "select", "press", "scroll", "back"}:
-        if kind != "click" or not is_collapse_toggle(action.get("target") or {}):
-            page.wait_for_timeout(750)
+        _settle_after_action(page, action, before_url=before_url, before_title=before_title)
 
 
 def stdin_help_provider(request: dict[str, Any]) -> dict[str, Any]:
@@ -725,7 +829,7 @@ def _page_result(
     goal: str = "",
     apply_date_filter: bool = False,
 ) -> PageResult:
-    raw_text = str(snapshot.get("visible_text") or "").strip()
+    raw_text = str(snapshot.get("visible_text") or snapshot.get("semantic_snapshot") or "").strip()
     if apply_date_filter and goal:
         text = page_text_for_goal(raw_text, goal, max_chars=12000)
     else:
@@ -762,6 +866,7 @@ def _goal_satisfied_for_page(
     source_url: str,
     publisher_domains: set[str],
     discovered_routes: set[str],
+    preferred_domains: set[str] | None = None,
 ) -> bool:
     return goal_is_satisfied(
         text,
@@ -769,6 +874,7 @@ def _goal_satisfied_for_page(
         source_url=source_url,
         publisher_domains=publisher_domains,
         publisher_routes=_publisher_routes(discovered_routes, publisher_domains),
+        preferred_domains=preferred_domains,
     )
 
 
@@ -779,8 +885,10 @@ def _should_collect_on_page(
     publisher_domains: set[str] | None = None,
     discovered_routes: set[str] | None = None,
 ) -> bool:
-    visible = str(snapshot.get("visible_text") or "")
-    if not page_contains_target_date(visible, goal):
+    visible = str(snapshot.get("visible_text") or "").strip()
+    if len(visible) < 120:
+        return False
+    if not page_matches_query(visible, goal):
         return False
     scoped = page_text_for_goal(visible, goal, max_chars=12000)
     return _goal_satisfied_for_page(
@@ -789,6 +897,40 @@ def _should_collect_on_page(
         source_url=str(snapshot.get("url") or ""),
         publisher_domains=set(publisher_domains or set()),
         discovered_routes=set(discovered_routes or set()),
+        preferred_domains=set(preferred_domains or set()) or parse_user_preferred_domains(goal),
+    )
+
+
+def _try_auto_collect_on_snapshot(
+    *,
+    page: Any,
+    snapshot: dict[str, Any],
+    step_id: str,
+    goal: str,
+    collected_content_keys: set[str],
+    publisher_domains: set[str] | None = None,
+    discovered_routes: set[str] | None = None,
+) -> tuple[PageResult | None, dict[str, Any]]:
+    """Capture answer text when the visible page already satisfies the goal."""
+    apply_date_filter = bool(parse_target_dates(goal))
+    collect_key = _content_collect_key(snapshot, goal, apply_date_filter=apply_date_filter)
+    if collect_key in collected_content_keys:
+        return None, {}
+    if not _should_collect_on_page(
+        snapshot,
+        goal,
+        publisher_domains=publisher_domains,
+        discovered_routes=discovered_routes,
+    ):
+        return None, {}
+    return _auto_collect_from_page(
+        page=page,
+        snapshot=snapshot,
+        step_id=step_id,
+        goal=goal,
+        reason="Auto-collected visible page text that matches the research goal",
+        publisher_domains=publisher_domains,
+        discovered_routes=discovered_routes,
     )
 
 
@@ -867,6 +1009,7 @@ def explore_candidates_in_browser(
     )
     publisher_domain_set = set(publisher_domains or set())
     publisher_names = list(publishers or [])
+    preferred_domain_set = parse_user_preferred_domains(goal)
     session_form_values: dict[str, str] = {
         str(key): str(value)
         for key, value in (form_values or {}).items()
@@ -880,7 +1023,10 @@ def explore_candidates_in_browser(
         url = _safe_normalize(str(getattr(row, "url", "")))
         if url and url not in seed_urls:
             seed_urls.append(url)
-    seed_urls.sort(key=lambda url: seed_url_priority(url, goal), reverse=True)
+    seed_urls.sort(
+        key=lambda url: seed_url_priority(url, goal, preferred_domains=preferred_domain_set),
+        reverse=True,
+    )
     origins = list(dict.fromkeys(origin_url(url) for url in seed_urls))
     allowed_origins = set(origins)
     # Search results are trusted starting points: land on them directly and let
@@ -1064,6 +1210,11 @@ def explore_candidates_in_browser(
                         snapshot=snapshot,
                     )
                     snapshots.append(_compact_snapshot(snapshot))
+                    active_branch_url = resolve_active_branch_url(
+                        page_url=str(page.url or ""),
+                        seed_urls=seed_urls,
+                        active_branch_url=active_branch_url,
+                    )
                     if _sync_branch_navigation(
                         page_url=str(page.url or ""),
                         snapshot=snapshot,
@@ -1079,6 +1230,7 @@ def explore_candidates_in_browser(
                         publisher_domain_set,
                         allowed_origins,
                         discovered_routes,
+                        preferred_domains=preferred_domain_set,
                     )
                     if promoted:
                         events.log(
@@ -1098,6 +1250,63 @@ def explore_candidates_in_browser(
                         if _safe_normalize(str(route))
                         and origin_url(str(route)) in allowed_origins
                     )
+                    auto_collected, auto_collect_item = _try_auto_collect_on_snapshot(
+                        page=page,
+                        snapshot=snapshot,
+                        step_id=step_id,
+                        goal=goal,
+                        collected_content_keys=collected_content_keys,
+                        publisher_domains=publisher_domain_set,
+                        discovered_routes=discovered_routes,
+                    )
+                    if auto_collected:
+                        collect_key = _content_collect_key(
+                            snapshot,
+                            goal,
+                            apply_date_filter=bool(parse_target_dates(goal)),
+                        )
+                        collected_content_keys.add(collect_key)
+                        pages.append(auto_collected)
+                        found_content = auto_collected.text
+                        events.evidence(
+                            {
+                                "session_id": session_id,
+                                "step_id": step_id,
+                                "snapshot_id": snapshot["snapshot_id"],
+                                "source_url": auto_collected.url,
+                                "title": auto_collected.title,
+                                "text": auto_collected.text,
+                                "note": auto_collect_item.get("reason", ""),
+                                "auto_collected": True,
+                            }
+                        )
+                        _finalize_step(
+                            {
+                                **auto_collect_item,
+                                "snapshot_id": snapshot["snapshot_id"],
+                            },
+                            page_url=str(page.url or ""),
+                            snapshot=snapshot,
+                        )
+                        helper_guidance.append(
+                            {
+                                "step_id": step_id,
+                                "kind": "auto_collected",
+                                "instruction": (
+                                    "Visible page text matches the goal and was captured automatically. "
+                                    "Use action=report now unless key details are still hidden."
+                                ),
+                            }
+                        )
+                        if _goal_satisfied_for_page(
+                            auto_collected.text,
+                            goal,
+                            source_url=auto_collected.url,
+                            publisher_domains=publisher_domain_set,
+                            discovered_routes=discovered_routes,
+                            preferred_domains=preferred_domain_set,
+                        ):
+                            goal_met = True
                     plan_result = ensure_form_values(
                         query=goal,
                         snapshot=snapshot,
@@ -1138,6 +1347,7 @@ def explore_candidates_in_browser(
                         "last_transition": transitions[-1] if transitions else None,
                         "publishers": publisher_names,
                         "publisher_domains": publisher_domain_set,
+                        "preferred_domains": preferred_domain_set,
                         "active_branch_url": active_branch_url,
                         "branch_steps": sum(
                             1
@@ -1171,6 +1381,7 @@ def explore_candidates_in_browser(
                             "current_url": str(page.url or ""),
                             "step": len(history) + 1,
                             "max_steps": max_steps,
+                            "reason": "Waiting for local AI to choose the next action…",
                         }
                     )
                     if blocked_attempts:
@@ -1206,6 +1417,7 @@ def explore_candidates_in_browser(
                         discovered_routes,
                         allowed_origins,
                         session_form_values,
+                        seed_urls=seed_urls,
                     )
                     raw_action = (
                         str(raw_decision.get("action") or "").lower().strip()
@@ -1274,6 +1486,7 @@ def explore_candidates_in_browser(
                                     discovered_routes,
                                     allowed_origins,
                                     session_form_values,
+                                    seed_urls=seed_urls,
                                 )
                         if action is None:
                             item = {
@@ -1529,25 +1742,148 @@ def explore_candidates_in_browser(
                                     "click a goal-relevant link or extract more evidence first"
                                 )
                             else:
+                                on_preferred = bool(
+                                    preferred_domain_set
+                                    and url_on_preferred_source(
+                                        str(snapshot.get("url") or ""),
+                                        preferred_domain_set,
+                                    )
+                                )
                                 pending_seeds = unexplored_seed_urls(
                                     seed_urls,
                                     history,
                                     active_branch_url=active_branch_url,
+                                    current_page_url=str(snapshot.get("url") or ""),
                                 )
+                                if on_preferred and page_matches_query(
+                                    str(snapshot.get("visible_text") or ""),
+                                    goal,
+                                ):
+                                    pending_seeds = []
+                                elif preferred_domain_set:
+                                    pending_seeds = [
+                                        seed
+                                        for seed in pending_seeds
+                                        if url_on_preferred_source(seed, preferred_domain_set)
+                                    ]
                                 if pending_seeds:
-                                    reject_report = True
-                                    reject_error = (
-                                        "report rejected: other search candidates were not tried yet — "
-                                        f"use swap_branch to explore {pending_seeds[0][:120]}"
+                                    auto_swap_url = pending_seeds[0]
+                                    events.log(
+                                        f"Report blocked — auto swap_branch to {auto_swap_url[:120]}",
+                                        level="info",
                                     )
+                                    try:
+                                        page.goto(
+                                            auto_swap_url,
+                                            wait_until="domcontentloaded",
+                                            timeout=45000,
+                                        )
+                                        page.wait_for_timeout(500)
+                                        active_branch_url = auto_swap_url
+                                        state_attempts = {}
+                                        auto_item = {
+                                            **item,
+                                            "action": "swap_branch",
+                                            "url": auto_swap_url,
+                                            "branch_url": auto_swap_url,
+                                            "ok": True,
+                                            "reason": (
+                                                "Opened unexplored search candidate instead of reporting "
+                                                "from current branch"
+                                            ),
+                                            "auto_swap": True,
+                                        }
+                                        _finalize_step(
+                                            auto_item,
+                                            decision=raw_decision
+                                            if isinstance(raw_decision, dict)
+                                            else None,
+                                            page_url=auto_swap_url,
+                                        )
+                                        helper_guidance.append(
+                                            {
+                                                "step_id": step_id,
+                                                "kind": "auto_swap_branch",
+                                                "instruction": (
+                                                    f"Exploring search candidate: {auto_swap_url[:120]}. "
+                                                    "Use extract/report here if the goal is satisfied."
+                                                ),
+                                            }
+                                        )
+                                        swap_snapshot = _snapshot(
+                                            page,
+                                            session_id=session_id,
+                                            step_id=f"{step_id}_swap",
+                                            context="post_swap",
+                                            form_values=session_form_values,
+                                        )
+                                        snapshots.append(_compact_snapshot(swap_snapshot))
+                                        auto_collected, auto_collect_item = _try_auto_collect_on_snapshot(
+                                            page=page,
+                                            snapshot=swap_snapshot,
+                                            step_id=f"{step_id}_swap",
+                                            goal=goal,
+                                            collected_content_keys=collected_content_keys,
+                                            publisher_domains=publisher_domain_set,
+                                            discovered_routes=discovered_routes,
+                                        )
+                                        if auto_collected:
+                                            collect_key = _content_collect_key(
+                                                swap_snapshot,
+                                                goal,
+                                                apply_date_filter=bool(parse_target_dates(goal)),
+                                            )
+                                            collected_content_keys.add(collect_key)
+                                            pages.append(auto_collected)
+                                            found_content = auto_collected.text
+                                            events.evidence(
+                                                {
+                                                    "session_id": session_id,
+                                                    "step_id": f"{step_id}_swap",
+                                                    "snapshot_id": swap_snapshot["snapshot_id"],
+                                                    "source_url": auto_collected.url,
+                                                    "title": auto_collected.title,
+                                                    "text": auto_collected.text,
+                                                    "note": auto_collect_item.get("reason", ""),
+                                                    "auto_collected": True,
+                                                }
+                                            )
+                                            _finalize_step(
+                                                {
+                                                    **auto_collect_item,
+                                                    "snapshot_id": swap_snapshot["snapshot_id"],
+                                                },
+                                                page_url=str(page.url or ""),
+                                                snapshot=swap_snapshot,
+                                            )
+                                            helper_guidance.append(
+                                                {
+                                                    "step_id": f"{step_id}_swap",
+                                                    "kind": "auto_collected",
+                                                    "instruction": (
+                                                        "New branch page text matches the goal and was captured. "
+                                                        "Use action=report."
+                                                    ),
+                                                }
+                                            )
+                                        continue
+                                    except Exception as exc:
+                                        reject_report = True
+                                        reject_error = (
+                                            "report rejected: other search candidates were not tried yet — "
+                                            f"use swap_branch to explore {auto_swap_url[:120]} "
+                                            f"(auto-swap failed: {exc})"
+                                        )
                             if not reject_report and page_has_goal_links(snapshot, goal):
                                 reject_report = True
                                 reject_error = (
                                     "report rejected: goal-relevant links are still available — "
                                     "click one of them before reporting"
                                 )
-                            elif not reject_report and (
-                                publisher_domain_set
+                            elif (
+                                not reject_report
+                                and not preferred_domain_set
+                                and publisher_domain_set
                                 and is_secondary_host(str(snapshot.get("url") or ""))
                                 and any(is_publisher_content_url(str(route)) for route in discovered_routes)
                             ):
@@ -1556,8 +1892,10 @@ def explore_candidates_in_browser(
                                     "report rejected: official publisher article pages are still available — "
                                     "swap_branch or follow a news/article link before reporting from forums"
                                 )
-                            elif not reject_report and (
-                                publisher_domain_set
+                            elif (
+                                not reject_report
+                                and not preferred_domain_set
+                                and publisher_domain_set
                                 and not url_on_publisher_domain(
                                     str(snapshot.get("url") or ""),
                                     publisher_domain_set,
@@ -1578,6 +1916,7 @@ def explore_candidates_in_browser(
                                     source_url=page_result.url,
                                     publisher_domains=publisher_domain_set,
                                     discovered_routes=discovered_routes,
+                                    preferred_domains=preferred_domain_set,
                                 )
                             ):
                                 reject_report = True
@@ -1640,6 +1979,7 @@ def explore_candidates_in_browser(
                                     source_url=page_result.url,
                                     publisher_domains=publisher_domain_set,
                                     discovered_routes=discovered_routes,
+                                    preferred_domains=preferred_domain_set,
                                 ):
                                     instruction = (
                                         "Collected text answers the goal. Use action=report now — "
@@ -1672,12 +2012,24 @@ def explore_candidates_in_browser(
                         continue
 
                     before = str(page.url or "")
+                    target_info = action.get("target") if isinstance(action.get("target"), dict) else {}
+                    target_label = _target_label(target_info)
+                    acting_reason = f"{action['action']}"
+                    if target_label:
+                        acting_reason = f"{action['action']} → {target_label[:80]}"
+                    elif action.get("target_id"):
+                        acting_reason = f"{action['action']} → #{action['target_id']}"
+                    elif action.get("url"):
+                        acting_reason = f"{action['action']} → {action['url']}"
                     events.controller(
                         {
                             "session_id": session_id,
                             "status": "acting",
                             "current_url": before,
                             "action": action["action"],
+                            "target_id": action.get("target_id"),
+                            "target_label": target_label[:80] if target_label else "",
+                            "reason": acting_reason,
                             "step": len(history) + 1,
                             "max_steps": max_steps,
                         }
@@ -1697,6 +2049,16 @@ def explore_candidates_in_browser(
                         item = {**item, "ok": True, "url": after}
                     except Exception as exc:
                         item = {**item, "ok": False, "error": str(exc)}
+                    events.controller(
+                        {
+                            "session_id": session_id,
+                            "status": "observing",
+                            "current_url": str(page.url or ""),
+                            "reason": "Checking whether the action changed the page…",
+                            "step": len(history) + 1,
+                            "max_steps": max_steps,
+                        }
+                    )
                     post_snapshot = _snapshot(
                         page,
                         session_id=session_id,
@@ -1717,16 +2079,18 @@ def explore_candidates_in_browser(
                         allowed_origins=allowed_origins,
                         discovered_routes=discovered_routes,
                     )
-                    if raw_action == "swap_branch":
+                    if raw_action == "swap_branch" or action.get("swap_branch"):
                         item["action"] = "swap_branch"
-                        swap_target = _safe_normalize(
-                            str(raw_decision.get("url") or "")
-                            if isinstance(raw_decision, dict)
-                            else ""
+                        swap_target = match_seed_url(
+                            str(action.get("url") or raw_decision.get("url") or ""),
+                            seed_urls,
+                        ) or _safe_normalize(
+                            str(action.get("url") or raw_decision.get("url") or "")
                         )
-                        seed_norms = {_safe_normalize(url) for url in seed_urls}
-                        if swap_target in seed_norms:
+                        if swap_target:
                             active_branch_url = swap_target
+                            item["branch_url"] = swap_target
+                            item["url"] = str(page.url or "")
                             state_attempts = {}
 
                     delta = diff_page_states(snapshot, post_snapshot)
@@ -1899,6 +2263,7 @@ def explore_candidates_in_browser(
                                 source_url=collected.url,
                                 publisher_domains=publisher_domain_set,
                                 discovered_routes=discovered_routes,
+                                preferred_domains=preferred_domain_set,
                             ):
                                 goal_met = True
                                 events.criteria(
@@ -1975,6 +2340,7 @@ def explore_candidates_in_browser(
                                 source_url=stuck_collected.url,
                                 publisher_domains=publisher_domain_set,
                                 discovered_routes=discovered_routes,
+                                preferred_domains=preferred_domain_set,
                             ):
                                 pages.append(stuck_collected)
                                 found_content = stuck_collected.text

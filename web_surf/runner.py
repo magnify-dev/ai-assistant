@@ -12,7 +12,13 @@ from web_surf.config import default_config
 from web_surf.llm import get_trace, ollama_chat, reset_trace
 from web_surf.extract import extract_facts_from_page
 from web_surf.fetch import PageResult, fetch_page_tier1
-from web_surf.page_match import focus_query, score_result_url, score_search_result
+from web_surf.page_match import (
+    focus_query,
+    parse_user_preferred_domains,
+    score_result_url,
+    score_search_result,
+    url_on_preferred_source,
+)
 from web_surf.spec import classify_search_sources
 from web_surf.search import SearchResult, web_search
 from web_surf.spec import fallback_research_spec, structure_research_spec
@@ -110,6 +116,15 @@ def _candidate_tiers(
         publisher_domains = official_registrable_domains(official_urls)
     official = _unique_urls(official, limit=limit)
     secondary = _unique_urls(secondary, limit=limit)
+    preferred = parse_user_preferred_domains(query)
+    if preferred:
+        def _is_preferred(row: Any) -> bool:
+            return url_on_preferred_source(str(getattr(row, "url", "") or ""), preferred)
+
+        preferred_rows = [row for row in ranked if _is_preferred(row)]
+        official = [row for row in official if not _is_preferred(row)]
+        secondary = [row for row in secondary if not _is_preferred(row)]
+        official = _unique_urls(preferred_rows + official, limit=limit)
     return official, secondary, publisher_domains
 
 

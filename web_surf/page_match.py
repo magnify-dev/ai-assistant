@@ -74,6 +74,24 @@ _LOW_VALUE_HOSTS = (
 
 _TASK_WRAPPER_MARKER = re.compile(r"original user task:\s*", re.I)
 
+# Sites users commonly name directly instead of by full domain.
+_SITE_ALIASES: dict[str, str] = {
+    "wowhead": "wowhead.com",
+    "icy-veins": "icy-veins.com",
+    "icy veins": "icy-veins.com",
+    "icyveins": "icy-veins.com",
+    "maxroll": "maxroll.gg",
+    "reddit": "reddit.com",
+    "wowpedia": "wowpedia.fandom.com",
+    "fandom": "fandom.com",
+}
+
+_USER_SOURCE_RE = re.compile(
+    r"\b(?:go\s+to|visit|use|open|check|start\s+(?:at|on)|from|on|at)\s+"
+    r"([a-z][a-z0-9\-]{1,40})(?:\s+(?:and|to|for)|[.,]|$)",
+    re.I,
+)
+
 
 def focus_query(query: str) -> str:
     """Strip this tool's collaboration wrapper so scoring sees only the user's task."""
@@ -81,6 +99,62 @@ def focus_query(query: str) -> str:
     if not match:
         return (query or "").strip()
     return query[match.end() :].strip() or query.strip()
+
+
+def parse_user_preferred_domains(query: str) -> set[str]:
+    """Domains the user explicitly asked to use — override official-source defaults."""
+    text = focus_query(query)
+    preferred: set[str] = set()
+    for match in re.finditer(r"https?://([^\s/?#]+)", text, re.I):
+        domain = registrable_domain(match.group(1).lower())
+        if domain:
+            preferred.add(domain)
+    for match in re.finditer(
+        r"\b([a-z0-9][a-z0-9\-]{0,40}\.(?:com|org|net|io|gg|co|tv))\b",
+        text,
+        re.I,
+    ):
+        domain = registrable_domain(match.group(1).lower())
+        if domain:
+            preferred.add(domain)
+    for match in _USER_SOURCE_RE.finditer(text):
+        token = match.group(1).lower().strip("-")
+        if not token or token in _QUERY_STOPWORDS:
+            continue
+        if token in _SITE_ALIASES:
+            preferred.add(_SITE_ALIASES[token])
+            continue
+        if "." in token:
+            domain = registrable_domain(token)
+            if domain:
+                preferred.add(domain)
+            continue
+        if len(token) >= 4:
+            preferred.add(registrable_domain(f"{token}.com"))
+    return {domain for domain in preferred if domain and "." in domain}
+
+
+def url_on_preferred_source(url: str, preferred_domains: set[str]) -> bool:
+    """True when url belongs to a user-requested source site."""
+    if not preferred_domains:
+        return False
+    host = registrable_domain(urlsplit(str(url or "").lower()).netloc)
+    if not host:
+        return False
+    if host in preferred_domains:
+        return True
+    return any(
+        host == registrable_domain(str(pref or ""))
+        or host.endswith(f".{pref}")
+        or pref in host
+        for pref in preferred_domains
+        if pref
+    )
+
+
+def user_directed_sources(query: str) -> bool:
+    """True when the user explicitly named where to research."""
+    return bool(parse_user_preferred_domains(query))
 
 
 def query_tokens(query: str, *, min_len: int = 3) -> list[str]:
@@ -142,13 +216,21 @@ def is_publisher_content_url(url: str) -> bool:
     )
 
 
-def seed_url_priority(url: str, query: str) -> tuple[int, int]:
+def seed_url_priority(
+    url: str,
+    query: str,
+    *,
+    preferred_domains: set[str] | None = None,
+) -> tuple[int, int]:
     """Rank candidate landing pages — higher is better."""
     parsed = urlsplit(str(url or "").lower())
     score = score_result_url(url, query)
-    if is_secondary_host(url):
+    preferred = preferred_domains or parse_user_preferred_domains(query)
+    if preferred and url_on_preferred_source(url, preferred):
+        score += 1000
+    if is_secondary_host(url) and not (preferred and url_on_preferred_source(url, preferred)):
         score -= 80
-    if is_publisher_content_url(url):
+    if is_publisher_content_url(url) and not (preferred and url_on_preferred_source(url, preferred)):
         score += 60
     if "patch" in parsed.path and "note" in parsed.path:
         score += 30
@@ -510,10 +592,14 @@ def goal_is_satisfied(
     source_url: str = "",
     publisher_domains: set[str] | None = None,
     publisher_routes: set[str] | None = None,
+    preferred_domains: set[str] | None = None,
 ) -> bool:
     """True when collected text answers the goal from an acceptable source."""
     if not page_matches_query(text, query):
         return False
+    preferred = preferred_domains or parse_user_preferred_domains(query)
+    if preferred and url_on_preferred_source(source_url, preferred):
+        return page_has_substantive_content(text, query)
     domains = publisher_domains or set()
     if not domains:
         return True
@@ -524,6 +610,8 @@ def goal_is_satisfied(
             return True
         return page_has_substantive_content(text, query)
     routes = publisher_routes or set()
+    if preferred:
+        return page_has_substantive_content(text, query)
     if any(url_on_publisher_domain(str(route), domains) for route in routes):
         return False
     return page_has_substantive_content(text, query)

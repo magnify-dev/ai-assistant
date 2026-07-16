@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from web_surf.llm import ollama_chat_json
-from web_surf.page_match import focus_query, is_secondary_host
+from web_surf.page_match import focus_query, is_secondary_host, parse_user_preferred_domains
 
 logger = logging.getLogger(__name__)
 
@@ -120,7 +120,8 @@ def classify_search_sources(
 
     user = (
         f"task: {focus_query(query)}\n"
-        f"publishers: {json.dumps(publishers, ensure_ascii=False)}\n\n"
+        f"publishers: {json.dumps(publishers, ensure_ascii=False)}\n"
+        f"preferred_sources: {json.dumps(sorted(parse_user_preferred_domains(query)), ensure_ascii=False)}\n\n"
         f"results:\n" + "\n".join(lines)
     )
     parsed = ollama_chat_json(
