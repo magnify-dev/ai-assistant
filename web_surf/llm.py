@@ -17,6 +17,7 @@ PROMPT_LABELS: dict[str, str] = {
     "web_research.plan_form_values": "Form value plan",
     "web_research.extract": "Fact extraction",
     "web_research.answer": "Answer synthesis",
+    "web_research.answer_copy": "Verbatim copy answer",
     "web_research.classify": "Task classification",
     "web_research.help": "Browser helper",
 }

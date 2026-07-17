@@ -3,16 +3,19 @@ import { apiUrl } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import type { BrowserState, PlaywrightSession, PlaywrightSessionFrame } from "@/lib/projectTypes";
 import type { WebCapture, WebCaptureBuildStatus, WebCaptureElement, WebCaptureReview } from "@/lib/webCaptureTypes";
+import { isScreenshotAheadOfMap, WEB_CAPTURE_BUILDING_PHASES } from "@/lib/webCaptureTypes";
 import {
   boxTone,
   captureBoxStyle,
+  captureCanvasHeight,
   effectiveInteractive,
   filterCaptureElements,
   type WebCaptureFilter,
 } from "@/lib/webCaptureView";
 import { parseVisualCell, visualCellStyle, visualStatusLabel } from "@/lib/webCaptureVisual";
+import { MapOverlayView } from "@/components/MapOverlayView";
 
-type InspectView = "map" | "pixels" | "screenshot" | "split";
+type InspectView = "overlay" | "map" | "pixels" | "screenshot" | "split";
 
 type Props = {
   state: BrowserState | null;
@@ -24,17 +27,30 @@ type Props = {
   lastAction?: string;
   replayMode?: boolean;
   latestReview?: WebCaptureReview | null;
+  projectPath?: string;
   onReview?: (review: Omit<WebCaptureReview, "captureId" | "ts"> & { element?: WebCaptureElement }) => Promise<void>;
 };
 
-const BUILDING_PHASES = new Set(["geometry", "locators", "analyzing", "visual"]);
+const BUILDING_PHASES = WEB_CAPTURE_BUILDING_PHASES;
+
+function UpdatingMapBadge({ visible, message }: { visible: boolean; message?: string }) {
+  if (!visible) return null;
+  return (
+    <div className="pointer-events-none absolute left-2 top-2 z-30 flex items-center gap-1.5 rounded-md border border-sky-400/40 bg-black/75 px-2 py-1 text-[10px] font-medium text-sky-100 shadow-lg backdrop-blur-sm">
+      <span className="inline-flex h-2.5 w-2.5 animate-spin rounded-full border-2 border-sky-200/30 border-t-sky-100" />
+      {message ?? "Updating map…"}
+    </div>
+  );
+}
 
 function CaptureBuildBanner({
   captureBuild,
   capture,
+  liveScreenshotReady,
 }: {
   captureBuild?: WebCaptureBuildStatus | null;
   capture?: WebCapture | null;
+  liveScreenshotReady?: boolean;
 }) {
   const phase = captureBuild?.phase ?? (capture ? "complete" : "idle");
   if (phase === "idle") return null;
@@ -68,9 +84,11 @@ function CaptureBuildBanner({
           ? "Map build failed"
           : complete
             ? "Map ready — inspect below"
-            : draft
-              ? "Draft map visible — finishing analysis…"
-              : captureBuild?.message ?? "Building page map…"}
+            : building && liveScreenshotReady
+              ? captureBuild?.message ?? "Screenshot updated · updating map…"
+              : draft
+                ? "Draft map visible — finishing analysis…"
+                : captureBuild?.message ?? "Building page map…"}
       </span>
       {captureBuild?.elementCount != null ? (
         <span className="rounded-full bg-black/20 px-2 py-0.5 text-[10px] text-white/70">
@@ -131,14 +149,24 @@ function frameTitle(frame: PlaywrightSessionFrame | undefined): string {
 function ScreenshotPane({
   src,
   emptyLabel,
+  updatingMap,
+  updatingMapMessage,
 }: {
   src?: string;
   emptyLabel: string;
+  updatingMap?: boolean;
+  updatingMapMessage?: string;
 }) {
   return (
-    <div className="flex min-h-[220px] items-center justify-center overflow-hidden rounded-lg border border-white/10 bg-neutral-950/90 p-1">
+    <div className="relative flex min-h-[220px] items-center justify-center overflow-hidden rounded-lg border border-white/10 bg-neutral-950/90 p-1">
+      <UpdatingMapBadge visible={Boolean(updatingMap && src)} message={updatingMapMessage} />
       {src ? (
-        <img src={src} alt="Page screenshot" className="max-h-[min(52vh,480px)] w-auto max-w-full object-contain" />
+        <img
+          key={src.slice(0, 80)}
+          src={src}
+          alt="Page screenshot"
+          className="max-h-[min(52vh,480px)] w-auto max-w-full object-contain"
+        />
       ) : (
         <p className="text-sm text-white/40">{emptyLabel}</p>
       )}
@@ -149,9 +177,11 @@ function ScreenshotPane({
 function PixelMapPane({
   capture,
   elements,
+  screenshotSrc,
 }: {
   capture: WebCapture;
   elements: WebCaptureElement[];
+  screenshotSrc?: string;
 }) {
   const visual = capture.visual;
   const cells = visual?.display_cells?.length ? visual.display_cells : visual?.cells ?? [];
@@ -181,6 +211,15 @@ function PixelMapPane({
             gridTemplateRows: `repeat(${visual.rows}, minmax(0, 1fr))`,
           }}
         >
+          {screenshotSrc ? (
+            <img
+              src={screenshotSrc}
+              alt=""
+              aria-hidden
+              className="pointer-events-none absolute inset-0 h-full w-full object-cover object-top opacity-35"
+              draggable={false}
+            />
+          ) : null}
           {cells.map((raw, index) => {
             const cell = parseVisualCell(raw);
             return <div key={index} style={visualCellStyle(cell)} title={`${cell.kind} · ${cell.color}`} />;
@@ -214,9 +253,10 @@ export function PageInspectPanel({
   lastAction,
   replayMode,
   latestReview,
+  projectPath,
   onReview,
 }: Props) {
-  const [view, setView] = useState<InspectView>(capture ? "map" : "screenshot");
+  const [view, setView] = useState<InspectView>(capture ? "overlay" : "screenshot");
   const [filter, setFilter] = useState<WebCaptureFilter>("all");
   const [selectedId, setSelectedId] = useState<string | null>(capture?.elements[0]?.id ?? null);
   const [saving, setSaving] = useState(false);
@@ -226,20 +266,26 @@ export function PageInspectPanel({
     if (capture) {
       setSelectedId(capture.elements[0]?.id ?? null);
       setSavedMessage("");
-      setView((current) => (current === "screenshot" && !state?.screenshot_b64 ? "map" : current));
+      setView((current) =>
+        current === "screenshot" && !state?.screenshot_b64 && !capture?.screenshotUrl ? "overlay" : current,
+      );
     }
-  }, [capture?.capture_id, capture?.elements, state?.screenshot_b64]);
+  }, [capture?.capture_id, capture?.elements, capture?.screenshotUrl, state?.screenshot_b64]);
 
   const frames = session?.frames ?? [];
   const activeFrame = frames[frameIndex] ?? frames[frames.length - 1];
   const screenshotUrl = activeFrame?.screenshotUrl;
   const screenshotSrc = state?.screenshot_b64
     ? `data:image/jpeg;base64,${state.screenshot_b64}`
-    : screenshotUrl
-      ? screenshotUrl.startsWith("http") || screenshotUrl.startsWith("data:")
-        ? screenshotUrl
-        : apiUrl(screenshotUrl)
-      : undefined;
+    : capture?.screenshotUrl
+      ? capture.screenshotUrl.startsWith("http") || capture.screenshotUrl.startsWith("data:")
+        ? capture.screenshotUrl
+        : apiUrl(capture.screenshotUrl)
+      : screenshotUrl
+        ? screenshotUrl.startsWith("http") || screenshotUrl.startsWith("data:")
+          ? screenshotUrl
+          : apiUrl(screenshotUrl)
+        : undefined;
 
   const title = capture?.title || state?.title || frameTitle(activeFrame) || "Untitled page";
   const url = capture?.url || state?.url || activeFrame?.url || "";
@@ -272,16 +318,25 @@ export function PageInspectPanel({
         : null;
 
   const building = BUILDING_PHASES.has(captureBuild?.phase ?? "");
+  const liveScreenshotReady = Boolean(state?.screenshot_b64);
+  const updatingMapOnScreenshot =
+    Boolean(screenshotSrc && liveScreenshotReady) && isScreenshotAheadOfMap(state?.ts, captureBuild);
+  const updatingMapMessage = captureBuild?.message ?? "Updating map…";
   const hasDraftCapture = Boolean(capture?.elements?.length);
-  const showWorkingMap = Boolean(capture) && (view === "map" || view === "split");
-  const showMap = showWorkingMap && (hasDraftCapture || !building);
+  const showOverlay = Boolean(capture) && view === "overlay" && (hasDraftCapture || !building);
+  const showWorkingMap = Boolean(capture) && view === "map" && (hasDraftCapture || !building);
+  const showMap = showOverlay || showWorkingMap;
   const showPixels = Boolean(capture) && view === "pixels" && !building;
   const showScreenshot = view === "screenshot" || view === "split" || !capture;
   const showEmpty = !capture && !screenshotSrc && !building && !captureBuild;
 
   return (
     <div className="space-y-3">
-      <CaptureBuildBanner captureBuild={captureBuild} capture={capture} />
+      <CaptureBuildBanner
+        captureBuild={captureBuild}
+        capture={capture}
+        liveScreenshotReady={liveScreenshotReady}
+      />
 
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div className="min-w-0">
@@ -290,7 +345,10 @@ export function PageInspectPanel({
           <p className="truncate font-mono text-xs text-sky-200/80">{url || "Waiting for browser page…"}</p>
           {capture ? (
             <p className="mt-1 text-[10px] text-white/45">
-              {capture.viewport.width} × {capture.viewport.height} viewport
+              {capture.viewport.width} × {captureCanvasHeight(capture)} map
+              {capture.scroll_map && capture.scroll_map.slice_count > 1
+                ? ` · ${capture.scroll_map.slice_count} scroll views stitched`
+                : ` · ${capture.viewport.height}px viewport`}
               {capture.ai.status === "ready" ? ` · ${capture.ai.model ?? "AI"}` : ""}
               {mapStatus ? ` · ${mapStatus}` : ""}
             </p>
@@ -298,21 +356,21 @@ export function PageInspectPanel({
         </div>
         {capture || screenshotSrc || building ? (
           <div className="flex flex-wrap gap-1">
-            {(["map", "pixels", "screenshot", "split"] as InspectView[]).map((mode) => (
+            {(["overlay", "map", "pixels", "screenshot", "split"] as InspectView[]).map((mode) => (
               <button
                 key={mode}
                 type="button"
-                disabled={mode !== "screenshot" && building && !hasDraftCapture}
+                disabled={mode !== "screenshot" && mode !== "split" && building && !hasDraftCapture}
                 onClick={() => setView(mode)}
                 className={cn(
                   "rounded-md border px-2.5 py-1 text-xs capitalize",
                   view === mode
                     ? "border-sky-400/50 bg-sky-500/15 text-sky-100"
                     : "border-white/10 text-white/55 hover:bg-white/5",
-                  mode !== "screenshot" && building && !hasDraftCapture && "opacity-40",
+                  mode !== "screenshot" && mode !== "split" && building && !hasDraftCapture && "opacity-40",
                 )}
               >
-                {mode}
+                {mode === "overlay" ? "overlay" : mode}
               </button>
             ))}
           </div>
@@ -345,7 +403,7 @@ export function PageInspectPanel({
         </div>
       ) : (
         <div className={cn("grid gap-3", view === "split" ? "xl:grid-cols-2" : "grid-cols-1")}>
-          {building && !hasDraftCapture && (view === "map" || view === "split" || view === "pixels") ? (
+          {building && !hasDraftCapture && (view === "overlay" || view === "map" || view === "split" || view === "pixels") ? (
             <div className="space-y-2">
               <p className="text-[10px] text-white/45">Sampling page geometry and controls…</p>
               <MapBuildSkeleton capture={capture ?? undefined} />
@@ -388,29 +446,16 @@ export function PageInspectPanel({
               </div>
 
               <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_280px]">
-                <div className="rounded-lg border border-white/15 bg-neutral-900 p-2">
-                  <div
-                    className="relative mx-auto max-h-[520px] w-full overflow-hidden rounded bg-white shadow-inner"
-                    style={{ aspectRatio: `${capture.viewport.width} / ${capture.viewport.height}` }}
-                  >
-                    {visible.map((element) => (
-                      <button
-                        key={element.id}
-                        type="button"
-                        title={`${elementLabel(element)} · ${element.locator_status}`}
-                        onClick={() => setSelectedId(element.id)}
-                        className={cn(
-                          "absolute overflow-hidden border text-left text-[9px] leading-tight transition",
-                          boxTone(element),
-                          selected?.id === element.id && "z-20 ring-2 ring-violet-600 ring-offset-1",
-                        )}
-                        style={captureBoxStyle(element, capture)}
-                      >
-                        <span className="block truncate px-0.5">{elementLabel(element)}</span>
-                      </button>
-                    ))}
-                  </div>
-                </div>
+                <MapOverlayView
+                  capture={capture}
+                  elements={visible}
+                  screenshotSrc={screenshotSrc}
+                  selectedId={selectedId}
+                  onSelect={setSelectedId}
+                  projectPath={projectPath}
+                  updatingMap={updatingMapOnScreenshot}
+                  updatingMapMessage={updatingMapMessage}
+                />
 
                 <aside className="space-y-3 rounded-lg border border-white/10 bg-black/25 p-3">
                   {selected ? (
@@ -490,11 +535,28 @@ export function PageInspectPanel({
           ) : null}
 
           {showPixels && capture ? (
-            <PixelMapPane capture={capture} elements={visible} />
+            <PixelMapPane capture={capture} elements={visible} screenshotSrc={screenshotSrc} />
           ) : null}
 
           {showScreenshot ? (
-            <ScreenshotPane src={screenshotSrc} emptyLabel="No screenshot yet" />
+            <ScreenshotPane
+              src={screenshotSrc}
+              emptyLabel="No screenshot yet"
+              updatingMap={updatingMapOnScreenshot}
+              updatingMapMessage={updatingMapMessage}
+            />
+          ) : null}
+
+          {view === "split" && capture ? (
+            <MapOverlayView
+              capture={capture}
+              elements={visible}
+              screenshotSrc={screenshotSrc}
+              selectedId={selectedId}
+              onSelect={setSelectedId}
+              updatingMap={updatingMapOnScreenshot}
+              updatingMapMessage={updatingMapMessage}
+            />
           ) : null}
         </div>
       )}

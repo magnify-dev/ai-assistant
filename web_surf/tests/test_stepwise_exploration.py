@@ -22,12 +22,14 @@ from web_surf.form_values import (
     report_is_negative,
     sanitize_form_values,
     suggest_overlay_action,
+    build_overlay_map,
     _pick_adult_year,
 )
 from web_surf.browser_explore import (
     _content_collect_key,
     _content_collect_signature,
     _discover_official_outbound,
+    validate_overlay_action,
     _json_object,
     _redact_form_values,
     _sync_branch_navigation,
@@ -624,6 +626,69 @@ class DecisionTests(unittest.TestCase):
         self.assertIn("reject", intents)
         self.assertIn("accept", intents)
         self.assertNotIn("policy", intents)
+
+    def test_build_overlay_map_includes_i_accept_on_wowhead_style_banner(self) -> None:
+        snapshot = {
+            "blocking_overlays": [
+                {
+                    "id": "div-1",
+                    "role": "dialog",
+                    "label": "We Care About Your Privacy",
+                    "text": "Selecting I Accept enables tracking. Reject All",
+                }
+            ],
+            "interactables": [
+                {
+                    "id": "el-button-i-accept",
+                    "kind": "button",
+                    "text": "I Accept",
+                    "landmark": "Your Privacy Choices",
+                    "rect": {"x": 100, "y": 500, "width": 80, "height": 32},
+                },
+                {
+                    "id": "el-button-reject-all",
+                    "kind": "button",
+                    "text": "Reject All",
+                    "landmark": "Your Privacy Choices",
+                    "rect": {"x": 200, "y": 500, "width": 80, "height": 32},
+                },
+                {
+                    "id": "el-button-show-purposes",
+                    "kind": "button",
+                    "text": "Show Purposes",
+                    "landmark": "Your Privacy Choices",
+                },
+            ],
+        }
+        overlay_map = build_overlay_map(snapshot)
+        ids = {row["id"] for row in overlay_map["elements"]}
+        self.assertIn("el-button-i-accept", ids)
+        self.assertIn("el-button-reject-all", ids)
+        reject = next(row for row in overlay_map["elements"] if row["id"] == "el-button-reject-all")
+        self.assertEqual(reject["intent"], "reject")
+        accept = next(row for row in overlay_map["elements"] if row["id"] == "el-button-i-accept")
+        self.assertEqual(accept["intent"], "accept")
+        self.assertIn("rect", reject)
+
+    def test_validate_overlay_action_rejects_non_map_target(self) -> None:
+        snapshot = {
+            "blocking_overlays": [{"id": "gate", "text": "Cookie consent"}],
+            "interactables": [
+                {"id": "reject", "kind": "button", "text": "Reject All", "landmark": "Privacy"},
+                {"id": "nav-home", "kind": "link", "text": "Home", "href": "/"},
+            ],
+        }
+        ok, _ = validate_overlay_action(
+            {"action": "click", "target_id": "reject", "reason": "dismiss"},
+            snapshot,
+        )
+        self.assertEqual(ok["target_id"], "reject")
+        blocked, err = validate_overlay_action(
+            {"action": "click", "target_id": "nav-home", "reason": "wrong"},
+            snapshot,
+        )
+        self.assertIsNone(blocked)
+        self.assertIn("overlay_map", err)
 
     def test_fallback_planner_maps_year_month_day_selects(self) -> None:
         snapshot = {

@@ -69,6 +69,26 @@ export type WebCaptureVisual = {
   active_source?: "none" | "built" | "corrected";
 };
 
+export type WebCaptureScrollSlice = {
+  scroll_y: number;
+  height: number;
+  screenshot?: string;
+  screenshotUrl?: string;
+  capture_id?: string;
+};
+
+export type WebCaptureScrollMap = {
+  canvas_height: number;
+  slice_count: number;
+  explored_height: number;
+  persistent_skipped?: number;
+  slices: WebCaptureScrollSlice[];
+  /** True when multiple scroll slices were merged into document space */
+  stitched?: boolean;
+  /** "document" = rect.y includes scroll offset; "viewport" = raw getBoundingClientRect */
+  coords?: "document" | "viewport";
+};
+
 export type WebCapture = {
   version: number;
   capture_id: string;
@@ -100,6 +120,12 @@ export type WebCapture = {
   };
   map?: WebCaptureMapInfo;
   visual?: WebCaptureVisual;
+  /** Relative path under .agent/web-capture/, e.g. screenshots/example-com-settings.jpg */
+  screenshot?: string;
+  /** Resolved URL for the saved viewport JPEG */
+  screenshotUrl?: string;
+  /** Document-tall stitched map built from multiple scroll slices */
+  scroll_map?: WebCaptureScrollMap;
   ai: {
     status: "pending" | "ready" | "unavailable" | "disabled";
     model?: string;
@@ -135,3 +161,23 @@ export type WebCaptureBuildStatus = {
   elementCount?: number;
   updatedAt?: string;
 };
+
+export const WEB_CAPTURE_BUILDING_PHASES = new Set<WebCaptureBuildPhase>([
+  "geometry",
+  "locators",
+  "analyzing",
+  "visual",
+]);
+
+/** True when a live screenshot arrived before the interaction map finished rebuilding. */
+export function isScreenshotAheadOfMap(
+  screenshotTs: string | undefined,
+  captureBuild: WebCaptureBuildStatus | null | undefined,
+): boolean {
+  if (!screenshotTs) return false;
+  if (!captureBuild) return true;
+  if (WEB_CAPTURE_BUILDING_PHASES.has(captureBuild.phase)) return true;
+  if (captureBuild.phase !== "complete") return false;
+  const mapTs = captureBuild.updatedAt ?? "";
+  return Boolean(mapTs && screenshotTs > mapTs);
+}

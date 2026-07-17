@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { apiUrl } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import type {
   WebCapture,
@@ -6,10 +7,10 @@ import type {
   WebCaptureReview,
 } from "@/lib/webCaptureTypes";
 import {
-  captureBoxStyle,
   filterCaptureElements,
   type WebCaptureFilter,
 } from "@/lib/webCaptureView";
+import { MapOverlayView } from "@/components/MapOverlayView";
 
 type Props = {
   capture: WebCapture;
@@ -25,19 +26,6 @@ function elementLabel(element: WebCaptureElement): string {
     element.name?.trim() ||
     element.kind
   ).slice(0, 48);
-}
-
-function boxTone(element: WebCaptureElement): string {
-  if (element.locator_status !== "unique") {
-    return "border-amber-500 bg-amber-300/25 text-amber-950";
-  }
-  if (element.ai_interactive === true) {
-    return "border-emerald-600 bg-emerald-300/25 text-emerald-950";
-  }
-  if (element.ai_interactive === false) {
-    return "border-rose-500 bg-rose-300/20 text-rose-950";
-  }
-  return "border-sky-500 bg-sky-300/20 text-sky-950";
 }
 
 export function WebCapturePanel({ capture, latestReview, onReview }: Props) {
@@ -79,6 +67,12 @@ export function WebCapturePanel({ capture, latestReview, onReview }: Props) {
         : capture.ai.status === "disabled"
           ? "AI disabled — raw capture shown"
           : "AI analysis pending";
+
+  const screenshotSrc = capture.screenshotUrl
+    ? capture.screenshotUrl.startsWith("http") || capture.screenshotUrl.startsWith("data:")
+      ? capture.screenshotUrl
+      : apiUrl(capture.screenshotUrl)
+    : undefined;
 
   return (
     <div className="space-y-3">
@@ -124,36 +118,13 @@ export function WebCapturePanel({ capture, latestReview, onReview }: Props) {
       </div>
 
       <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_300px]">
-        <div className="rounded-lg border border-white/15 bg-neutral-900 p-2">
-          <div
-            className="relative mx-auto max-h-[520px] w-full overflow-hidden rounded bg-white shadow-inner"
-            style={{ aspectRatio: `${capture.viewport.width} / ${capture.viewport.height}` }}
-            aria-label="Scaled browser viewport interaction map"
-          >
-            {visible.map((element) => (
-              <button
-                key={element.id}
-                type="button"
-                title={`${elementLabel(element)} · ${element.locator_status}`}
-                aria-label={`Inspect ${elementLabel(element)}`}
-                onClick={() => setSelectedId(element.id)}
-                className={cn(
-                  "absolute overflow-hidden border text-left text-[9px] leading-tight transition",
-                  boxTone(element),
-                  selected?.id === element.id && "z-20 ring-2 ring-violet-600 ring-offset-1",
-                )}
-                style={captureBoxStyle(element, capture)}
-              >
-                <span className="block truncate px-0.5">{elementLabel(element)}</span>
-              </button>
-            ))}
-            {!visible.length ? (
-              <div className="absolute inset-0 flex items-center justify-center text-sm text-neutral-400">
-                No elements match this filter
-              </div>
-            ) : null}
-          </div>
-        </div>
+        <MapOverlayView
+          capture={capture}
+          elements={visible}
+          screenshotSrc={screenshotSrc}
+          selectedId={selected?.id ?? null}
+          onSelect={setSelectedId}
+        />
 
         <aside className="space-y-3 rounded-lg border border-white/10 bg-black/25 p-3">
           {selected ? (

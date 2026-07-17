@@ -223,6 +223,13 @@ def _discover_and_persist(
     from ui_test.browser_state import attach_web_capture, collect_page_state
 
     state = collect_page_state(page, include_screenshot=True)
+    if state.get("screenshot_b64"):
+        try:
+            from ui_test.browser_state import emit_browser_state_event
+
+            emit_browser_state_event(state, context="ui_exploration")
+        except ImportError:
+            pass
     attach_web_capture(page, state, context="ui_exploration", analyze=True)
     visible = extract_visible_content(page)
     interactables = state.get("interactables") or []
@@ -248,16 +255,9 @@ def _discover_and_persist(
     state["visible_content"] = visible
     state["semantic_summary"] = semantic_summary_from_visible(visible)
     try:
-        from ui_test.events import browser_state_event
+        from ui_test.browser_state import emit_browser_state_event
 
-        browser_state_event(
-            url=state["url"],
-            title=state.get("title") or "",
-            interactables=interactables,
-            context="ui_exploration",
-            screenshot_b64=state.get("screenshot_b64"),
-            web_capture=state.get("web_capture"),
-        )
+        emit_browser_state_event(state, context="ui_exploration")
     except ImportError:
         pass
     return registry, nav_tree, state, visible, site_changed, new_capabilities, nav_changed, new_interactables
@@ -368,13 +368,22 @@ def _write_exploration_report(project: Path, markdown: str) -> Path:
     return out
 
 
-def _emit_agent_decision(decision: dict[str, Any]) -> None:
+def _emit_agent_decision(decision: dict[str, Any], page: Page | None = None) -> None:
     try:
         from ui_test.events import agent_decision_event
 
         agent_decision_event(decision)
     except ImportError:
         pass
+    if page is not None:
+        try:
+            from ui_test.browser_state import collect_page_state, emit_browser_state_event
+
+            preview = collect_page_state(page, include_screenshot=True)
+            if preview.get("screenshot_b64"):
+                emit_browser_state_event(preview, context="agent_decision")
+        except Exception:
+            pass
     try:
         from ui_test.playwright_session import get_active_recorder
 
@@ -499,6 +508,7 @@ def _execute_agent_action(
             target=f"{ms}ms",
             ok=True,
         )
+        emit_page_state(page, context="explore_wait")
         return True, f"wait {ms}ms"
 
     if action in ("done", "report"):
@@ -555,6 +565,12 @@ def run_exploration(
         if recorder:
             context_opts.update(recorder.context_options())
         context = browser.new_context(**context_opts)
+        try:
+            from web_surf.adblock import install_adblock
+
+            install_adblock(context)
+        except Exception:
+            pass
         if recorder:
             recorder.attach(context)
         page = context.new_page()
@@ -658,7 +674,7 @@ def run_exploration(
 
                 decision = _sanitize_navigate_decision(decision, nav_tree, interactables, current_path)
 
-                _emit_agent_decision(decision)
+                _emit_agent_decision(decision, page)
                 reason = str(decision.get("reason") or "")
                 action = str(decision.get("action") or "")
                 log(f"Step {step_num + 1}: {action} — {reason}")

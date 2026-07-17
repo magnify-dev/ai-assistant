@@ -59,7 +59,11 @@ OVERLAY_REJECT_RE = re.compile(
     re.I,
 )
 OVERLAY_ACCEPT_RE = re.compile(
-    r"\b(accept all cookies|accept cookies|accept all|agree and continue|allow all|i agree|got it)\b",
+    r"\b(accept all cookies|accept cookies|accept all|agree and continue|allow all|i agree|i accept|got it)\b",
+    re.I,
+)
+CONSENT_REGION_RE = re.compile(
+    r"\b(cookie|consent|privacy|tracking|gdpr|ccpa|your privacy)\b",
     re.I,
 )
 OVERLAY_DISMISS_RE = re.compile(
@@ -117,6 +121,14 @@ def _is_overlay_button(item: dict[str, Any]) -> bool:
         return False
     kind = str(item.get("kind") or item.get("role") or "").lower()
     return kind in {"button", "blz-button"}
+
+
+def _in_consent_region(item: dict[str, Any]) -> bool:
+    blob = " ".join(
+        str(item.get(key) or "")
+        for key in ("landmark", "nearest_heading", "nearby_text")
+    )
+    return bool(CONSENT_REGION_RE.search(blob))
 
 
 def _snapshot_blockers(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
@@ -195,12 +207,7 @@ def _controls_for_overlay(
                 scoped.append(raw)
             continue
         if overlay_kind == "cookie":
-            primary = _primary_label(raw)
-            if _is_overlay_button(raw) and (
-                OVERLAY_REJECT_RE.search(primary)
-                or OVERLAY_ACCEPT_RE.search(primary)
-                or OVERLAY_DISMISS_RE.search(primary)
-            ):
+            if _is_cookie_overlay_control(raw):
                 scoped.append(raw)
         elif overlay_kind == "age_gate":
             scoped.append(raw)
@@ -238,6 +245,21 @@ def _consent_action_score(item: dict[str, Any], *, reject: bool) -> int:
     if OVERLAY_BUTTON_RE.search(primary):
         return 40
     return -1
+
+
+def _is_cookie_overlay_control(item: dict[str, Any]) -> bool:
+    if not _is_overlay_button(item):
+        return False
+    primary = _primary_label(item)
+    if (
+        OVERLAY_REJECT_RE.search(primary)
+        or OVERLAY_ACCEPT_RE.search(primary)
+        or OVERLAY_DISMISS_RE.search(primary)
+    ):
+        return True
+    if _consent_action_score(item, reject=True) >= 0 or _consent_action_score(item, reject=False) >= 0:
+        return True
+    return bool(_in_consent_region(item) and primary and OVERLAY_BUTTON_RE.search(primary))
 
 
 def _action_signature(action: dict[str, Any]) -> str:
@@ -429,7 +451,14 @@ def summarize_overlay_actions(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
             widget = str(item.get("widget") or "").lower()
             if kind in {"select", "combobox", "input", "textbox", "textarea"} or widget in {"select", "combobox", "text", "number"}:
                 field_action = "select" if kind in {"select", "combobox"} or widget in {"select", "combobox"} else "fill"
-                actions.append({"id": str(item["id"]), "label": primary[:80], "intent": field_action})
+                row: dict[str, Any] = {"id": str(item["id"]), "label": primary[:80], "intent": field_action}
+                name = str(item.get("name") or "").lower()
+                if name:
+                    row["name"] = name[:40]
+                options = item.get("options")
+                if isinstance(options, list) and options:
+                    row["options"] = [str(opt)[:40] for opt in options[:8]]
+                actions.append(row)
                 continue
             if not _is_overlay_button(item):
                 continue
@@ -445,7 +474,22 @@ def summarize_overlay_actions(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
                 intent = "dismiss"
             else:
                 continue
-            actions.append({"id": str(item["id"]), "label": primary[:80], "intent": intent})
+            row = {"id": str(item["id"]), "label": primary[:80], "intent": intent}
+            landmark = str(item.get("landmark") or "").strip()
+            if landmark:
+                row["landmark"] = landmark[:60]
+            heading = str(item.get("nearest_heading") or "").strip()
+            if heading:
+                row["heading"] = heading[:60]
+            rect = item.get("rect") if isinstance(item.get("rect"), dict) else {}
+            if rect:
+                row["rect"] = {
+                    "x": round(float(rect.get("x") or 0), 1),
+                    "y": round(float(rect.get("y") or 0), 1),
+                    "w": round(float(rect.get("width") or 0), 1),
+                    "h": round(float(rect.get("height") or 0), 1),
+                }
+            actions.append(row)
         if actions:
             summaries.append(
                 {
@@ -455,6 +499,67 @@ def summarize_overlay_actions(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
                 }
             )
     return summaries
+
+
+def overlay_target_ids(snapshot: dict[str, Any]) -> set[str]:
+    """Ids the overlay-dismiss model may click/fill/select."""
+    ids: set[str] = set()
+    for summary in summarize_overlay_actions(snapshot):
+        for act in summary.get("actions") or []:
+            if isinstance(act, dict) and act.get("id"):
+                ids.add(str(act["id"]))
+    return ids
+
+
+def build_overlay_map(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Rich overlay interaction map for the dismiss model — ids, labels, intents, layout hints."""
+    summaries = summarize_overlay_actions(snapshot)
+    interactables = {
+        str(item.get("id") or ""): item
+        for item in (snapshot.get("interactables") or [])
+        if isinstance(item, dict) and item.get("id")
+    }
+    elements: list[dict[str, Any]] = []
+    menu: list[dict[str, Any]] = []
+    number = 1
+    for summary in summaries:
+        overlay_kind = str(summary.get("kind") or "generic")
+        for act in summary.get("actions") or []:
+            if not isinstance(act, dict) or not act.get("id"):
+                continue
+            target_id = str(act["id"])
+            intent = str(act.get("intent") or "click")
+            action = intent if intent in {"fill", "select"} else "click"
+            row: dict[str, Any] = {
+                "id": target_id,
+                "label": str(act.get("label") or target_id)[:80],
+                "intent": intent,
+                "action": action,
+                "overlay_kind": overlay_kind,
+            }
+            for key in ("landmark", "heading", "name", "options", "rect"):
+                if act.get(key) is not None:
+                    row[key] = act[key]
+            item = interactables.get(target_id)
+            if item and "widget" not in row:
+                widget = str(item.get("widget") or item.get("kind") or "").strip()
+                if widget:
+                    row["widget"] = widget[:40]
+            elements.append(row)
+            menu.append(
+                {
+                    "n": number,
+                    "action": action,
+                    "target_id": target_id,
+                    "label": f"{overlay_kind}/{intent}: {row['label']}"[:100],
+                }
+            )
+            number += 1
+    return {
+        "overlays": summaries,
+        "elements": elements[:16],
+        "menu": menu[:16],
+    }
 
 
 def _latest_adult_birth_year(*, min_age_years: int = MIN_ADULT_AGE_YEARS) -> int:
@@ -589,12 +694,7 @@ def _cookie_buttons_from_interactables(interactables: list[Any]) -> list[dict[st
     return [
         raw
         for raw in interactables
-        if isinstance(raw, dict)
-        and _is_overlay_button(raw)
-        and (
-            OVERLAY_REJECT_RE.search(_primary_label(raw))
-            or OVERLAY_ACCEPT_RE.search(_primary_label(raw))
-        )
+        if isinstance(raw, dict) and _is_cookie_overlay_control(raw)
     ]
 
 

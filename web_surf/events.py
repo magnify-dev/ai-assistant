@@ -177,5 +177,16 @@ def web_result_event(payload: dict[str, Any]) -> None:
     _dispatch({"type": "web_research_result", **payload})
 
 
-def finish(*, overall_ok: bool, error: str = "") -> None:
-    _dispatch({"type": "done", "overall_ok": overall_ok, "error": error})
+def finish(
+    *,
+    overall_ok: bool,
+    error: str = "",
+    goal_met: bool | None = None,
+    partial: bool = False,
+) -> None:
+    payload: dict[str, Any] = {"type": "done", "overall_ok": overall_ok, "error": error}
+    if goal_met is not None:
+        payload["goal_met"] = goal_met
+    if partial:
+        payload["partial"] = True
+    _dispatch(payload)

@@ -341,6 +341,12 @@ def run_spec(
             device_scale_factor=1,
             color_scheme="light",
         )
+        try:
+            from web_surf.adblock import install_adblock
+
+            install_adblock(context)
+        except Exception:
+            pass
         page = context.new_page()
         try:
             auth = spec.get("auth")

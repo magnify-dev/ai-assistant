@@ -290,10 +290,98 @@ def merge_facts(
     return {**facts_doc, "facts": existing[-500:]}, added
 
 
-def index_summary_for_agent(index: dict[str, Any], *, max_pages: int = 20) -> str:
-    pages = index.get("pages") or {}
+def _query_tokens(query: str, *, min_len: int = 4) -> set[str]:
+    return {t for t in re.split(r"\W+", query.lower()) if len(t) >= min_len}
+
+
+def query_overlap_score(query_a: str, query_b: str) -> int:
+    a = _query_tokens(query_a)
+    b = _query_tokens(query_b)
+    if not a or not b:
+        return 0
+    return len(a & b)
+
+
+def _same_research_task(research_query: str, current_query: str) -> bool:
+    if not research_query.strip() or not current_query.strip():
+        return False
+    if research_query.strip() == current_query.strip():
+        return True
+    return query_overlap_score(research_query, current_query) >= 3
+
+
+def facts_for_query(
+    facts_doc: dict[str, Any],
+    query: str,
+    *,
+    max_facts: int = 30,
+) -> list[dict[str, Any]]:
+    """Return facts scoped to the current research task."""
+    from web_surf.page_match import focus_query
+
+    focused = focus_query(query)
+    query_tokens = _query_tokens(focused)
+    scored: list[tuple[int, dict[str, Any]]] = []
+    for fact in facts_doc.get("facts") or []:
+        if not isinstance(fact, dict):
+            continue
+        research_query = str(fact.get("research_query") or "")
+        if research_query and not _same_research_task(research_query, focused):
+            continue
+        content_blob = " ".join(
+            str(fact.get(key) or "")
+            for key in ("field", "value", "quote")
+        ).lower()
+        score = 0
+        if research_query and _same_research_task(research_query, focused):
+            score += 100
+        if query_tokens:
+            score += sum(1 for token in query_tokens if token in content_blob)
+        if score <= 0 and query_tokens:
+            continue
+        scored.append((score, fact))
+    scored.sort(key=lambda row: row[0], reverse=True)
+    return [fact for _, fact in scored[:max_facts]]
+
+
+def index_for_query(index: dict[str, Any], query: str, *, max_pages: int = 20) -> list[tuple[str, dict[str, Any]]]:
+    from web_surf.page_match import focus_query
+
+    focused = focus_query(query)
+    query_tokens = _query_tokens(focused)
+    rows: list[tuple[int, str, dict[str, Any]]] = []
+    for url, info in (index.get("pages") or {}).items():
+        if not isinstance(info, dict):
+            continue
+        search_query = str(info.get("search_query") or "")
+        score = 0
+        if search_query and _same_research_task(search_query, focused):
+            score += 100
+        elif search_query:
+            score += query_overlap_score(search_query, focused)
+        summary = str(info.get("summary") or "").lower()
+        if query_tokens:
+            score += sum(1 for token in query_tokens if token in summary)
+        if score <= 0 and query_tokens:
+            continue
+        rows.append((score, str(url), info))
+    rows.sort(key=lambda row: row[0], reverse=True)
+    return [(url, info) for _, url, info in rows[:max_pages]]
+
+
+def index_summary_for_agent(
+    index: dict[str, Any],
+    *,
+    query: str = "",
+    max_pages: int = 20,
+) -> str:
+    pages = (
+        index_for_query(index, query, max_pages=max_pages)
+        if query.strip()
+        else list((index.get("pages") or {}).items())[:max_pages]
+    )
     lines = ["Known web pages (semantic catalog):"]
-    for url, info in list(pages.items())[:max_pages]:
+    for url, info in pages:
         if not isinstance(info, dict):
             continue
         title = str(info.get("title") or url)
@@ -310,29 +398,20 @@ def facts_summary_for_agent(
     query: str = "",
     max_facts: int = 30,
 ) -> str:
-    facts = facts_doc.get("facts") or []
+    facts = facts_for_query(facts_doc, query, max_facts=max_facts) if query.strip() else list(facts_doc.get("facts") or [])
     if not facts:
         return "(no extracted facts yet)"
 
-    query_tokens = {t for t in re.split(r"\W+", query.lower()) if len(t) > 2}
-    scored: list[tuple[int, dict[str, Any]]] = []
-    for fact in facts:
-        if not isinstance(fact, dict):
-            continue
-        blob = " ".join(
-            str(fact.get(key) or "")
-            for key in ("field", "value", "quote", "source_url", "research_query")
-        ).lower()
-        score = sum(1 for token in query_tokens if token in blob) if query_tokens else 0
-        scored.append((score, fact))
-
-    scored.sort(key=lambda row: row[0], reverse=True)
     lines = ["Extracted facts:"]
-    for score, fact in scored[:max_facts]:
-        if query_tokens and score == 0:
+    for fact in facts[:max_facts]:
+        if not isinstance(fact, dict):
             continue
         field = str(fact.get("field") or "fact")
         value = str(fact.get("value") or "")
         source = str(fact.get("source_url") or "")
-        lines.append(f"- {field}: {value} (source: {source})")
+        quote = str(fact.get("quote") or "").strip()
+        if quote:
+            lines.append(f"- {field}: {value}\n  quote: {quote}\n  source: {source}")
+        else:
+            lines.append(f"- {field}: {value} (source: {source})")
     return "\n".join(lines) if len(lines) > 1 else "(no matching facts)"

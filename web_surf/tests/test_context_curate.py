@@ -8,6 +8,7 @@ from web_surf.context_curate import (
     compact_routes,
     curate_browse_context,
     curate_controls,
+    curate_overlay_context,
     curate_text,
     normalize_decision,
 )
@@ -300,6 +301,46 @@ class ContextCurateTests(unittest.TestCase):
         )
         self.assertTrue(payload.get("overlay_required"))
 
+    def test_browse_context_defers_report_ready_when_overlay_present(self) -> None:
+        snapshot = {
+            "url": "https://example.com/article",
+            "title": "Article",
+            "visible_text": "Article body",
+            "blocking_overlays": [{"id": "overlay-1", "text": "Cookie preferences"}],
+            "interactables": [
+                {"id": "btn-reject", "kind": "button", "text": "Reject All", "landmark": "Privacy"},
+            ],
+        }
+        payload = curate_browse_context(
+            query="latest news",
+            step_id="step_002",
+            snapshot=snapshot,
+            discovered_routes=set(),
+            collected_evidence=[
+                {"url": "https://example.com/article", "step_id": "step_001", "chars": 900},
+            ],
+        )
+        self.assertNotIn("report_ready", payload)
+        self.assertIn("overlay", str(payload.get("evidence_collected") or "").lower())
+        self.assertTrue(any(row.get("id") == "btn-reject" for row in payload.get("overlay_map") or []))
+
+    def test_curate_overlay_context_builds_menu_from_map(self) -> None:
+        snapshot = {
+            "url": "https://example.com/",
+            "title": "Example",
+            "blocking_overlays": [{"id": "overlay-1", "role": "dialog", "text": "We use cookies"}],
+            "interactables": [
+                {"id": "btn-accept", "kind": "button", "text": "I Accept", "landmark": "Privacy"},
+                {"id": "btn-reject", "kind": "button", "text": "Reject All", "landmark": "Privacy"},
+            ],
+        }
+        payload = curate_overlay_context(step_id="step_001", snapshot=snapshot)
+        ids = {row["id"] for row in payload.get("overlay_map") or []}
+        self.assertIn("btn-accept", ids)
+        self.assertIn("btn-reject", ids)
+        menu_ids = {row.get("target_id") for row in payload.get("menu") or []}
+        self.assertEqual(ids, menu_ids)
+
     def test_page_has_goal_links_ignores_toc_when_target_date_section_present(self) -> None:
         snapshot = {
             "visible_text": (
@@ -417,6 +458,23 @@ class ContextCurateTests(unittest.TestCase):
             discovered_routes=set(),
         )
         self.assertEqual(payload["goal"], "find diablo 4 patch notes for 14.7.2026")
+
+    def test_browse_context_includes_recency_note(self) -> None:
+        snapshot = {
+            "url": "https://www.example.com/news",
+            "title": "News",
+            "visible_text": "Latest headlines",
+            "interactables": [],
+        }
+        payload = curate_browse_context(
+            query="find the most recent news",
+            step_id="step_008",
+            snapshot=snapshot,
+            discovered_routes=set(),
+        )
+        self.assertTrue(payload.get("recency_requirement"))
+        self.assertIn("recency_note", payload)
+        self.assertIn("NEWEST", payload["recency_note"])
 
     def test_browse_context_includes_agent_memory(self) -> None:
         from web_surf.agent_memory import commit_agent_memory

@@ -87,7 +87,13 @@ def _action_type(item: dict[str, Any]) -> str:
     return "click"
 
 
-def _query_score(item: dict[str, Any], query_tokens: set[str], *, publisher_domains: set[str] | None = None) -> int:
+def _query_score(
+    item: dict[str, Any],
+    query_tokens: set[str],
+    *,
+    publisher_domains: set[str] | None = None,
+    query: str = "",
+) -> int:
     if not query_tokens:
         return 0
     blob = f"{_label(item)} {item.get('href') or ''}".lower()
@@ -98,12 +104,16 @@ def _query_score(item: dict[str, Any], query_tokens: set[str], *, publisher_doma
         score -= 8
     href = str(item.get("href") or "").strip()
     if href:
-        from web_surf.page_match import _CONTENT_PATH_HINTS, url_on_publisher_domain
+        from web_surf.page_match import _CONTENT_PATH_HINTS, parse_content_date, query_implies_recency, url_on_publisher_domain
 
         path = urlsplit(href.lower()).path
         score += sum(1 for hint in _CONTENT_PATH_HINTS if hint in path)
         if url_on_publisher_domain(href, publisher_domains or set()):
             score += 12
+        if query and query_implies_recency(query):
+            published = parse_content_date(f"{_label(item)} {href}")
+            if published:
+                score += published.toordinal() // 10
     return score
 
 
@@ -132,17 +142,24 @@ def _overlay_score(item: dict[str, Any], *, has_overlay: bool) -> int:
     return score
 
 
-def _control_priority(item: dict[str, Any], query_tokens: set[str], *, has_overlay: bool, publisher_domains: set[str] | None = None) -> int:
+def _control_priority(
+    item: dict[str, Any],
+    query_tokens: set[str],
+    *,
+    has_overlay: bool,
+    publisher_domains: set[str] | None = None,
+    query: str = "",
+) -> int:
     if item.get("disabled"):
         return -1000
     return (
-        _query_score(item, query_tokens, publisher_domains=publisher_domains)
+        _query_score(item, query_tokens, publisher_domains=publisher_domains, query=query)
         + _structural_score(item)
         + _overlay_score(item, has_overlay=has_overlay)
     )
 
 
-def compact_control(item: dict[str, Any]) -> dict[str, Any]:
+def compact_control(item: dict[str, Any], *, query: str = "") -> dict[str, Any]:
     widget = _widget_type(item)
     row: dict[str, Any] = {
         "id": str(item.get("id") or ""),
@@ -150,6 +167,13 @@ def compact_control(item: dict[str, Any]) -> dict[str, Any]:
         "widget": widget,
         "label": _label(item),
     }
+    if query:
+        from web_surf.page_match import parse_content_date, query_implies_recency
+
+        if query_implies_recency(query):
+            published = parse_content_date(f"{row['label']} {item.get('href') or ''}")
+            if published:
+                row["published"] = published.isoformat()
     href = str(item.get("href") or "").strip()
     if href:
         row["href"] = href
@@ -239,7 +263,10 @@ def curate_controls(
     publisher_domains: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Keep a balanced mix of overlay, goal-relevant, and structural controls."""
-    query_tokens = _tokens(query)
+    from web_surf.page_match import focus_query
+
+    focused = focus_query(query)
+    query_tokens = _tokens(focused)
     ranked: list[tuple[int, int, dict[str, Any]]] = []
     for index, raw in enumerate(interactables or []):
         if not isinstance(raw, dict) or not raw.get("id"):
@@ -251,6 +278,7 @@ def curate_controls(
                     query_tokens,
                     has_overlay=has_overlay,
                     publisher_domains=publisher_domains,
+                    query=focused,
                 ),
                 index,
                 raw,
@@ -266,7 +294,7 @@ def curate_controls(
         if not control_id or control_id in seen:
             return
         seen.add(control_id)
-        chosen.append(compact_control(item))
+        chosen.append(compact_control(item, query=focused))
 
     # Overlay dismiss / form controls first when a modal is present.
     if has_overlay:
@@ -282,7 +310,7 @@ def curate_controls(
     for score, _, item in ranked:
         if score < 0:
             continue
-        if query_tokens and _query_score(item, query_tokens, publisher_domains=publisher_domains) > 0:
+        if query_tokens and _query_score(item, query_tokens, publisher_domains=publisher_domains, query=focused) > 0:
             add(item)
         if len(chosen) >= limit - 8:
             break
@@ -486,11 +514,17 @@ def curate_browse_context(
     from web_surf.page_match import (
         filter_text_by_date,
         focus_query,
+        is_content_listing_url,
         page_contains_target_date,
         page_matches_query,
         parse_target_dates,
         parse_user_preferred_domains,
+        query_implies_recency,
         url_on_publisher_domain,
+        viewport_explored_fraction,
+        viewport_has_content_below,
+        page_extends_beyond_viewport,
+        snapshot_viewport,
     )
 
     focused_goal = focus_query(query)
@@ -502,6 +536,12 @@ def curate_browse_context(
     curated_page_text = curate_text(visible_text, query=focused_goal, max_chars=4500)
     if target_dates and page_contains_target_date(visible_text, focused_goal):
         filtered = filter_text_by_date(visible_text, focused_goal, max_chars=8000)
+        if len(filtered) >= 120:
+            curated_page_text = curate_text(filtered, query=focused_goal, max_chars=4500)
+    elif query_implies_recency(focused_goal):
+        from web_surf.page_match import filter_text_by_recency
+
+        filtered = filter_text_by_recency(visible_text, focused_goal, max_chars=8000)
         if len(filtered) >= 120:
             curated_page_text = curate_text(filtered, query=focused_goal, max_chars=4500)
     payload: dict[str, Any] = {
@@ -522,6 +562,29 @@ def curate_browse_context(
         ),
         "routes": compact_routes(list(discovered_routes)),
     }
+    if page_extends_beyond_viewport(snapshot):
+        vp = snapshot_viewport(snapshot)
+        payload["viewport"] = {
+            "scroll_y": int(vp["scroll_y"]),
+            "page_height": int(vp["document_height"]),
+            "view_height": int(vp["height"]),
+            "explored_pct": round(viewport_explored_fraction(snapshot) * 100),
+            "more_below": viewport_has_content_below(snapshot),
+        }
+        if query_implies_recency(focused_goal) or is_content_listing_url(str(snapshot.get("url") or "")):
+            payload["scroll_note"] = (
+                "This page extends beyond the current view. Scroll down or open the top "
+                "news/article link to reach the newest content before extract/filter/report."
+            )
+    if query_implies_recency(focused_goal):
+        payload["recency_requirement"] = True
+        payload["recency_note"] = (
+            "Timing is part of the user's request — pick the NEWEST matching item, not just any "
+            "related article. On listing pages prefer links with the latest published date "
+            "(usually first/top). When several dated sections appear on one page, collect only "
+            "the newest dated section. Do not report older content when newer content is visible "
+            "or one click away."
+        )
 
     publisher_routes = [
         route
@@ -564,7 +627,7 @@ def curate_browse_context(
         if isinstance(item, dict)
         and str(item.get("url") or "").strip().rstrip("/") == current_url
     ]
-    if prior_collects:
+    if prior_collects and not overlays:
         latest = prior_collects[-1]
         step_ref = str(latest.get("step_id") or "").strip()
         payload["evidence_collected"] = (
@@ -573,6 +636,11 @@ def curate_browse_context(
             + ". Use action=report now — do not repeat extract or filter."
         )
         payload["report_ready"] = True
+    elif prior_collects and overlays:
+        payload["evidence_collected"] = (
+            "Content was collected but a blocking overlay is still up. "
+            "Dismiss the overlay from overlay_map[] first, then use action=report."
+        )
     collapsed = [
         control
         for control in payload.get("controls") or []
@@ -688,7 +756,91 @@ def curate_browse_context(
         payload["overlay_required"] = True
         if overlay_actions:
             payload["overlay_actions"] = overlay_actions
+        from web_surf.form_values import build_overlay_map
+
+        overlay_map = build_overlay_map(snapshot)
+        if overlay_map.get("elements"):
+            payload["overlay_map"] = overlay_map["elements"]
     return payload
+
+
+def curate_overlay_context(
+    *,
+    step_id: str,
+    snapshot: dict[str, Any],
+    recent_history: list[dict[str, Any]] | None = None,
+    blocked_attempts: list[str] | None = None,
+    available_value_keys: list[str] | None = None,
+    field_mapping: dict[str, str] | None = None,
+    agent_memory: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Focused context for choosing which overlay control to interact with."""
+    from web_surf.form_values import (
+        AGE_GATE_AGENT_NOTE,
+        build_overlay_map,
+        looks_like_age_gate,
+        _snapshot_blockers,
+    )
+    from web_surf.agent_memory import compact_avoid, compact_failed_steps
+
+    overlays = _snapshot_blockers(snapshot)
+    overlay_map = build_overlay_map(snapshot)
+    payload: dict[str, Any] = {
+        "step": step_id,
+        "page": {
+            "url": str(snapshot.get("url") or ""),
+            "title": str(snapshot.get("title") or "")[:140],
+        },
+        "overlays": compact_blockers(overlays),
+        "overlay_map": overlay_map.get("elements") or [],
+        "menu": overlay_map.get("menu") or [],
+        "overlay_note": (
+            "A blocking overlay covers the page. Pick ONE element from overlay_map[] or menu[]. "
+            "Copy target_id exactly. Prefer reject/decline for cookie banners when available; "
+            "otherwise accept/agree/OK. For age gates fill year/month/day before confirm."
+        ),
+    }
+    failed_steps = compact_failed_steps(agent_memory, limit=6)
+    avoid = compact_avoid(
+        blocked_signatures=blocked_attempts,
+        history=list(recent_history or []),
+        agent_memory=list(agent_memory or []),
+        snapshot=snapshot,
+        limit=8,
+    )
+    if failed_steps:
+        payload["failed"] = failed_steps
+    if avoid:
+        payload["avoid"] = avoid
+    history = compact_history(recent_history, limit=4)
+    if history:
+        payload["history"] = history
+    keys = [str(key) for key in (available_value_keys or []) if str(key)]
+    if keys:
+        payload["form_keys"] = keys
+    mapping = {str(k): str(v) for k, v in (field_mapping or {}).items() if k and v}
+    if mapping:
+        payload["form_map"] = mapping
+    form_fields = curate_form_fields(snapshot.get("interactables"), field_mapping=mapping)
+    gate_fields = [field for field in form_fields if field.get("id") in overlay_target_ids_from_map(overlay_map)]
+    if gate_fields:
+        payload["form_fields"] = gate_fields
+        payload["form_note"] = "select→action=select, text→action=fill; use value_key from form_keys"
+    if looks_like_age_gate(snapshot):
+        payload["age_gate_note"] = AGE_GATE_AGENT_NOTE
+    if not payload["overlay_map"]:
+        payload["overlay_note"] = (
+            "Overlay detected but no controls mapped — try menu[] if present or report stuck."
+        )
+    return payload
+
+
+def overlay_target_ids_from_map(overlay_map: dict[str, Any]) -> set[str]:
+    return {
+        str(item.get("id") or "")
+        for item in (overlay_map.get("elements") or [])
+        if isinstance(item, dict) and item.get("id")
+    }
 
 
 def curate_form_plan_context(
@@ -753,15 +905,27 @@ def curate_extract_context(
             str(research_spec.get("source_query") or ""),
         ]
     ).strip()
-    curated = curate_text(page_text, query=query, max_chars=max_chars)
+    from web_surf.page_match import focus_query, query_implies_recency
+
+    focused = focus_query(query)
+    curated = curate_text(page_text, query=focused, max_chars=max_chars)
     lines = [
         f"goal: {research_spec.get('summary') or query}",
         f"need: {', '.join(needed) if needed else 'relevant facts'}",
-        f"title: {page_title}",
-        f"url: {page_url}",
-        "content:",
-        curated,
     ]
+    if query_implies_recency(focused):
+        lines.append(
+            "timing: user wants the newest/most recent item — extract facts only from the "
+            "latest dated section or article, not older entries on the same page"
+        )
+    lines.extend(
+        [
+            f"title: {page_title}",
+            f"url: {page_url}",
+            "content:",
+            curated,
+        ]
+    )
     return "\n".join(lines)
 
 

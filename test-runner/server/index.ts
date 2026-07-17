@@ -13,6 +13,7 @@ import { readCollaborationConfig, writeCollaborationConfig } from "./collaborati
 import { canResumeTranscript, readCollaborationTranscript } from "./collaboration-transcript.js";
 import {
   buildOllamaModelCatalog,
+  ensureOllamaReadyForRun,
   fetchOllamaStatus,
   preloadOllamaModel,
   pullOllamaModel,
@@ -55,10 +56,40 @@ import {
   prepareCurrentForNewRun,
   sessionWithArtifactUrls,
 } from "./project-report.js";
+import {
+  attachScreenshotToCapture,
+  resolveWebCaptureScreenshotFile,
+} from "./web-capture-screenshots.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-dotenv.config({ path: path.join(REPO_ROOT, ".env") });
-dotenv.config({ path: path.join(REPO_ROOT, "test-runner", ".env") });
+const ROOT_ENV_PATH = path.join(REPO_ROOT, ".env");
+const TEST_RUNNER_ENV_PATH = path.join(REPO_ROOT, "test-runner", ".env");
+
+function loadEnvFiles(): void {
+  dotenv.config({ path: ROOT_ENV_PATH });
+  dotenv.config({ path: TEST_RUNNER_ENV_PATH });
+}
+
+/** Re-read .env so UI/config picks up CURSOR_API_KEY edits without a full restart. */
+function readCursorApiKey(): string | undefined {
+  let key: string | undefined;
+  for (const envPath of [ROOT_ENV_PATH, TEST_RUNNER_ENV_PATH]) {
+    try {
+      if (!fs.existsSync(envPath)) continue;
+      const parsed = dotenv.parse(fs.readFileSync(envPath));
+      const fromFile =
+        typeof parsed.CURSOR_API_KEY === "string" ? parsed.CURSOR_API_KEY.trim() : "";
+      if (fromFile) key = fromFile;
+    } catch {
+      /* ignore unreadable env files */
+    }
+  }
+  if (!key) key = process.env.CURSOR_API_KEY?.trim() || undefined;
+  if (key) process.env.CURSOR_API_KEY = key;
+  return key;
+}
+
+loadEnvFiles();
 
 const PORT = Number(process.env.TEST_RUNNER_PORT || 8767);
 const pythonRunner = new PythonRunner();
@@ -272,16 +303,34 @@ function resetRunStateForNewRun(
   };
   pushEvent({ type: "run_cleared" });
   pushEvent({ type: "run_state", running: true });
-  if (task.trim()) {
-    pushEvent({ type: "collaboration_start", task: task.trim() });
-  }
+  pushEvent({ type: "collaboration_start", task: task.trim() });
+}
+
+/** Drop multi-MB base64 from retained/replayed events so /api/state and SSE stay responsive. */
+function withoutHeavyFields(event: StoredEvent): StoredEvent {
+  const strip = (value: unknown): unknown => {
+    if (!value || typeof value !== "object") return value;
+    if (Array.isArray(value)) return value.map(strip);
+    const obj = value as Record<string, unknown>;
+    const out: Record<string, unknown> = {};
+    for (const [key, nested] of Object.entries(obj)) {
+      if (key === "screenshot_b64" && typeof nested === "string") {
+        out.screenshot_b64_omitted = true;
+        continue;
+      }
+      out[key] = strip(nested);
+    }
+    return out;
+  };
+  return strip(event) as StoredEvent;
 }
 
 function pushEvent(event: StoredEvent) {
   const stamped = { ...event, ts: event.ts ?? new Date().toISOString() };
-  eventLog.push(stamped);
+  const forLog = withoutHeavyFields(stamped);
+  eventLog.push(forLog);
   if (eventLog.length > 2000) eventLog.splice(0, eventLog.length - 2000);
-  appendRunLogs(stamped);
+  appendRunLogs(forLog);
 
   if (event.type === "phase" && typeof event.phase === "string") {
     runState.phase = event.phase;
@@ -316,7 +365,11 @@ function pushEvent(event: StoredEvent) {
       ts: event.ts,
     };
     if (event.web_capture && typeof event.web_capture === "object") {
-      runState.webCapture = event.web_capture;
+      runState.webCapture = attachScreenshotToCapture(
+        String(runState.project || ""),
+        "current",
+        event.web_capture as Record<string, unknown>,
+      );
     }
   }
   if (event.type === "web_capture_progress") {
@@ -329,7 +382,11 @@ function pushEvent(event: StoredEvent) {
       updatedAt: event.ts,
     };
     if (event.capture && typeof event.capture === "object") {
-      runState.webCapture = event.capture;
+      runState.webCapture = attachScreenshotToCapture(
+        String(runState.project || ""),
+        "current",
+        event.capture as Record<string, unknown>,
+      );
     }
     if (event.url && (event.screenshot_b64 || event.interactables)) {
       runState.browserState = {
@@ -474,7 +531,11 @@ function pushEvent(event: StoredEvent) {
         ts: event.ts,
       };
       if (nested.web_capture && typeof nested.web_capture === "object") {
-        runState.webCapture = nested.web_capture;
+        runState.webCapture = attachScreenshotToCapture(
+          String(runState.project || ""),
+          "current",
+          nested.web_capture as Record<string, unknown>,
+        );
       }
     }
   } else if (
@@ -618,6 +679,31 @@ async function beginCollaborationRun(options: CollaborationRunBody): Promise<voi
     }
     emitRunPreflightWarnings(options.apiKey, options.cursorRuntime, options.project);
 
+    if (!options.noOllama) {
+      const ollamaCfg = readOllamaConfig();
+      try {
+        await ensureOllamaReadyForRun(ollamaCfg, emitOllamaSwitch);
+        const ollama = await buildOllamaPayload(ollamaCfg);
+        broadcastSystemEvent({
+          type: "ollama_switch",
+          step: "done",
+          message: `${ollamaCfg.model} ready for run`,
+          progress: 100,
+          toModel: ollamaCfg.model,
+          ollama,
+        });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        pushEvent({ type: "log", message: `Ollama setup failed: ${message}`, level: "error" });
+        pushEvent({
+          type: "collaboration_done",
+          ok: false,
+          error: message,
+        });
+        return;
+      }
+    }
+
     const result = await collaborationLoop.run({
       project: options.project,
       task: options.task,
@@ -659,7 +745,7 @@ function startCollaborationRun(body: Record<string, unknown>, res: express.Respo
   const target = resolveRunTargetOptions(
     typeof body.testTarget === "string" ? body.testTarget : undefined,
   );
-  const apiKey = process.env.CURSOR_API_KEY;
+  const apiKey = readCursorApiKey();
   const cursorRuntime = body.cursorRuntime === "local" ? "local" : "cloud";
   const repoUrl = typeof body.repoUrl === "string" ? body.repoUrl : undefined;
   const cursorTarget = resolveCursorRuntime(cursorRuntime, repoUrl);
@@ -705,14 +791,32 @@ app.get("/api/config", async (req, res) => {
     typeof req.query.project === "string" && req.query.project.trim()
       ? req.query.project.trim()
       : defaultProjectPath();
-  const cursorHelper = preflightCursorHelper("local", process.env.CURSOR_API_KEY, project);
+  const apiKey = readCursorApiKey();
+  const cursorHelper = preflightCursorHelper("local", apiKey, project);
+  let ollama: Awaited<ReturnType<typeof buildOllamaPayload>> | null = null;
+  try {
+    ollama = await buildOllamaPayload();
+  } catch (err) {
+    console.warn(
+      "Ollama status unavailable for /api/config:",
+      err instanceof Error ? err.message : String(err),
+    );
+  }
   res.json({
     defaultProject: defaultProjectPath(),
-    hasCursorApiKey: Boolean(process.env.CURSOR_API_KEY),
+    hasCursorApiKey: Boolean(apiKey),
     cursorHelper,
     repoRoot: REPO_ROOT,
-    ollama: await buildOllamaPayload(),
+    ollama,
   });
+});
+
+app.get("/api/ollama/status", async (_req, res) => {
+  try {
+    res.json({ ollama: await buildOllamaPayload() });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
 });
 
 app.post("/api/ollama/preload", async (_req, res) => {
@@ -1033,6 +1137,30 @@ app.get("/api/project/web-capture", (req, res) => {
   res.json(readWebCapture(projectPath, runId));
 });
 
+app.get("/api/project/web-capture/screenshot", (req, res) => {
+  const projectPath = req.query.path;
+  const file = req.query.file;
+  if (!projectPath || typeof projectPath !== "string") {
+    res.status(400).json({ error: "path query param is required" });
+    return;
+  }
+  if (!file || typeof file !== "string") {
+    res.status(400).json({ error: "file query param is required" });
+    return;
+  }
+  try {
+    const full = resolveWebCaptureScreenshotFile(projectPath, file);
+    if (!full) {
+      res.status(404).json({ error: "Screenshot not found" });
+      return;
+    }
+    res.setHeader("Content-Type", artifactContentType(full));
+    fs.createReadStream(full).pipe(res);
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
 app.post("/api/project/web-capture/review", (req, res) => {
   const {
     project: projectPath,
@@ -1297,7 +1425,7 @@ app.post("/api/run/cursor", async (req, res) => {
     return;
   }
 
-  const apiKey = process.env.CURSOR_API_KEY;
+  const apiKey = readCursorApiKey();
   if (!apiKey) {
     res.status(400).json({
       error: "CURSOR_API_KEY not set. Add it to ai-assistant/.env (see test-runner/.env.example).",
@@ -1414,7 +1542,7 @@ app.post("/api/run/resume", async (req, res) => {
 
   res.json({ started: true, resumedFrom: runId, task: transcript.task });
 
-  const apiKey = process.env.CURSOR_API_KEY;
+  const apiKey = readCursorApiKey();
   const target = resolveRunTargetOptions(body.testTarget);
 
   void beginCollaborationRun({

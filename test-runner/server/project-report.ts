@@ -9,6 +9,7 @@ import {
   saveElementCorrection,
 } from "./web-capture-maps.js";
 import { attachVisualToCapture, stampVisualCorrection } from "./web-capture-visual.js";
+import { attachScreenshotToCapture } from "./web-capture-screenshots.js";
 
 type ExplorationDoc = {
   version?: number;
@@ -113,54 +114,22 @@ function synthesizeSessionFromScreenshots(
 function readWebSessionStateForRun(
   projectPath: string,
   manifest: Record<string, unknown> | null,
-  transcriptSavedAt?: string,
+  _transcriptSavedAt?: string,
 ): Record<string, unknown> | null {
   const sessionsDir = agentPath(projectPath, "web", "sessions");
   if (!fs.existsSync(sessionsDir)) return null;
 
-  const frameLabels = new Set(
-    (Array.isArray(manifest?.frames) ? manifest.frames : [])
-      .map((frame) =>
-        frame && typeof frame === "object" ? String((frame as Record<string, unknown>).label ?? "") : "",
-      )
-      .filter(Boolean),
-  );
-  const targetTime = parseTimestamp(transcriptSavedAt);
-
-  let best: { state: Record<string, unknown>; score: number; mtime: number } | null = null;
-  for (const entry of fs.readdirSync(sessionsDir, { withFileTypes: true })) {
-    if (!entry.isFile() || !/\.ya?ml$/i.test(entry.name)) continue;
-    const file = path.join(sessionsDir, entry.name);
-    const state = readYamlFile(file);
-    if (!state) continue;
-    let mtime = 0;
-    try {
-      mtime = fs.statSync(file).mtimeMs;
-    } catch {
-      mtime = 0;
-    }
-
-    const sessionId = String(state.session_id ?? entry.name.replace(/\.ya?ml$/i, ""));
-    if (manifest?.session_id && sessionId === String(manifest.session_id)) {
-      return state;
-    }
-
-    const history = Array.isArray(state.history) ? state.history : [];
-    const matchScore = history.reduce((count, item) => {
-      if (!item || typeof item !== "object") return count;
-      const stepId = String((item as Record<string, unknown>).step_id ?? "");
-      return frameLabels.has(stepId) ? count + 1 : count;
-    }, 0);
-
-    const timeScore =
-      targetTime > 0 ? -Math.abs(mtime - targetTime) : mtime;
-    const score = matchScore * 1_000_000_000_000 + timeScore;
-    if (!best || score > best.score) {
-      best = { state, score, mtime };
-    }
+  // Only open the session file that matches session_id. Scanning/parsing other
+  // multi-MB yaml sessions blocks the API event loop for tens of seconds.
+  const wantedId = manifest?.session_id ? String(manifest.session_id).trim() : "";
+  if (!wantedId) return null;
+  for (const ext of [".yaml", ".yml"]) {
+    const direct = path.join(sessionsDir, `${wantedId}${ext}`);
+    if (!fs.existsSync(direct)) continue;
+    const state = readYamlFile(direct);
+    if (state) return state;
   }
-
-  return best?.state ?? null;
+  return null;
 }
 
 function enrichSessionFromWebState(
@@ -271,6 +240,8 @@ function resolvePlaywrightSession(
     preferWeb?: boolean;
     runKind?: "ui_test" | "web_research" | "exploration";
     transcriptSavedAt?: string;
+    /** When false, skip scanning multi-MB web/sessions/*.yaml (history list). Default true. */
+    enrichWebState?: boolean;
   },
 ): SessionResolution {
   const webBase = "web-artifacts/playwright-session";
@@ -337,7 +308,12 @@ function resolvePlaywrightSession(
     chosen = { manifest: null, base: uiBase, source: "ui" };
   }
 
-  if (chosen.source === "web" && chosen.manifest && projectPath) {
+  if (
+    hints?.enrichWebState !== false &&
+    chosen.source === "web" &&
+    chosen.manifest &&
+    projectPath
+  ) {
     chosen = {
       ...chosen,
       manifest: enrichSessionFromWebState(
@@ -497,13 +473,18 @@ export type RunSummary = {
   sessionSource?: "web" | "ui";
 };
 
-export function readRunBundle(projectPath: string, runId: string) {
+export function readRunBundle(
+  projectPath: string,
+  runId: string,
+  options?: { light?: boolean },
+) {
+  const light = Boolean(options?.light);
   const root = runRoot(projectPath, runId);
   const report = readJsonFile<Record<string, unknown>>(path.join(root, "run-report.json"));
   const task = readJsonFile<Record<string, unknown>>(path.join(root, "task.json"));
   const explorationReportPath = path.join(root, "exploration-report.md");
   let pageReport = "";
-  if (fs.existsSync(explorationReportPath)) {
+  if (!light && fs.existsSync(explorationReportPath)) {
     try {
       pageReport = fs.readFileSync(explorationReportPath, "utf8");
     } catch {
@@ -522,12 +503,25 @@ export function readRunBundle(projectPath: string, runId: string) {
     preferWeb: transcriptPreferred || runKind === "web_research",
     runKind,
     transcriptSavedAt: collaborationTranscript?.savedAt,
+    // History cards only need frame counts — skip scanning every web/sessions/*.yaml.
+    enrichWebState: !light,
   });
   const structuredTask =
     (task?.structured_task as Record<string, unknown> | undefined) ??
     (report?.requested as Record<string, unknown> | undefined);
   const status = readJsonFile<Record<string, unknown>>(path.join(root, "status.json"));
-  const webCapture = readWebCapture(projectPath, runId);
+  const webCapture = light ? { capture: null, reviews: [] as Record<string, unknown>[] } : readWebCapture(projectPath, runId);
+  let playwrightSession = session.manifest;
+  if (light && playwrightSession && Array.isArray(playwrightSession.frames)) {
+    // Keep counts without shipping multi-MB frame payloads into the history mapper.
+    playwrightSession = {
+      ...playwrightSession,
+      frame_count:
+        Number(playwrightSession.frame_count) ||
+        (playwrightSession.frames as unknown[]).length,
+      frames: undefined,
+    };
+  }
   return {
     runId,
     root,
@@ -535,7 +529,7 @@ export function readRunBundle(projectPath: string, runId: string) {
     task,
     pageReport,
     structuredTask,
-    playwrightSession: session.manifest,
+    playwrightSession,
     sessionBase: session.base,
     sessionSource: session.source,
     status,
@@ -705,7 +699,7 @@ export function listRunHistory(
   const allIds = listRunIds(projectPath);
   const total = allIds.length;
   const pageIds = allIds.slice(offset, offset + limit);
-  const runs = pageIds.map((id) => summarizeRun(id, readRunBundle(projectPath, id)));
+  const runs = pageIds.map((id) => summarizeRun(id, readRunBundle(projectPath, id, { light: true })));
 
   return {
     runs,
@@ -743,7 +737,12 @@ export function readWebCapture(projectPath: string, runId = "current") {
     );
   }
   if (capture) {
-    capture = applySavedMapToCapture(projectPath, capture);
+    capture = attachScreenshotToCapture(
+      projectPath,
+      runId,
+      applySavedMapToCapture(projectPath, capture),
+    );
+    capture = attachVisualToCapture(projectPath, capture);
   }
   const reviewsPath = path.join(root, "web-capture", "reviews.jsonl");
   const reviews: Record<string, unknown>[] = [];
@@ -808,7 +807,11 @@ export function saveWebCaptureReview(
   }
 
   const updatedCapture = capture
-    ? attachVisualToCapture(projectPath, applySavedMapToCapture(projectPath, capture))
+    ? attachScreenshotToCapture(
+        projectPath,
+        String(runId),
+        attachVisualToCapture(projectPath, applySavedMapToCapture(projectPath, capture)),
+      )
     : null;
   if (updatedCapture) {
     const payload = JSON.stringify(updatedCapture, null, 2) + "\n";

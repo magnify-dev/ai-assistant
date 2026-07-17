@@ -31,10 +31,31 @@ import {
 } from "@/lib/webResearchTypes";
 import type { PhaseMap, RunEvent } from "@/types";
 import type { WebCapture, WebCaptureBuildStatus, WebCaptureElement, WebCaptureReview } from "@/lib/webCaptureTypes";
+import { WEB_CAPTURE_BUILDING_PHASES } from "@/lib/webCaptureTypes";
 import { buildUiDisplaySnapshot, isUiDebugEnabled, traceUiDisplay } from "@/lib/uiRunDebug";
 import { UiRunDebugPanel } from "@/components/UiRunDebugPanel";
 
 const BROWSER_PHASES = ["exploration", "ui_test", "web_research"] as const;
+
+function markCaptureBuildPendingMap(
+  setCaptureBuild: Dispatch<SetStateAction<WebCaptureBuildStatus | null>>,
+  event: { url?: string; ts?: string; screenshot_b64?: string },
+) {
+  if (!event.screenshot_b64) return;
+  setCaptureBuild((prev) => {
+    const shotTs = event.ts ?? new Date().toISOString();
+    if (prev && WEB_CAPTURE_BUILDING_PHASES.has(prev.phase)) {
+      return { ...prev, updatedAt: shotTs };
+    }
+    return {
+      phase: "geometry",
+      url: event.url ? String(event.url) : prev?.url,
+      message: "Screenshot updated · updating map…",
+      updatedAt: shotTs,
+      elementCount: prev?.elementCount,
+    };
+  });
+}
 
 function applyWebCaptureProgress(
   event: RunEvent & {
@@ -194,7 +215,7 @@ function applyStateFromServer(
     phase?: string;
     phases?: PhaseMap;
     events?: RunEvent[];
-    lastResult?: { overall_ok?: boolean };
+    lastResult?: { overall_ok?: boolean; goal_met?: boolean; partial?: boolean };
     browserState?: BrowserState;
     testTarget?: TestTarget;
     structuredTask?: StructuredTask;
@@ -211,7 +232,7 @@ function applyStateFromServer(
     setActivePhase: (v: string | undefined) => void;
     setPhases: (v: PhaseMap) => void;
     setEvents: (v: RunEvent[]) => void;
-    setLastResult: (v: { overall_ok?: boolean } | null) => void;
+    setLastResult: (v: { overall_ok?: boolean; goal_met?: boolean; partial?: boolean } | null) => void;
     setBrowserState?: (v: BrowserState | null) => void;
     setTestTarget?: (v: TestTarget | null) => void;
     setStructuredTask?: (v: StructuredTask | null) => void;
@@ -373,7 +394,11 @@ export default function App() {
   const [pullingOllamaModel, setPullingOllamaModel] = useState<string | null>(null);
   const [changingOllamaModel, setChangingOllamaModel] = useState(false);
   const [ollamaSwitch, setOllamaSwitch] = useState<OllamaSwitchUiState | null>(null);
-  const [lastResult, setLastResult] = useState<{ overall_ok?: boolean } | null>(null);
+  const [lastResult, setLastResult] = useState<{
+    overall_ok?: boolean;
+    goal_met?: boolean;
+    partial?: boolean;
+  } | null>(null);
   const [browserState, setBrowserState] = useState<BrowserState | null>(null);
   const [testTarget, setTestTarget] = useState<TestTarget | null>(null);
   const [structuredTask, setStructuredTask] = useState<StructuredTask | null>(null);
@@ -492,6 +517,24 @@ export default function App() {
       })
       .catch(() => {});
   }, [project]);
+
+  const applyOllamaFromResponse = useCallback((ollama?: OllamaStatus) => {
+    if (!ollama) return;
+    setOllamaStatus(ollama);
+    if (ollama.switch) setOllamaSwitch(ollama.switch);
+  }, []);
+
+  const refreshOllamaStatus = useCallback(async (): Promise<OllamaStatus | null> => {
+    try {
+      const res = await apiFetch("/api/ollama/status");
+      if (!res.ok) return null;
+      const body = (await res.json()) as { ollama?: OllamaStatus };
+      if (body.ollama) applyOllamaFromResponse(body.ollama);
+      return body.ollama ?? null;
+    } catch {
+      return null;
+    }
+  }, [applyOllamaFromResponse]);
 
   const refreshState = useCallback(() => {
     apiFetch("/api/state")
@@ -729,6 +772,15 @@ export default function App() {
   }, [project]);
 
   useEffect(() => {
+    if (running || startingRun || ollamaSwitch?.active) return;
+    void refreshOllamaStatus();
+    const timer = setInterval(() => {
+      void refreshOllamaStatus();
+    }, 15_000);
+    return () => clearInterval(timer);
+  }, [running, startingRun, ollamaSwitch?.active, refreshOllamaStatus]);
+
+  useEffect(() => {
     if (logRef.current) {
       logRef.current.scrollTop = logRef.current.scrollHeight;
     }
@@ -781,6 +833,7 @@ export default function App() {
       );
     }
     if (event.type === "browser_state" && event.url) {
+      const screenshotB64 = (event as { screenshot_b64?: string }).screenshot_b64;
       setBrowserState({
         url: event.url,
         title: event.title,
@@ -788,7 +841,7 @@ export default function App() {
         context: event.context,
         node_url: event.node_url,
         ts: event.ts,
-        screenshot_b64: (event as { screenshot_b64?: string }).screenshot_b64,
+        screenshot_b64: screenshotB64,
         error: (event as { error?: string }).error,
       });
       const capture = (event as RunEvent & { web_capture?: WebCapture }).web_capture;
@@ -800,6 +853,12 @@ export default function App() {
           elementCount: capture.elements?.length,
           message: "Map ready — inspect below",
           updatedAt: event.ts,
+        });
+      } else if (screenshotB64) {
+        markCaptureBuildPendingMap(setCaptureBuild, {
+          url: event.url,
+          ts: event.ts,
+          screenshot_b64: screenshotB64,
         });
       }
       if (String(event.context ?? "").startsWith("web_")) {
@@ -895,6 +954,12 @@ export default function App() {
             message: "Map ready — inspect below",
             updatedAt: event.ts,
           });
+        } else if (snapshot.screenshot_b64) {
+          markCaptureBuildPendingMap(setCaptureBuild, {
+            url: snapshot.url,
+            ts: event.ts,
+            screenshot_b64: snapshot.screenshot_b64,
+          });
         }
       }
       if (event.type === "web_research_progress" || event.type === "web_help_request") {
@@ -932,7 +997,6 @@ export default function App() {
       setLastResult(null);
     }
     if (event.type === "collaboration_done") {
-      if (startingRunRef.current) return;
       collabActiveRef.current = false;
       startingRunRef.current = false;
       setStartingRun(false);
@@ -954,6 +1018,7 @@ export default function App() {
       setRunning(false);
       runningRef.current = false;
       loadRunHistory();
+      void refreshOllamaStatus();
     }
     if (event.type === "run_cleared") {
       if (runningRef.current || collabActiveRef.current || startingRunRef.current) {
@@ -988,7 +1053,11 @@ export default function App() {
     }
     if (event.type === "done" && !collabActiveRef.current && !startingRunRef.current) {
       setRunning(false);
-      setLastResult({ overall_ok: (event as { overall_ok?: boolean }).overall_ok });
+      setLastResult({
+        overall_ok: (event as { overall_ok?: boolean }).overall_ok,
+        goal_met: (event as { goal_met?: boolean }).goal_met,
+        partial: (event as { partial?: boolean }).partial,
+      });
       loadRunHistory();
     }
     if (event.type === "process_exit" && !collabActiveRef.current && !startingRunRef.current) {
@@ -1024,7 +1093,7 @@ export default function App() {
         setPreloadingOllama(false);
       }
     }
-  }, [loadRunHistory]);
+  }, [loadRunHistory, refreshOllamaStatus]);
 
   useEffect(() => {
     let source: EventSource | null = null;
@@ -1056,8 +1125,8 @@ export default function App() {
     };
   }, [applyEvent, refreshState]);
 
-  const preloadOllama = async () => {
-    if (ollamaSwitch?.active) return;
+  const preloadOllama = async (): Promise<boolean> => {
+    if (ollamaSwitch?.active) return false;
     setPreloadingOllama(true);
     setOllamaSwitch({
       active: true,
@@ -1077,20 +1146,15 @@ export default function App() {
           error: body.error ?? "Ollama preload failed",
         });
         applyEvent({ type: "log", message: body.error ?? "Ollama preload failed", level: "error" });
-      } else {
-        applyOllamaFromResponse(body.ollama);
-        applyEvent({ type: "log", message: body.message ?? "Ollama model ready", level: "info" });
+        return false;
       }
+      applyOllamaFromResponse(body.ollama);
+      applyEvent({ type: "log", message: body.message ?? "Ollama model ready", level: "info" });
       refreshConfig();
+      return Boolean(body.ollama?.modelLoaded);
     } finally {
       setPreloadingOllama(false);
     }
-  };
-
-  const applyOllamaFromResponse = (ollama?: OllamaStatus) => {
-    if (!ollama) return;
-    setOllamaStatus(ollama);
-    if (ollama.switch) setOllamaSwitch(ollama.switch);
   };
 
   const changeOllamaModel = async (model: string, opts?: { forceSwitch?: boolean }) => {
@@ -1330,6 +1394,44 @@ export default function App() {
   const resumeFromRun = useCallback(
     async (runId: string, note?: string) => {
       if (!project.trim() || running) return;
+
+      const fresh = await refreshOllamaStatus();
+      if (fresh) {
+        if (!fresh.reachable) {
+          applyEvent({
+            type: "log",
+            message: `Ollama is not reachable at ${fresh.url}`,
+            level: "error",
+          });
+          return;
+        }
+        if (!fresh.modelAvailable) {
+          applyEvent({
+            type: "log",
+            message: `Model ${fresh.model} is not installed — download it before resuming`,
+            level: "error",
+          });
+          return;
+        }
+        if (!fresh.modelLoaded) {
+          applyEvent({
+            type: "log",
+            message: `Model ${fresh.model} is not in VRAM — loading before resume…`,
+            level: "info",
+          });
+          const loaded = await preloadOllama();
+          const after = await refreshOllamaStatus();
+          if (!loaded || !after?.modelLoaded) {
+            applyEvent({
+              type: "log",
+              message: "Could not load Ollama model into VRAM — use Preload model now, then retry",
+              level: "error",
+            });
+            return;
+          }
+        }
+      }
+
       startingRunRef.current = true;
       collabActiveRef.current = true;
       runningRef.current = true;
@@ -1366,6 +1468,8 @@ export default function App() {
           setAgentCards([]);
         } else {
           setInterveneNote("");
+          startingRunRef.current = false;
+          setStartingRun(false);
         }
       } catch (err) {
         applyEvent({
@@ -1391,6 +1495,8 @@ export default function App() {
       repoUrl,
       applyEvent,
       showRunView,
+      refreshOllamaStatus,
+      preloadOllama,
     ],
   );
 
@@ -1590,6 +1696,44 @@ export default function App() {
 
   const startRun = async () => {
     if (!project.trim()) return;
+
+    const fresh = await refreshOllamaStatus();
+    if (fresh) {
+      if (!fresh.reachable) {
+        applyEvent({
+          type: "log",
+          message: `Ollama is not reachable at ${fresh.url}`,
+          level: "error",
+        });
+        return;
+      }
+      if (!fresh.modelAvailable) {
+        applyEvent({
+          type: "log",
+          message: `Model ${fresh.model} is not installed — download it before running`,
+          level: "error",
+        });
+        return;
+      }
+      if (!fresh.modelLoaded) {
+        applyEvent({
+          type: "log",
+          message: `Model ${fresh.model} is not in VRAM — loading before run…`,
+          level: "info",
+        });
+        const loaded = await preloadOllama();
+        const after = await refreshOllamaStatus();
+        if (!loaded || !after?.modelLoaded) {
+          applyEvent({
+            type: "log",
+            message: "Could not load Ollama model into VRAM — use Preload model now, then retry",
+            level: "error",
+          });
+          return;
+        }
+      }
+    }
+
     traceUiDisplay(
       buildUiDisplaySnapshot({
         trigger: "run:click",
@@ -1666,7 +1810,10 @@ export default function App() {
         setRunning(false);
         setAgentCards([]);
         traceUi("run:start-failed", err.error ?? "Failed to start");
+        return;
       }
+      startingRunRef.current = false;
+      setStartingRun(false);
     } catch (err) {
       applyEvent({
         type: "log",
@@ -1826,7 +1973,7 @@ export default function App() {
             </div>
           ) : null}
           <div className="space-y-2 rounded-md border border-white/10 bg-black/20 p-3">
-            {!config?.hasCursorApiKey ? (
+            {config && !config.hasCursorApiKey ? (
               <p className="text-xs text-amber-300/90">
                 Set <code className="text-white/80">CURSOR_API_KEY</code> in ai-assistant/.env — needed when the local
                 agent escalates to the helper
@@ -1862,18 +2009,20 @@ export default function App() {
               >
                 {config?.cursorHelper?.ok ? (
                   <p>Local helper ready — Cursor app is running on this machine.</p>
+                ) : !config ? (
+                  <p>Checking helper readiness…</p>
                 ) : (
                   <ul className="space-y-1">
-                    {!config?.hasCursorApiKey ? (
+                    {!config.hasCursorApiKey ? (
                       <li>
                         Set <code className="text-white/90">CURSOR_API_KEY</code> in ai-assistant/.env
                       </li>
                     ) : null}
-                    {config?.cursorHelper?.errors.map((err) => (
+                    {config.cursorHelper?.errors.map((err) => (
                       <li key={err}>{err}</li>
                     ))}
-                    {!config?.cursorHelper ? (
-                      <li>Open this page after selecting a project to check helper readiness.</li>
+                    {!config.cursorHelper ? (
+                      <li>Select a project to check helper readiness.</li>
                     ) : null}
                   </ul>
                 )}
@@ -2135,6 +2284,7 @@ export default function App() {
                 lastAction={lastActionLine}
                 replayMode={replayMode}
                 latestReview={latestWebCaptureReview}
+                projectPath={project.trim() || undefined}
                 onReview={saveWebCaptureReview}
               />
             </section>

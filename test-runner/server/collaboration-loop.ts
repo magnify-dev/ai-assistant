@@ -1216,7 +1216,9 @@ export class CollaborationLoop extends EventEmitter {
         if (event.type === "done") {
           const err = String(event.error ?? "").trim();
           if (err) failedPhases.push(`error: ${err}`);
-          finish(Boolean(event.overall_ok));
+          const partial = Boolean(event.partial);
+          const goalMet = Boolean(event.goal_met);
+          finish(Boolean(event.overall_ok) || (partial && Boolean(result.answer) && !goalMet));
         }
         if (event.type === "process_exit") {
           if (this.cancelled) {

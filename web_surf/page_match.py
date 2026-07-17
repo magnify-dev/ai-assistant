@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -421,9 +422,8 @@ def _normalize_year(year: int) -> int:
     return year
 
 
-def parse_target_dates(query: str) -> list[tuple[int, int, int]]:
-    """Return (day, month, year) tuples explicitly mentioned in the user's query."""
-    goal = focus_query(query)
+def _extract_absolute_dates(blob: str) -> list[tuple[int, int, int]]:
+    """Return (day, month, year) tuples found in arbitrary text."""
     found: list[tuple[int, int, int]] = []
     seen: set[tuple[int, int, int]] = set()
 
@@ -435,7 +435,7 @@ def parse_target_dates(query: str) -> list[tuple[int, int, int]]:
             seen.add(normalized)
             found.append(normalized)
 
-    for match in _DATE_NUMERIC_RE.finditer(goal):
+    for match in _DATE_NUMERIC_RE.finditer(blob):
         first, second, year = int(match.group(1)), int(match.group(2)), int(match.group(3))
         if first > 12:
             add(first, second, year)
@@ -444,15 +444,92 @@ def parse_target_dates(query: str) -> list[tuple[int, int, int]]:
         else:
             add(first, second, year)
 
-    for match in _DATE_NAMED_RE.finditer(goal):
+    for match in _DATE_NAMED_RE.finditer(blob):
         month = _MONTH_TO_NUM[match.group(1).lower()]
         add(int(match.group(2)), month, int(match.group(3)))
 
-    for match in _DATE_NAMED_DAY_FIRST_RE.finditer(goal):
+    for match in _DATE_NAMED_DAY_FIRST_RE.finditer(blob):
         month = _MONTH_TO_NUM[match.group(2).lower()]
         add(int(match.group(1)), month, int(match.group(3)))
 
     return found
+
+
+def parse_target_dates(query: str) -> list[tuple[int, int, int]]:
+    """Return (day, month, year) tuples explicitly mentioned in the user's query."""
+    return _extract_absolute_dates(focus_query(query))
+
+
+_RELATIVE_AGO_RE = re.compile(
+    r"\b(\d+)\s+(minute|hour|day|week|month|year)s?\s+ago\b",
+    re.I,
+)
+_URL_DATE_RE = re.compile(r"/(\d{4})/(\d{1,2})(?:/(\d{1,2}))?(?:/|$|\?)")
+
+
+def parse_content_date(text: str, *, reference: date | None = None) -> date | None:
+    """Best-effort parse of a publication date from link labels, URLs, or snippets."""
+    blob = str(text or "").strip()
+    if not blob:
+        return None
+    ref = reference or datetime.now(timezone.utc).date()
+
+    if re.search(r"\b(?:just now|today)\b", blob, re.I):
+        return ref
+    if re.search(r"\byesterday\b", blob, re.I):
+        return ref - timedelta(days=1)
+
+    relative = _RELATIVE_AGO_RE.search(blob)
+    if relative:
+        amount = int(relative.group(1))
+        unit = relative.group(2).lower()
+        if unit.startswith("minute") or unit.startswith("hour"):
+            return ref
+        if unit.startswith("day"):
+            return ref - timedelta(days=amount)
+        if unit.startswith("week"):
+            return ref - timedelta(weeks=amount)
+        if unit.startswith("month"):
+            return ref - timedelta(days=min(amount * 30, 365 * 3))
+        if unit.startswith("year"):
+            return ref - timedelta(days=min(amount * 365, 365 * 10))
+
+    url_match = _URL_DATE_RE.search(blob)
+    if url_match:
+        year, month = int(url_match.group(1)), int(url_match.group(2))
+        day = int(url_match.group(3) or 1)
+        if 1 <= month <= 12 and 1 <= day <= 31 and 1990 <= year <= 2100:
+            return date(year, month, day)
+
+    absolute = _extract_absolute_dates(blob)
+    if absolute:
+        day, month, year = max(absolute, key=lambda item: (item[2], item[1], item[0]))
+        return date(year, month, day)
+    return None
+
+
+def newest_date_in_text(text: str, *, reference: date | None = None) -> date | None:
+    """Return the newest date mentioned anywhere in a page or listing blob."""
+    blob = str(text or "")
+    if not blob.strip():
+        return None
+    ref = reference or datetime.now(timezone.utc).date()
+    candidates: list[date] = []
+    for match in _RELATIVE_AGO_RE.finditer(blob):
+        parsed = parse_content_date(match.group(0), reference=ref)
+        if parsed:
+            candidates.append(parsed)
+    for day, month, year in _extract_absolute_dates(blob):
+        candidates.append(date(year, month, day))
+    if re.search(r"\b(?:just now|today)\b", blob, re.I):
+        candidates.append(ref)
+    if re.search(r"\byesterday\b", blob, re.I):
+        candidates.append(ref - timedelta(days=1))
+    for match in _URL_DATE_RE.finditer(blob):
+        parsed = parse_content_date(match.group(0), reference=ref)
+        if parsed:
+            candidates.append(parsed)
+    return max(candidates) if candidates else None
 
 
 def _date_match_patterns(day: int, month: int, year: int) -> list[re.Pattern[str]]:
@@ -479,6 +556,24 @@ def page_contains_target_date(text: str, query: str) -> bool:
     return False
 
 
+def _section_around_date_match(blob: str, match_start: int) -> str:
+    section_starts = [match.start() for match in _SECTION_HEADER_RE.finditer(blob)]
+    if not section_starts:
+        section_starts = [0]
+    start_index = 0
+    for section_start in section_starts:
+        if section_start <= match_start:
+            start_index = section_start
+        else:
+            break
+    end_index = len(blob)
+    for section_start in section_starts:
+        if section_start > match_start:
+            end_index = section_start
+            break
+    return blob[start_index:end_index].strip()
+
+
 def filter_text_by_date(text: str, query: str, *, max_chars: int = 8000) -> str:
     """Keep only the section that matches a target date when a page lists many dated entries."""
     blob = str(text or "").strip()
@@ -488,28 +583,13 @@ def filter_text_by_date(text: str, query: str, *, max_chars: int = 8000) -> str:
     if not targets:
         return blob[:max_chars]
 
-    section_starts = [match.start() for match in _SECTION_HEADER_RE.finditer(blob)]
-    if not section_starts:
-        section_starts = [0]
-
     best_section = ""
     for day, month, year in targets:
         for pattern in _date_match_patterns(day, month, year):
             match = pattern.search(blob)
             if not match:
                 continue
-            start_index = 0
-            for section_start in section_starts:
-                if section_start <= match.start():
-                    start_index = section_start
-                else:
-                    break
-            end_index = len(blob)
-            for section_start in section_starts:
-                if section_start > match.start():
-                    end_index = section_start
-                    break
-            section = blob[start_index:end_index].strip()
+            section = _section_around_date_match(blob, match.start())
             if len(section) > len(best_section):
                 best_section = section
             break
@@ -519,13 +599,217 @@ def filter_text_by_date(text: str, query: str, *, max_chars: int = 8000) -> str:
     return best_section[:max_chars]
 
 
+def filter_text_by_recency(text: str, query: str, *, max_chars: int = 8000) -> str:
+    """Keep only the newest dated section when the user asked for latest/recent content."""
+    blob = str(text or "").strip()
+    if not blob or not query_implies_recency(query):
+        return blob[:max_chars]
+
+    dated_positions: list[tuple[date, int]] = []
+    for day, month, year in _extract_absolute_dates(blob):
+        parsed = date(year, month, day)
+        for pattern in _date_match_patterns(day, month, year):
+            match = pattern.search(blob)
+            if match:
+                dated_positions.append((parsed, match.start()))
+                break
+
+    if not dated_positions:
+        return blob[:max_chars]
+
+    dated_positions.sort(key=lambda row: row[1])
+    newest_date = max(row[0] for row in dated_positions)
+    anchor_pos = next(pos for when, pos in dated_positions if when == newest_date)
+
+    para_start = blob.rfind(". ", 0, anchor_pos)
+    start = para_start + 2 if para_start >= 0 else max(0, anchor_pos - 48)
+
+    end = len(blob)
+    for _when, pos in dated_positions:
+        if pos > anchor_pos:
+            end = pos
+            break
+
+    section = blob[start:end].strip()
+    if len(section) >= 80:
+        return section[:max_chars]
+    return blob[:max_chars]
+
+
 def page_text_for_goal(text: str, query: str, *, max_chars: int = 12000) -> str:
-    """Prefer a date-filtered slice when the goal names a specific date."""
+    """Prefer a date-filtered slice when the goal names a specific date or newest content."""
     if parse_target_dates(query):
         filtered = filter_text_by_date(text, query, max_chars=max_chars)
         if len(filtered) >= 120:
             return filtered
+    if query_implies_recency(query):
+        filtered = filter_text_by_recency(text, query, max_chars=max_chars)
+        if len(filtered) >= 120:
+            return filtered
     return str(text or "")[:max_chars]
+
+
+_RECENCY_RE = re.compile(
+    r"\b("
+    r"latest|newest|most recent|recent|"
+    r"today|yesterday|this week|this month|"
+    r"breaking|just (?:announced|released|updated|posted)|"
+    r"up[- ]to[- ]date|current|what'?s new"
+    r")\b",
+    re.I,
+)
+_LISTING_PATH_RE = re.compile(r"/(news|updates?|blog|articles?)(?:/|$|\?)", re.I)
+_NAV_SHELL_MARKERS = (
+    "log in",
+    "sign in",
+    "cookie",
+    "skip to",
+    "subscribe",
+    "trending topics",
+    "create account",
+    "register",
+)
+
+
+def query_implies_recency(query: str) -> bool:
+    return bool(_RECENCY_RE.search(focus_query(query)))
+
+
+def should_apply_date_filter(query: str) -> bool:
+    """True when collected page text should be clipped to a target or newest dated section."""
+    focused = focus_query(query)
+    return bool(parse_target_dates(focused) or query_implies_recency(focused))
+
+
+def is_content_listing_url(url: str) -> bool:
+    return bool(_LISTING_PATH_RE.search(urlsplit(str(url or "")).path.lower()))
+
+
+def snapshot_viewport(snapshot: dict[str, Any]) -> dict[str, float]:
+    vp = snapshot.get("viewport") if isinstance(snapshot.get("viewport"), dict) else {}
+    width = float(vp.get("width") or 1280)
+    height = float(vp.get("height") or 720)
+    return {
+        "width": width,
+        "height": height,
+        "scroll_x": float(vp.get("scroll_x") or 0),
+        "scroll_y": float(vp.get("scroll_y") or 0),
+        "document_width": float(vp.get("document_width") or width),
+        "document_height": float(vp.get("document_height") or height),
+    }
+
+
+def viewport_has_content_below(snapshot: dict[str, Any], *, threshold: float = 0.12) -> bool:
+    vp = snapshot_viewport(snapshot)
+    bottom = vp["scroll_y"] + vp["height"]
+    return bottom < vp["document_height"] - vp["height"] * threshold
+
+
+def page_extends_beyond_viewport(snapshot: dict[str, Any], *, ratio: float = 1.25) -> bool:
+    vp = snapshot_viewport(snapshot)
+    return vp["document_height"] > vp["height"] * ratio
+
+
+def viewport_explored_fraction(snapshot: dict[str, Any]) -> float:
+    vp = snapshot_viewport(snapshot)
+    if vp["document_height"] <= vp["height"]:
+        return 1.0
+    visible_bottom = min(vp["scroll_y"] + vp["height"], vp["document_height"])
+    return visible_bottom / max(vp["document_height"], 1.0)
+
+
+def page_looks_like_nav_shell(text: str, query: str) -> bool:
+    """True when visible text is mostly site chrome, not article content."""
+    scoped = page_text_for_goal(text, query, max_chars=4000)
+    if page_has_substantive_content(scoped, query):
+        return False
+    blob = scoped.lower()
+    nav_hits = sum(1 for marker in _NAV_SHELL_MARKERS if marker in blob)
+    return nav_hits >= 2
+
+
+def should_defer_collect_on_listing(snapshot: dict[str, Any], query: str) -> bool:
+    """Defer auto-collect when a listing page still needs scrolling or a deeper article link."""
+    url = str(snapshot.get("url") or "")
+    visible = str(snapshot.get("visible_text") or "")
+    recency = query_implies_recency(query)
+    listing = is_content_listing_url(url)
+    if not recency and not listing:
+        return False
+    if listing and (
+        page_looks_like_nav_shell(visible, query)
+        or page_has_goal_links(snapshot, query, min_score=4)
+    ):
+        return True
+    if recency and page_extends_beyond_viewport(snapshot) and page_looks_like_nav_shell(visible, query):
+        return True
+    if recency and listing and not page_has_substantive_content(page_text_for_goal(visible, query), query):
+        return page_has_goal_links(snapshot, query, min_score=4)
+    return False
+
+
+def score_content_link(el: dict[str, Any], query: str, *, dom_index: int = 0) -> int:
+    href = str(el.get("href") or "").lower()
+    label = " ".join(
+        str(el.get(key) or "")
+        for key in ("text", "aria", "label", "nearby_text")
+    ).strip()
+    blob = f"{label} {href}".lower()
+    score = score_interactable(el, query)
+    path = urlsplit(href).path
+    score += sum(3 for hint in _CONTENT_PATH_HINTS if hint in path)
+    if re.search(r"\b(patch notes|changelog|release notes|updates?|what's new|whats new)\b", blob, re.I):
+        score += 12
+    parsed_date = parse_content_date(f"{label} {href}")
+    if parsed_date:
+        score += parsed_date.toordinal()
+    elif query_implies_recency(query):
+        # Listing pages usually show newest items first when dates are absent.
+        score += max(0, 24 - min(dom_index, 24))
+    return score
+
+
+def suggest_content_link_action(
+    snapshot: dict[str, Any],
+    query: str,
+    *,
+    min_score: int = 6,
+) -> dict[str, Any] | None:
+    """Click the top news/article link when browsing a listing page for latest content."""
+    url = str(snapshot.get("url") or "")
+    if not (is_content_listing_url(url) or query_implies_recency(query)):
+        return None
+    best: dict[str, Any] | None = None
+    best_score = 0
+    current_path = urlsplit(url).path.rstrip("/")
+    for dom_index, raw in enumerate(snapshot.get("interactables") or []):
+        if not isinstance(raw, dict) or raw.get("disabled") or not raw.get("id"):
+            continue
+        kind = str(raw.get("kind") or "").lower()
+        if kind not in {"link", "button", "menuitem", "blz-button"}:
+            continue
+        href = str(raw.get("href") or "").strip()
+        if not href:
+            continue
+        href_path = urlsplit(href).path.rstrip("/")
+        if href_path == current_path:
+            continue
+        if not any(hint in href_path for hint in _CONTENT_PATH_HINTS):
+            continue
+        score = score_content_link(raw, query, dom_index=dom_index)
+        if score > best_score:
+            best_score = score
+            best = raw
+    if best and best_score >= min_score:
+        label = str(best.get("text") or best.get("aria") or "")[:60]
+        published = parse_content_date(f"{label} {best.get('href') or ''}")
+        date_note = f" dated {published.isoformat()}" if published else ""
+        return {
+            "action": "click",
+            "target_id": str(best["id"]),
+            "reason": f"Open the newest relevant article link ({label}{date_note})",
+        }
+    return None
 
 
 _DETAIL_MARKERS = (
@@ -554,6 +838,9 @@ def page_has_substantive_content(text: str, query: str) -> bool:
     detail_hits = sum(1 for marker in _DETAIL_MARKERS if marker in blob)
     bullet_count = len(_BULLET_RE.findall(scoped))
     fixed_hits = scoped.count("Fixed") + scoped.count("fixed")
+    nav_hits = sum(1 for marker in _NAV_SHELL_MARKERS if marker in blob)
+    if nav_hits >= 2 and detail_hits < 1 and bullet_count < 2 and fixed_hits < 2:
+        return False
     if detail_hits >= 2 or bullet_count >= 3 or fixed_hits >= 2:
         return True
     if len(blob) >= 500 and detail_hits >= 1:
@@ -607,6 +894,8 @@ def goal_is_satisfied(
         if is_secondary_host(source_url):
             return page_has_substantive_content(text, query)
         if is_publisher_content_url(source_url):
+            if is_content_listing_url(source_url):
+                return page_has_substantive_content(text, query)
             return True
         return page_has_substantive_content(text, query)
     routes = publisher_routes or set()

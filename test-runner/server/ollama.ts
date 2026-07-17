@@ -237,6 +237,24 @@ async function preloadWithProgress(
   }
 }
 
+/** Verify Ollama is reachable and the configured model is loaded into VRAM. */
+export async function ensureOllamaReadyForRun(
+  cfg: OllamaConfig,
+  onProgress: (progress: OllamaSwitchProgress) => void,
+): Promise<void> {
+  const status = await fetchOllamaStatus(cfg);
+  if (!status.reachable) {
+    throw new Error(`Ollama is not reachable at ${cfg.url}`);
+  }
+  if (!status.modelAvailable) {
+    throw new Error(`Model ${cfg.model} is not installed`);
+  }
+  if (status.modelLoaded) {
+    return;
+  }
+  await switchOllamaModel(cfg.model, onProgress);
+}
+
 export async function switchOllamaModel(
   newModel: string,
   onProgress: (progress: OllamaSwitchProgress) => void,

@@ -11,7 +11,7 @@ from web_surf import events as web_events
 from web_surf.config import default_config
 from web_surf.llm import get_trace, ollama_chat, reset_trace
 from web_surf.extract import extract_facts_from_page
-from web_surf.fetch import PageResult, fetch_page_tier1
+from web_surf.fetch import PageResult, fetch_page_tier1, is_js_shell_text
 from web_surf.page_match import (
     focus_query,
     parse_user_preferred_domains,
@@ -21,9 +21,10 @@ from web_surf.page_match import (
 )
 from web_surf.spec import classify_search_sources
 from web_surf.search import SearchResult, web_search
-from web_surf.spec import fallback_research_spec, structure_research_spec
+from web_surf.spec import fallback_research_spec, structure_research_spec, wants_verbatim_copy
 from web_surf.store import (
     cache_page_markdown,
+    facts_for_query,
     facts_summary_for_agent,
     index_summary_for_agent,
     load_facts,
@@ -215,23 +216,90 @@ def _synthesize_answer(
     from web_surf.spec import _get_prompt
 
     question = focus_query(query)
+    scoped_index = index
+    scoped_facts = {"facts": facts_for_query(facts_doc, question, max_facts=30)}
+    copy_mode = wants_verbatim_copy(query)
+    prompt_key = "web_research.answer_copy" if copy_mode else "web_research.answer"
     user = (
         f"question: {question}\n"
-        f"pages:\n{index_summary_for_agent(index, max_pages=12)}\n"
-        f"facts:\n{facts_summary_for_agent(facts_doc, query=question, max_facts=20)}"
+        f"pages:\n{index_summary_for_agent(scoped_index, query=question, max_pages=12)}\n"
+        f"facts:\n{facts_summary_for_agent(scoped_facts, query=question, max_facts=20)}"
     )
     try:
         return ollama_chat(
-            prompt_key="web_research.answer",
+            prompt_key=prompt_key,
             ollama_url=ollama_url,
             model=model,
             timeout_sec=timeout_sec,
-            system=_get_prompt("web_research.answer"),
+            system=_get_prompt(prompt_key),
             user=user,
         ).strip()
     except Exception as exc:
         logger.warning("Answer synthesis failed: %s", exc)
-        return facts_summary_for_agent(facts_doc, query=query)
+        return facts_summary_for_agent(scoped_facts, query=question)
+
+
+def _ingest_counts_as_fetch(page: PageResult, *, added: int) -> bool:
+    if not page.ok:
+        return False
+    if added > 0:
+        return True
+    return len(page.text.strip()) >= 200 and not is_js_shell_text(page.text)
+
+
+def _browser_retry_js_shell(
+    *,
+    row: Any,
+    query: str,
+    project_path: Path,
+    spec: dict[str, Any],
+    cfg: dict[str, Any],
+    emit_events: bool,
+    publisher_domains: set[str],
+    publishers: list[str],
+    steps_used: int,
+    max_steps_total: int,
+) -> tuple[PageResult | None, int]:
+    """Try Playwright when HTTP only returned a JS-required shell."""
+    tier_pages, _, _, metadata, steps_used = _explore_candidate_tier(
+        tier_name="browser_retry",
+        candidates=[row],
+        query=query.strip(),
+        project_path=project_path,
+        page_budget=1,
+        pages_fetched=0,
+        max_steps_total=max_steps_total,
+        steps_used=steps_used,
+        spec=spec,
+        cfg=cfg,
+        emit_events=emit_events,
+        publisher_domains=publisher_domains,
+        publishers=publishers,
+    )
+    page = tier_pages[0] if tier_pages else None
+    if page and page.ok:
+        from web_surf import events as web_events
+
+        if emit_events:
+            web_events.log(f"Browser fetch succeeded for {row.url}", level="info")
+    return page, steps_used
+
+
+def _infer_goal_met(
+    *,
+    query: str,
+    facts_doc: dict[str, Any],
+    pages_fetched: int,
+    facts_added: int,
+    answer: str,
+    browser_goal_met: bool,
+) -> bool:
+    if browser_goal_met:
+        return True
+    if pages_fetched <= 0 or facts_added <= 0 or not answer.strip():
+        return False
+    matching = facts_for_query(facts_doc, query, max_facts=50)
+    return len(matching) >= 2
 
 
 def _result_payload(result: WebResearchResult, index: dict[str, Any], facts_doc: dict[str, Any]) -> dict[str, Any]:
@@ -516,16 +584,17 @@ def run_web_research(
             cfg,
             emit_events,
         )
-        pages_fetched += 1
-        facts_added += added
-        visited_urls.add(browser_page.url)
+        if _ingest_counts_as_fetch(browser_page, added=added):
+            pages_fetched += 1
+            facts_added += added
+            visited_urls.add(browser_page.url)
 
     fetch_tiers = [
         ("official", official_candidates),
         ("secondary", secondary_candidates),
     ]
     for tier_name, tier_rows in fetch_tiers:
-        if browser_completed or result.goal_met:
+        if result.goal_met:
             break
         if not tier_rows:
             continue
@@ -548,6 +617,38 @@ def run_web_research(
                 timeout_sec=float(cfg["fetch_timeout_sec"]),
                 max_chars=int(cfg["content_max_chars"]),
             )
+            if (
+                not page.ok
+                and use_llm
+                and "browser fetch required" in str(page.error or "").lower()
+            ):
+                if emit_events:
+                    web_events.log(
+                        f"HTTP fetch got JS shell for {row.url} — retrying in browser",
+                        level="warn",
+                    )
+                page, steps_used = _browser_retry_js_shell(
+                    row=row,
+                    query=query.strip(),
+                    project_path=project_path,
+                    spec=spec,
+                    cfg=cfg,
+                    emit_events=emit_events,
+                    publisher_domains=publisher_domains,
+                    publishers=publishers,
+                    steps_used=steps_used,
+                    max_steps_total=max_steps_total,
+                )
+                if not page:
+                    page = PageResult(
+                        url=row.url,
+                        title="",
+                        text="",
+                        markdown="",
+                        content_hash="",
+                        fetch_tier=2,
+                        error="JavaScript-rendered page — browser fetch required",
+                    )
             if not page.ok:
                 err = f"{row.url}: {page.error or 'fetch failed'}"
                 result.errors.append(err)
@@ -567,8 +668,10 @@ def run_web_research(
                 cfg,
                 emit_events,
             )
-            pages_fetched += 1
-            facts_added += added
+            if _ingest_counts_as_fetch(page, added=added):
+                pages_fetched += 1
+                facts_added += added
+                visited_urls.add(page.url)
 
     save_index(project_path, index)
     save_facts(project_path, facts_doc)
@@ -605,19 +708,42 @@ def run_web_research(
             timeout_sec=float(cfg["ollama_timeout_sec"]),
         )
     elif facts_doc.get("facts"):
-        result.answer = facts_summary_for_agent(facts_doc, query=query)
+        result.answer = facts_summary_for_agent(
+            {"facts": facts_for_query(facts_doc, query, max_facts=20)},
+            query=query,
+        )
     else:
         result.answer = "Fetched pages but extracted no verified facts. Try a more specific query."
 
+    result.goal_met = _infer_goal_met(
+        query=query.strip(),
+        facts_doc=facts_doc,
+        pages_fetched=pages_fetched,
+        facts_added=facts_added,
+        answer=result.answer,
+        browser_goal_met=result.goal_met,
+    )
+
     if emit_events:
-        ok = result.goal_met or pages_fetched > 0 or facts_added > 0
+        partial = (
+            not result.goal_met
+            and (pages_fetched > 0 or facts_added > 0)
+            and bool(result.answer.strip())
+        )
+        ok = result.goal_met
         web_events.web_result_event(_result_payload(result, index, facts_doc))
         web_events.phase_done(
             "web_research",
-            ok=ok,
-            message=f"{pages_fetched} page(s), {facts_added} fact(s)",
+            ok=ok or partial,
+            message=f"{pages_fetched} page(s), {facts_added} fact(s)"
+            + ("" if result.goal_met else " · goal not fully met"),
         )
-        web_events.finish(overall_ok=ok, error="" if ok else result.answer)
+        web_events.finish(
+            overall_ok=ok or partial,
+            goal_met=result.goal_met,
+            partial=partial,
+            error="" if (ok or partial) else result.answer,
+        )
         web_events.set_running(False)
 
     save_run_state(

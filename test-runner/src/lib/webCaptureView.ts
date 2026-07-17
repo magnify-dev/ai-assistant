@@ -2,6 +2,23 @@ import type { WebCapture, WebCaptureElement } from "./webCaptureTypes";
 
 export type WebCaptureFilter = "all" | "kept" | "rejected" | "saved" | "problems";
 
+export function captureUsesDocumentCoords(capture: WebCapture): boolean {
+  const map = capture.scroll_map;
+  if (!map) return false;
+  if (map.coords === "document" || map.stitched) return true;
+  return (map.slice_count ?? 0) > 1;
+}
+
+export function captureCanvasHeight(capture: WebCapture): number {
+  const map = capture.scroll_map;
+  // Stitched maps use document-space rects against explored canvas height.
+  if (map && captureUsesDocumentCoords(capture) && map.canvas_height > 0) {
+    return map.canvas_height;
+  }
+  // Single viewport slices keep viewport-space rects — never stretch to document_height.
+  return Math.max(1, capture.viewport.height);
+}
+
 export function effectiveInteractive(element: WebCaptureElement): boolean | null {
   if (element.user_interactive != null) return element.user_interactive;
   if (element.ai_interactive != null) return element.ai_interactive;
@@ -31,7 +48,7 @@ export function filterCaptureElements(
 
 export function captureBoxStyle(element: WebCaptureElement, capture: WebCapture) {
   const width = Math.max(1, capture.viewport.width);
-  const height = Math.max(1, capture.viewport.height);
+  const height = Math.max(1, captureCanvasHeight(capture));
   return {
     left: `${(element.rect.x / width) * 100}%`,
     top: `${(element.rect.y / height) * 100}%`,

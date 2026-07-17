@@ -13,6 +13,23 @@ logger = logging.getLogger(__name__)
 
 USER_AGENT = "JarvisWebResearch/1.0 (+local research agent)"
 
+_JS_SHELL_MARKERS = (
+    "please enable javascript",
+    "this site makes extensive use of javascript",
+    "javascript is required",
+    "javascript must be enabled",
+    "enable javascript to view",
+)
+
+
+def is_js_shell_text(text: str) -> bool:
+    """True when extracted body is a JS-required placeholder, not real page content."""
+    blob = " ".join(str(text or "").lower().split())
+    if not blob or len(blob) > 600:
+        return False
+    hits = sum(1 for marker in _JS_SHELL_MARKERS if marker in blob)
+    return hits >= 1 and len(blob) < 450
+
 
 @dataclass
 class PageResult:
@@ -108,6 +125,17 @@ def fetch_page_tier1(
             content_hash="",
             fetch_tier=1,
             error="No readable content extracted",
+        )
+
+    if is_js_shell_text(body):
+        return PageResult(
+            url=safe_url,
+            title=str(getattr(metadata, "title", "") or "").strip(),
+            text="",
+            markdown="",
+            content_hash="",
+            fetch_tier=1,
+            error="JavaScript-rendered page — browser fetch required",
         )
 
     clipped = body[:max_chars]

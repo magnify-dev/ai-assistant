@@ -313,6 +313,143 @@ class PageMatchTests(unittest.TestCase):
             )
         )
 
+    def test_listing_url_requires_substantive_content_not_nav_shell(self) -> None:
+        from web_surf.page_match import goal_is_satisfied, should_defer_collect_on_listing
+
+        nav_shell = (
+            "WOW RETAIL CLASSIC TBC MISTS LOG IN WITH BATTLE.NET "
+            "PHASE 5 TRENDING TOPICS CREATE ACCOUNT "
+            "Mists of Pandaria Classic news and updates "
+        ) * 8
+        query = "go to wowhead and find wow mists of pandaria latest news"
+        snapshot = {
+            "url": "https://www.wowhead.com/mop-classic/news",
+            "visible_text": nav_shell,
+            "viewport": {
+                "width": 1280,
+                "height": 720,
+                "scroll_x": 0,
+                "scroll_y": 0,
+                "document_width": 1280,
+                "document_height": 7263,
+            },
+            "interactables": [
+                {
+                    "id": "el_news_1",
+                    "kind": "link",
+                    "text": "MoP Classic Phase 5 Now Live",
+                    "href": "https://www.wowhead.com/mop-classic/news/phase-5-live",
+                    "disabled": False,
+                }
+            ],
+        }
+        self.assertFalse(
+            goal_is_satisfied(
+                nav_shell,
+                query,
+                source_url=snapshot["url"],
+                preferred_domains={"wowhead.com"},
+            )
+        )
+        self.assertTrue(should_defer_collect_on_listing(snapshot, query))
+
+    def test_viewport_helpers_detect_unexplored_long_page(self) -> None:
+        from web_surf.page_match import (
+            page_extends_beyond_viewport,
+            viewport_has_content_below,
+            viewport_explored_fraction,
+        )
+
+        snapshot = {
+            "viewport": {
+                "width": 1280,
+                "height": 720,
+                "scroll_x": 0,
+                "scroll_y": 0,
+                "document_width": 1280,
+                "document_height": 7263,
+            }
+        }
+        self.assertTrue(page_extends_beyond_viewport(snapshot))
+        self.assertTrue(viewport_has_content_below(snapshot))
+        self.assertLess(viewport_explored_fraction(snapshot), 0.2)
+
+    def test_suggest_content_link_action_picks_article_on_listing(self) -> None:
+        from web_surf.page_match import suggest_content_link_action
+
+        snapshot = {
+            "url": "https://www.wowhead.com/mop-classic/news",
+            "interactables": [
+                {
+                    "id": "el_home",
+                    "kind": "link",
+                    "text": "Home",
+                    "href": "https://www.wowhead.com/",
+                    "disabled": False,
+                },
+                {
+                    "id": "el_article",
+                    "kind": "link",
+                    "text": "MoP Classic Phase 5 Now Live",
+                    "href": "https://www.wowhead.com/mop-classic/news/phase-5-live",
+                    "disabled": False,
+                },
+            ],
+        }
+        action = suggest_content_link_action(
+            snapshot,
+            "wow mists of pandaria latest news",
+        )
+        self.assertIsNotNone(action)
+        assert action is not None
+        self.assertEqual(action["target_id"], "el_article")
+        self.assertEqual(action["action"], "click")
+
+    def test_suggest_content_link_prefers_newer_dated_article(self) -> None:
+        from web_surf.page_match import suggest_content_link_action
+
+        snapshot = {
+            "url": "https://www.example.com/news",
+            "interactables": [
+                {
+                    "id": "el_old",
+                    "kind": "link",
+                    "text": "Season 8 recap",
+                    "href": "https://www.example.com/news/season-8-recap-june-1-2025",
+                    "disabled": False,
+                },
+                {
+                    "id": "el_new",
+                    "kind": "link",
+                    "text": "Season 9 launch July 15, 2026",
+                    "href": "https://www.example.com/news/season-9-launch",
+                    "disabled": False,
+                },
+            ],
+        }
+        action = suggest_content_link_action(snapshot, "find the most recent news")
+        self.assertIsNotNone(action)
+        assert action is not None
+        self.assertEqual(action["target_id"], "el_new")
+
+    def test_filter_text_by_recency_keeps_newest_section(self) -> None:
+        from web_surf.page_match import filter_text_by_recency
+
+        text = (
+            "Season 8 recap June 1, 2025. Older balance changes and bug fixes from last season. "
+            "Season 9 launch July 15, 2026. New raid opens today with fresh rewards and quests."
+        )
+        filtered = filter_text_by_recency(text, "most recent news")
+        self.assertIn("July 15, 2026", filtered)
+        self.assertNotIn("June 1, 2025", filtered)
+
+    def test_query_implies_recency_detects_temporal_phrases(self) -> None:
+        from web_surf.page_match import query_implies_recency
+
+        self.assertTrue(query_implies_recency("find the most recent news"))
+        self.assertTrue(query_implies_recency("what's new today"))
+        self.assertFalse(query_implies_recency("find patch notes for 14.7.2026"))
+
 
 class ExtractTests(unittest.TestCase):
     def test_quote_supported_exact_and_partial(self) -> None:

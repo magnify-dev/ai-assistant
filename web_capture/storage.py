@@ -18,6 +18,22 @@ def project_capture_dir(project: Path) -> Path:
     return project / ".agent" / "web-capture"
 
 
+def _copy_screenshot_to_run(project: Path, session_dir: Path, capture: dict[str, Any]) -> None:
+    rel = str(capture.get("screenshot") or "").strip()
+    if not rel:
+        return
+    source = project / ".agent" / "web-capture" / rel
+    if not source.is_file():
+        return
+    target_dir = capture_dir_for_session(session_dir) / "screenshots"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / source.name
+    try:
+        target.write_bytes(source.read_bytes())
+    except OSError:
+        pass
+
+
 def persist_capture(session_dir: Path, capture: dict[str, Any]) -> Path:
     target_dir = capture_dir_for_session(session_dir)
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -45,6 +61,7 @@ def persist_capture(session_dir: Path, capture: dict[str, Any]) -> Path:
         project_raw_tmp = project_raw / f"{capture_id}.json.tmp"
         project_raw_tmp.write_text(payload, encoding="utf-8")
         project_raw_tmp.replace(project_raw / f"{capture_id}.json")
+        _copy_screenshot_to_run(project, session_dir, capture)
         append_training_record(
             project,
             {
@@ -55,6 +72,7 @@ def persist_capture(session_dir: Path, capture: dict[str, Any]) -> Path:
                 "summary": capture.get("summary"),
                 "map": capture.get("map"),
                 "ai": capture.get("ai"),
+                "screenshot": capture.get("screenshot"),
             },
         )
     return target_dir / f"{capture_id}.json"

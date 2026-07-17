@@ -1123,6 +1123,7 @@ def attach_web_capture(
         from web_capture.context import get_active_project
         from web_capture.locators import validate_capture_locators
         from web_capture.maps import apply_site_map, sync_interactables_from_capture
+        from web_capture.screenshots import attach_screenshot_to_capture, persist_screenshot
         from web_capture.visual import collect_visual_tiles, resolve_visual_map
 
         _progress("geometry")
@@ -1147,6 +1148,17 @@ def attach_web_capture(
             elements=list(capture.get("elements") or []),
             fresh_tiles=fresh_tiles,
         )
+        screenshot_b64 = state.get("screenshot_b64")
+        if isinstance(screenshot_b64, str) and screenshot_b64.strip():
+            screenshot_rel = persist_screenshot(
+                project,
+                url,
+                screenshot_b64,
+                capture_id=str(capture.get("capture_id") or ""),
+            )
+            if screenshot_rel:
+                capture["screenshot"] = screenshot_rel
+        attach_screenshot_to_capture(capture, project)
         sync_interactables_from_capture(state, capture)
         state["web_capture"] = capture
         _progress("complete", capture=capture)
@@ -1154,6 +1166,32 @@ def attach_web_capture(
         state["web_capture_error"] = str(exc)[:300]
         _progress("error", error=str(exc)[:300])
     return state
+
+
+def emit_browser_state_event(
+    state: dict[str, Any],
+    *,
+    context: str = "",
+    node_url: str = "",
+    error: str = "",
+    web_capture: dict[str, Any] | None = None,
+) -> None:
+    """Push browser_state to the test-runner UI (screenshot may arrive before map rebuild)."""
+    try:
+        from ui_test.events import browser_state_event
+
+        browser_state_event(
+            url=state["url"],
+            title=state.get("title") or "",
+            interactables=list(state.get("interactables") or []),
+            context=context,
+            node_url=node_url,
+            screenshot_b64=state.get("screenshot_b64"),
+            error=error or None,
+            web_capture=web_capture if web_capture is not None else state.get("web_capture"),
+        )
+    except ImportError:
+        pass
 
 
 def emit_page_state(
@@ -1166,22 +1204,11 @@ def emit_page_state(
 ) -> dict[str, Any]:
     """Collect and emit browser_state event for the test-runner UI."""
     state = collect_page_state(page, include_screenshot=include_screenshot)
+    # Refresh the live screenshot immediately; map rebuild (AI analyze, visual tiles) can take seconds.
+    if include_screenshot and state.get("screenshot_b64"):
+        emit_browser_state_event(state, context=context, node_url=node_url, error=error, web_capture=None)
     attach_web_capture(page, state, context=context, analyze=True)
-    try:
-        from ui_test.events import browser_state_event
-
-        browser_state_event(
-            url=state["url"],
-            title=state["title"],
-            interactables=state["interactables"],
-            context=context,
-            node_url=node_url,
-            screenshot_b64=state.get("screenshot_b64"),
-            error=error or None,
-            web_capture=state.get("web_capture"),
-        )
-    except ImportError:
-        pass
+    emit_browser_state_event(state, context=context, node_url=node_url, error=error)
     try:
         from ui_test.playwright_session import notify_page_state
 

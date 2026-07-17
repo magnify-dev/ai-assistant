@@ -24,7 +24,7 @@ type Props = {
   testTarget: TestTarget | null;
   running: boolean;
   projectPath: string;
-  lastResult?: { overall_ok?: boolean } | null;
+  lastResult?: { overall_ok?: boolean; goal_met?: boolean; partial?: boolean } | null;
   testTargetMode: "local" | "deployed";
   skipDeploy: boolean;
   hasTask: boolean;
@@ -256,11 +256,23 @@ export function RunProgressPanel({
 
   const overallStatus: ProgressStatus = running
     ? "running"
-    : lastResult?.overall_ok
+    : lastResult?.goal_met || lastResult?.overall_ok
       ? "done"
       : lastResult
         ? "failed"
         : "idle";
+
+  const statusLabel = running
+    ? "running"
+    : lastResult?.goal_met
+      ? "pass"
+      : lastResult?.partial
+        ? "partial"
+        : lastResult?.overall_ok
+          ? "pass"
+          : lastResult
+            ? "fail"
+            : "…";
 
   const siteChanges = runReport?.site_map_changes as
     | { new_pages?: string[]; updated_pages?: { path: string; new_elements: number }[]; new_elements?: number }
@@ -279,10 +291,11 @@ export function RunProgressPanel({
             overallStatus === "running" && "bg-sky-500/20 text-sky-200",
             overallStatus === "done" && "bg-green-500/20 text-green-200",
             overallStatus === "failed" && "bg-red-500/20 text-red-200",
+            lastResult?.partial && !running && "bg-amber-500/20 text-amber-200",
             overallStatus === "idle" && "bg-white/10 text-white/50",
           )}
         >
-          {running ? "running" : lastResult?.overall_ok ? "pass" : lastResult ? "fail" : "…"}
+          {statusLabel}
         </span>
       </div>
 

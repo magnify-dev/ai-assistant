@@ -77,6 +77,22 @@ def structure_research_spec(
     return parsed
 
 
+def wants_verbatim_copy(query: str) -> bool:
+    text = query.lower()
+    return any(
+        phrase in text
+        for phrase in (
+            "copy the",
+            "copy latest",
+            "copy verbatim",
+            "paste the",
+            "quote the",
+            "exact text",
+            "word for word",
+        )
+    )
+
+
 def _fallback_source_tiers(results: list[Any], query: str) -> tuple[list[Any], list[Any]]:
     """When the model is unavailable, only demote obvious social/forum hosts."""
     goal = focus_query(query)

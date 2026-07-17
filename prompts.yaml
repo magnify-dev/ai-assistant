@@ -143,6 +143,8 @@ web_research:
     - summary keeps the user's goal exactly — do not generalize it.
     - If the user names a specific site (e.g. "go to wowhead"), keep that site in summary verbatim.
     - data_needed: the concrete facts the answer must contain (dates, version numbers, names).
+    - When the user asks for latest/newest/most recent/today/breaking/current news or updates,
+      success_criteria MUST require the newest dated item — not merely any related article.
     - search_queries: 2-4 diverse strings, no URLs. When the task is about updates,
       releases, or announcements, make one query target the official source
       (add words like "official", "patch notes", "changelog", "release notes").
@@ -177,9 +179,12 @@ web_research:
     - failed[]: prior steps that failed and why
     - avoid[]: actions already tried — never repeat these
     - menu[]: numbered valid next moves — copy target_id/url exactly
+    - recency_note / recency_requirement: timing matters — pick the newest dated item
 
     Rules:
     - Clear overlays (menu[]) before extract/report
+    - When recency_note is present, prefer menu entries with the latest published date;
+      on listing pages open the newest article before extract/report — never settle for older news
     - swap_branch only when branch is stalled; copy url from branch.alternatives[]
     - target_id must come from menu[] or form_fields[], not overlay ids
     - Pick a different action than failed[] and avoid[]
@@ -190,6 +195,28 @@ web_research:
 
     Read stuck, branch_note, failed, avoid, menu. Never repeat avoid[].
     Clear overlays before extract/report. Pick from menu[].
+    When recency_note is present, choose the newest dated item — not an older match.
+
+  choose_overlay_dismiss: |
+    A blocking overlay covers the page. Return JSON only:
+    {"action":"click|fill|select","target_id":"","value_key":"","reason":""}
+
+    Read overlay_map[] and menu[] first — each entry has:
+    - id: copy exactly into target_id
+    - label: visible button/field text (wording varies by site)
+    - intent: reject | accept | dismiss | confirm | fill | select
+    - rect: on-screen position hint when present
+
+    Pick ONE control to clear the overlay:
+    - cookie/consent/privacy: prefer reject/decline (minimal tracking); if none, use accept/agree/OK/close
+    - age_gate: fill year/month/day fields first; click confirm/continue last
+    - generic modal: close/dismiss/continue/OK
+
+    Rules:
+    - target_id MUST come from overlay_map[].id — never invent ids or use overlay container ids
+    - Do NOT extract, filter, report, navigate, or swap_branch — only dismiss the overlay
+    - Never repeat target_ids listed in avoid[]
+    - fill/select requires value_key from form_keys when listed
 
   plan_form_values: |
     Plan synthetic values for the form fields listed in fields[]. Return JSON only:
@@ -212,6 +239,8 @@ web_research:
     Rules:
     - quote must be copied verbatim from content — it is checked against the page. Keep it under 200 chars.
     - Prefer facts with dates, version numbers, names, and figures the goal asks for.
+    - When timing/recency is mentioned in the goal, extract facts only from the newest dated
+      section or article — ignore older entries on the same page.
     - If the page is an error / "not found" page or lacks the requested data, return {"page_summary":"why","facts":[]}.
     - Max 8 facts. Never add facts from your own knowledge.
 
@@ -220,8 +249,18 @@ web_research:
     Answer the question in 2-5 sentences using ONLY the pages and facts provided.
     Cite source URLs. Prefer facts from official / primary-source pages over forums,
     social posts, or third-party summaries when both are available.
+    When the user asked for latest/newest/most recent content, answer with the newest
+    dated fact only — do not summarize older news unless the user asked for history.
     Prefer the most recent dated information. Do not invent values.
     If key data is missing, say exactly what is missing.
+
+  # Verbatim copy when the user asked to copy/quote page content.
+  answer_copy: |
+    The user asked to COPY content from the page — do not paraphrase.
+    Return the requested text using verbatim quotes from the facts provided.
+    Prefer the single most recent dated item when the user asked for "latest" news.
+    Include the source URL. Use markdown block quotes for copied passages when helpful.
+    If quotes are missing from the facts, say exactly what could not be copied.
 
 cheatsheet:
   # System prompt for append-only cheatsheet refinement after a run.
