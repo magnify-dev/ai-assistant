@@ -105,7 +105,13 @@ def build_capture(
                 "aria": raw.get("aria"),
                 "rect": rect,
                 "locator_candidates": list(raw.get("locator_candidates") or []),
-                "locator_status": "synthetic" if raw.get("inferred_from_overlay") else "unresolved",
+                "locator_status": (
+                    "synthetic"
+                    if raw.get("inferred_from_overlay")
+                    else "content"
+                    if raw.get("map_layer") == "content"
+                    else "unresolved"
+                ),
                 "locator": None,
                 "ai_interactive": None,
                 "ai_confidence": None,

@@ -1,6 +1,6 @@
 import type { WebCapture, WebCaptureElement } from "./webCaptureTypes";
 
-export type WebCaptureFilter = "all" | "kept" | "rejected" | "saved" | "problems";
+export type WebCaptureFilter = "all" | "kept" | "rejected" | "saved" | "problems" | "content" | "controls";
 
 export function captureUsesDocumentCoords(capture: WebCapture): boolean {
   const map = capture.scroll_map;
@@ -43,6 +43,12 @@ export function filterCaptureElements(
       (item) => item.locator_status !== "unique" || Boolean(item.deterministic_issues?.length),
     );
   }
+  if (filter === "content") {
+    return elements.filter((item) => item.map_layer === "content");
+  }
+  if (filter === "controls") {
+    return elements.filter((item) => item.map_layer !== "content");
+  }
   return elements;
 }
 
@@ -58,6 +64,12 @@ export function captureBoxStyle(element: WebCaptureElement, capture: WebCapture)
 }
 
 export function boxTone(element: WebCaptureElement): string {
+  if (element.map_layer === "content") {
+    if (element.likely_clickable) {
+      return "border-cyan-500 bg-cyan-300/20 text-cyan-950";
+    }
+    return "border-slate-400 bg-slate-300/15 text-slate-900";
+  }
   if (element.map_matched) {
     return element.user_interactive
       ? "border-violet-600 bg-violet-300/30 text-violet-950"

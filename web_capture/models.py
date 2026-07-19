@@ -46,6 +46,11 @@ class CaptureElement(TypedDict, total=False):
     ai_confidence: float | None
     ai_control_type: str | None
     ai_reason: str | None
+    map_layer: str | None
+    content_role: str | None
+    likely_clickable: bool | None
+    title: str | None
+    dates: list[str] | None
     deterministic_issues: list[str]
     raw: dict[str, Any]
 

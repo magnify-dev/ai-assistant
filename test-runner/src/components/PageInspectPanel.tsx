@@ -92,11 +92,11 @@ function CaptureBuildBanner({
       </span>
       {captureBuild?.elementCount != null ? (
         <span className="rounded-full bg-black/20 px-2 py-0.5 text-[10px] text-white/70">
-          {captureBuild.elementCount} controls
+          {capture ? mapElementCountLabel(capture) : `${captureBuild.elementCount} elements`}
         </span>
       ) : capture?.elements?.length ? (
         <span className="rounded-full bg-black/20 px-2 py-0.5 text-[10px] text-white/70">
-          {capture.elements.length} controls
+          {mapElementCountLabel(capture)}
         </span>
       ) : null}
       {failed && captureBuild?.error ? (
@@ -129,14 +129,28 @@ function MapBuildSkeleton({ capture }: { capture?: WebCapture | null }) {
   );
 }
 
+function mapElementCountLabel(capture: WebCapture): string {
+  const total = capture.elements.length;
+  const content = capture.summary.content ?? capture.elements.filter((item) => item.map_layer === "content").length;
+  const controls = capture.summary.controls ?? total - content;
+  if (content > 0) {
+    return `${total} mapped (${controls} controls · ${content} content)`;
+  }
+  return `${total} elements`;
+}
+
 function elementLabel(element: WebCaptureElement): string {
-  return (
+  const base = (
+    element.title?.trim() ||
     element.text?.trim() ||
     element.aria?.trim() ||
     element.label?.trim() ||
     element.name?.trim() ||
     element.kind
   ).slice(0, 48);
+  const role = element.content_role || (element.map_layer === "content" ? element.kind : "");
+  const dates = element.dates?.length ? ` · ${element.dates[0]}` : "";
+  return role && element.map_layer === "content" ? `[${role}] ${base}${dates}` : base;
 }
 
 function frameTitle(frame: PlaywrightSessionFrame | undefined): string {
@@ -405,7 +419,7 @@ export function PageInspectPanel({
         <div className={cn("grid gap-3", view === "split" ? "xl:grid-cols-2" : "grid-cols-1")}>
           {building && !hasDraftCapture && (view === "overlay" || view === "map" || view === "split" || view === "pixels") ? (
             <div className="space-y-2">
-              <p className="text-[10px] text-white/45">Sampling page geometry and controls…</p>
+              <p className="text-[10px] text-white/45">Sampling page geometry, controls, and content blocks…</p>
               <MapBuildSkeleton capture={capture ?? undefined} />
             </div>
           ) : null}
@@ -416,6 +430,16 @@ export function PageInspectPanel({
                 <span className="rounded-full bg-violet-500/15 px-2 py-1 text-violet-200">
                   {capture.summary.user_kept ?? 0} saved kept
                 </span>
+                {capture.summary.content != null ? (
+                  <span className="rounded-full bg-slate-500/15 px-2 py-1 text-slate-100">
+                    {capture.summary.content} content
+                  </span>
+                ) : null}
+                {capture.summary.clickable_content != null && capture.summary.clickable_content > 0 ? (
+                  <span className="rounded-full bg-cyan-500/15 px-2 py-1 text-cyan-100">
+                    {capture.summary.clickable_content} clickable cards
+                  </span>
+                ) : null}
                 <span className="rounded-full bg-emerald-500/15 px-2 py-1 text-emerald-200">
                   {capture.summary.ai_kept} AI kept
                 </span>
@@ -428,7 +452,7 @@ export function PageInspectPanel({
               </div>
 
               <div className="flex flex-wrap gap-1">
-                {(["all", "saved", "kept", "rejected", "problems"] as WebCaptureFilter[]).map((value) => (
+                {(["all", "controls", "content", "saved", "kept", "rejected", "problems"] as WebCaptureFilter[]).map((value) => (
                   <button
                     key={value}
                     type="button"

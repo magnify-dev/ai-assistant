@@ -217,6 +217,8 @@ def _effective_interactive(item: dict[str, Any]) -> bool:
         return bool(item["user_interactive"])
     if item.get("ai_interactive") is not None:
         return bool(item["ai_interactive"])
+    if item.get("map_layer") == "content":
+        return bool(item.get("likely_clickable"))
     if item.get("disabled"):
         return False
     return item.get("locator_status") == "unique"

@@ -44,6 +44,11 @@ export type WebCaptureElement = {
   map_matched?: boolean;
   map_signature?: string;
   map_corrected_at?: string;
+  map_layer?: "control" | "content" | null;
+  content_role?: string | null;
+  likely_clickable?: boolean | null;
+  title?: string | null;
+  dates?: string[] | null;
 };
 
 export type WebCaptureMapInfo = {
@@ -117,6 +122,9 @@ export type WebCapture = {
     user_kept?: number;
     user_rejected?: number;
     map_matched?: number;
+    controls?: number;
+    content?: number;
+    clickable_content?: number;
   };
   map?: WebCaptureMapInfo;
   visual?: WebCaptureVisual;

@@ -11,6 +11,7 @@ import httpx
 
 from ui_test.config_loader import load_engine_config, ollama_model, ollama_url
 from ui_test.prompts import get_prompt
+from web_capture.page_map import apply_content_defaults
 
 _CACHE: dict[str, dict[str, Any]] = {}
 _CACHE_LOCK = Lock()
@@ -24,6 +25,7 @@ def _compact_element(item: dict[str, Any]) -> dict[str, Any]:
         "role": item.get("role"),
         "tag": item.get("tag"),
         "text": item.get("text"),
+        "title": item.get("title"),
         "aria": item.get("aria"),
         "label": item.get("label"),
         "name": item.get("name"),
@@ -34,6 +36,10 @@ def _compact_element(item: dict[str, Any]) -> dict[str, Any]:
         "locator_status": item.get("locator_status"),
         "frame_url": item.get("frame_url"),
         "shadow_host": item.get("shadow_host"),
+        "map_layer": item.get("map_layer"),
+        "content_role": item.get("content_role"),
+        "likely_clickable": bool(item.get("likely_clickable")),
+        "dates": item.get("dates"),
     }
 
 
@@ -84,10 +90,12 @@ def analyze_capture(capture: dict[str, Any]) -> dict[str, Any]:
             "model": cached.get("_model"),
             "duration_ms": 0,
         }
+        apply_content_defaults(capture)
         return capture
 
     if os.environ.get("WEB_CAPTURE_AI", "1").strip().lower() in {"0", "false", "off"}:
         capture["ai"] = {"status": "disabled", "duration_ms": 0}
+        apply_content_defaults(capture)
         return capture
 
     config = load_engine_config()
@@ -140,4 +148,5 @@ def analyze_capture(capture: dict[str, Any]) -> dict[str, Any]:
             "error": str(exc)[:300],
             "duration_ms": round((time.perf_counter() - started) * 1000),
         }
+    apply_content_defaults(capture)
     return capture

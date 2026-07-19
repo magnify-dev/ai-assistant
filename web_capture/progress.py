@@ -3,9 +3,9 @@ from __future__ import annotations
 from typing import Any
 
 _PHASE_MESSAGES = {
-    "geometry": "Scanning page layout…",
+    "geometry": "Scanning controls and page content…",
     "locators": "Validating Playwright locators…",
-    "analyzing": "Classifying controls with AI…",
+    "analyzing": "Classifying controls and content blocks…",
     "visual": "Building pixel map…",
     "complete": "Map ready — inspect below",
     "error": "Could not build page map",

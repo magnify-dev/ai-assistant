@@ -29,6 +29,12 @@ web_capture:
 
     Rules:
     - Include every input element exactly once and never invent an id.
+    - Elements may come from map_layer=control (native controls) or map_layer=content
+      (cards, headings, text blocks, dates). Content blocks are usually read-only.
+    - For map_layer=content, interactive=true only when likely_clickable is true or
+      cursor style / card pattern indicates the block opens or navigates on click.
+    - Headings, paragraphs, dates, and static text blocks are interactive=false unless
+      clearly clickable.
     - interactive=true only when a user can meaningfully click, type, choose, toggle,
       open, submit, navigate, or expand through that visible element.
     - Native controls, semantic roles, hrefs, labels, cursor style, disabled state,

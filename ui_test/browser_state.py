@@ -676,6 +676,237 @@ _SEMANTIC_JS = """() => {
   };
 }"""
 
+_PAGE_CONTENT_MAP_JS = """() => {
+  function clean(value, limit = 220) {
+    return String(value || "").trim().replace(/\\s+/g, " ").slice(0, limit);
+  }
+  function isVisible(el) {
+    if (!el || el.nodeType !== 1) return false;
+    const tag = el.tagName;
+    if (tag === "SCRIPT" || tag === "STYLE" || tag === "NOSCRIPT" || tag === "SVG") return false;
+    const rect = el.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return false;
+    const style = getComputedStyle(el);
+    if (style.visibility === "hidden" || style.display === "none" || parseFloat(style.opacity || "1") === 0) return false;
+    return true;
+  }
+  function inViewport(el) {
+    const rect = el.getBoundingClientRect();
+    return rect.bottom >= 0 && rect.top <= window.innerHeight && rect.right >= 0 && rect.left <= window.innerWidth;
+  }
+  function inChrome(el) {
+    return Boolean(el.closest("nav, header, footer, [role='navigation'], [role='banner']"));
+  }
+  function blockText(el, limit = 220) {
+    if (!el || !isVisible(el)) return "";
+    return clean(el.innerText || el.textContent || "", limit);
+  }
+  function nearestHeading(el) {
+    const section = el.closest("section,article,main,nav,aside,form,[role='region']");
+    const heading = section && section.querySelector("h1,h2,h3,h4,[role='heading']");
+    return heading ? clean(heading.innerText || heading.textContent || "", 120) : "";
+  }
+  function landmarkOf(el) {
+    const landmark = el.closest("nav,main,aside,header,footer,form,[role]");
+    if (!landmark) return "";
+    return clean(landmark.getAttribute("aria-label") || landmark.getAttribute("role") || landmark.tagName.toLowerCase(), 80);
+  }
+  function cssPath(el) {
+    if (el.id) return `#${CSS.escape(el.id)}`;
+    const parts = [];
+    let node = el;
+    while (node && node.nodeType === Node.ELEMENT_NODE && parts.length < 6) {
+      let part = node.tagName.toLowerCase();
+      const testId = node.getAttribute("data-testid");
+      if (testId) {
+        parts.unshift(`[data-testid="${CSS.escape(testId)}"]`);
+        break;
+      }
+      if (node.parentElement) {
+        const siblings = Array.from(node.parentElement.children).filter(
+          (candidate) => candidate.tagName === node.tagName
+        );
+        if (siblings.length > 1) part += `:nth-of-type(${siblings.indexOf(node) + 1})`;
+      }
+      parts.unshift(part);
+      node = node.parentElement;
+    }
+    return parts.join(" > ");
+  }
+  function extractDates(text) {
+    const out = [];
+    const seen = new Set();
+    const patterns = [
+      /\\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\\s+\\d{1,2},?\\s+\\d{4}\\b/gi,
+      /\\b\\d{4}-\\d{2}-\\d{2}\\b/g,
+      /\\b\\d{1,2}[./-]\\d{1,2}[./-]\\d{2,4}\\b/g,
+      /\\b\\d+\\s+(?:minute|hour|day|week|month|year)s?\\s+ago\\b/gi,
+      /\\b(?:today|yesterday|just now)\\b/gi,
+    ];
+    for (const pattern of patterns) {
+      for (const match of String(text || "").matchAll(pattern)) {
+        const value = clean(match[0], 40);
+        if (!value || seen.has(value.toLowerCase())) continue;
+        seen.add(value.toLowerCase());
+        out.push(value);
+        if (out.length >= 4) return out;
+      }
+    }
+    return out;
+  }
+  function cardTitle(el) {
+    const heading = el.querySelector("h1,h2,h3,h4,h5,h6,[role='heading']");
+    if (heading) return clean(heading.innerText || heading.textContent || "", 160);
+    const time = el.querySelector("time,[datetime]");
+    const text = blockText(el, 220);
+    if (time) {
+      const without = text.replace(clean(time.innerText || time.textContent || "", 40), "").trim();
+      if (without.length >= 8) return clean(without, 160);
+    }
+    return clean(text, 160);
+  }
+  function isLikelyClickable(el) {
+    if (!el || el.nodeType !== 1) return false;
+    const style = getComputedStyle(el);
+    if (style.cursor === "pointer") return true;
+    if (el.hasAttribute("onclick")) return true;
+    const tabindex = el.getAttribute("tabindex");
+    if (tabindex && tabindex !== "-1") return true;
+    const role = el.getAttribute("role") || "";
+    if (["button", "link", "menuitem", "option", "tab", "row"].includes(role)) return true;
+    if (el.matches("a[href]")) return true;
+    const anchor = el.querySelector(":scope > a[href], :scope a[href]");
+    if (anchor && blockText(anchor, 80)) return true;
+    return false;
+  }
+  function contentRole(el) {
+    const tag = el.tagName.toLowerCase();
+    const role = el.getAttribute("role") || "";
+    const className = String(el.className || "").toLowerCase();
+    if (tag === "time" || el.hasAttribute("datetime")) return "date";
+    if (/^h[1-6]$/.test(tag) || role === "heading") return "heading";
+    if (tag === "article" || role === "article") return "article";
+    if (role === "listitem" || tag === "li") return "list-item";
+    if (tag === "tr" || role === "row") return "row";
+    if (tag === "td" || tag === "th" || role === "cell" || role === "gridcell") return "cell";
+    if (/\\bcard\\b|\\bteaser\\b|\\bstory\\b|\\bheadline\\b/.test(className)) return "card";
+    if (["p", "blockquote", "figcaption"].includes(tag)) return "text";
+    if (isLikelyClickable(el) && blockText(el, 220).length >= 16) return "card";
+    return "block";
+  }
+  function contentRoots() {
+    const roots = [];
+    const seen = new Set();
+    for (const sel of ["main", "[role='main']", "#content", ".content", "article", "[role='article']"]) {
+      for (const el of document.querySelectorAll(sel)) {
+        if (!isVisible(el) || seen.has(el)) continue;
+        seen.add(el);
+        roots.push(el);
+      }
+    }
+    return roots.length ? roots : (document.body ? [document.body] : []);
+  }
+  const controlSelector =
+    "a[href], button, input:not([type='hidden']), select, textarea, summary, [role='button'], [role='link'], [role='menuitem'], [role='textbox'], [role='combobox'], [contenteditable=''], [contenteditable='true'], [tabindex]:not([tabindex='-1']), [onclick]";
+  const contentSelector = [
+    "article",
+    "[role='article']",
+    "li",
+    "[role='listitem']",
+    "tr",
+    "[role='row']",
+    "time",
+    "[datetime]",
+    "h1,h2,h3,h4,h5,h6",
+    "[role='heading']",
+    "p",
+    "blockquote",
+    "figcaption",
+    "[class*='card' i]",
+    "[class*='teaser' i]",
+    "[class*='story' i]",
+    "[class*='item' i]",
+    "[class*='headline' i]",
+  ].join(",");
+  const roots = contentRoots();
+  const candidates = [];
+  const seenElements = new Set();
+  function consider(el) {
+    if (!el || seenElements.has(el) || !isVisible(el) || !inViewport(el) || inChrome(el)) return;
+    if (el.matches(controlSelector)) return;
+    const rect = el.getBoundingClientRect();
+    if (rect.width < 24 || rect.height < 14) return;
+    const role = contentRole(el);
+    const text = blockText(el, role === "heading" ? 180 : 220);
+    const title = role === "card" || role === "article" || role === "list-item" ? cardTitle(el) : "";
+    const label = title || text;
+    if (!label || label.length < (role === "date" ? 4 : 8)) return;
+    if (role === "text" && label.length < 20) return;
+    seenElements.add(el);
+    const dates = extractDates(`${label} ${text}`);
+    const timeEl = el.matches("time,[datetime]") ? el : el.querySelector("time,[datetime]");
+    if (timeEl) {
+      const dt = clean(timeEl.getAttribute("datetime") || timeEl.innerText || timeEl.textContent || "", 40);
+      if (dt && !dates.includes(dt)) dates.unshift(dt);
+    }
+    candidates.push({
+      el,
+      kind: role,
+      content_role: role,
+      map_layer: "content",
+      text: label,
+      title: title || null,
+      dates: dates.length ? dates : null,
+      likely_clickable: isLikelyClickable(el),
+      tag: el.tagName.toLowerCase(),
+      role: el.getAttribute("role") || null,
+      nearest_heading: nearestHeading(el) || null,
+      landmark: landmarkOf(el) || null,
+      rect: {
+        x: rect.x,
+        y: rect.y,
+        width: rect.width,
+        height: rect.height,
+      },
+      css_path: cssPath(el),
+      cursor: getComputedStyle(el).cursor || null,
+    });
+  }
+  for (const root of roots) {
+    for (const el of root.querySelectorAll(contentSelector)) consider(el);
+    for (const el of root.querySelectorAll("div,section")) {
+      if (!isLikelyClickable(el)) continue;
+      if (blockText(el, 220).length < 16) continue;
+      consider(el);
+    }
+  }
+  const filtered = [];
+  for (const row of candidates) {
+    const el = row.el;
+    const nested = candidates.some(
+      (other) => other !== row && other.el !== el && other.el.contains(el)
+    );
+    if (nested) continue;
+    filtered.push(row);
+  }
+  const out = filtered.slice(0, 250).map((row, index) => {
+    const { el, ...rest } = row;
+    return { ...rest, index };
+  });
+  return {
+    items: out,
+    total: filtered.length,
+    viewport: {
+      width: window.innerWidth,
+      height: window.innerHeight,
+      scroll_x: window.scrollX,
+      scroll_y: window.scrollY,
+      document_width: Math.max(document.documentElement.scrollWidth, document.body?.scrollWidth || 0),
+      document_height: Math.max(document.documentElement.scrollHeight, document.body?.scrollHeight || 0),
+    },
+  };
+}"""
+
 
 def _id_slug(value: Any) -> str:
     slug = re.sub(r"[^a-z0-9]+", "-", str(value or "").lower()).strip("-")
@@ -810,6 +1041,34 @@ def _infer_gate_interactables_from_overlays(overlays: list[Any]) -> list[dict[st
         if inferred:
             break
     return inferred
+
+
+def _enrich_content_map(items: Any) -> list[dict[str, Any]]:
+    if not isinstance(items, list):
+        return []
+    occurrences: dict[str, int] = {}
+    result: list[dict[str, Any]] = []
+    for raw in items:
+        if not isinstance(raw, dict):
+            continue
+        item = dict(raw)
+        signature = "|".join(
+            str(item.get(key) or "").strip().lower()
+            for key in ("kind", "content_role", "text", "title", "tag", "role")
+        )
+        occurrence = occurrences.get(signature, 0)
+        occurrences[signature] = occurrence + 1
+        item["id"] = _stable_interactable_id(item, occurrence)
+        if item.get("likely_clickable"):
+            label = str(item.get("title") or item.get("text") or "content").strip()
+            item["widget"] = "click"
+            item["action_hint"] = f'Click this card: "{label[:80]}".' if label else "Click this content card."
+        else:
+            item["widget"] = "read"
+            label = str(item.get("title") or item.get("text") or "content").strip()
+            item["action_hint"] = f'Read-only content: "{label[:80]}".' if label else "Read-only page content."
+        result.append(item)
+    return result
 
 
 def _enrich_interactables(items: Any, page_url: str) -> list[dict[str, Any]]:
@@ -991,6 +1250,22 @@ def build_semantic_snapshot(state: dict[str, Any], *, max_chars: int = 10000) ->
     headings = state.get("headings")
     if isinstance(headings, list) and headings:
         parts.append("## " + " · ".join(str(item) for item in headings[:12] if str(item).strip()))
+    content_map = state.get("page_content_map")
+    if isinstance(content_map, list) and content_map:
+        lines = ["## Visible content blocks"]
+        for item in content_map[:48]:
+            if not isinstance(item, dict):
+                continue
+            kind = str(item.get("content_role") or item.get("kind") or "block")
+            label = str(item.get("title") or item.get("text") or "").strip()
+            if not label:
+                continue
+            dates = item.get("dates") if isinstance(item.get("dates"), list) else []
+            date_suffix = f" ({', '.join(str(d) for d in dates[:2])})" if dates else ""
+            click_suffix = " [clickable]" if item.get("likely_clickable") else ""
+            lines.append(f"- [{kind}]{click_suffix} {label[:180]}{date_suffix}")
+        if len(lines) > 1:
+            parts.append("\n".join(lines))
     visible = str(state.get("visible_text") or "").strip()
     if visible:
         parts.append(visible)
@@ -1011,6 +1286,10 @@ def collect_page_state(page: Page, *, include_screenshot: bool = True) -> dict[s
         semantic = page.evaluate(_SEMANTIC_JS)
     except Exception:
         semantic = {}
+    try:
+        raw_content_map = page.evaluate(_PAGE_CONTENT_MAP_JS)
+    except Exception:
+        raw_content_map = {}
     try:
         blocking_overlays = page.evaluate(_BLOCKING_OVERLAYS_JS)
     except Exception:
@@ -1034,6 +1313,8 @@ def collect_page_state(page: Page, *, include_screenshot: bool = True) -> dict[s
         inferred_items,
     )
     interactables = _enrich_interactables(merged_items, page_url)
+    content_items = raw_content_map.get("items") if isinstance(raw_content_map, dict) else raw_content_map
+    page_content_map = _enrich_content_map(content_items if isinstance(content_items, list) else [])
     interactable_total = (
         int(raw_interactables.get("total") or len(interactables)) + len(iframe_items)
         if isinstance(raw_interactables, dict)
@@ -1057,6 +1338,17 @@ def collect_page_state(page: Page, *, include_screenshot: bool = True) -> dict[s
         "url": page_url,
         "title": title,
         "interactables": interactables,
+        "page_content_map": page_content_map,
+        "page_content_total": (
+            int(raw_content_map.get("total") or len(page_content_map))
+            if isinstance(raw_content_map, dict)
+            else len(page_content_map)
+        ),
+        "page_content_truncated": (
+            int(raw_content_map.get("total") or 0) > len(page_content_map)
+            if isinstance(raw_content_map, dict)
+            else False
+        ),
         "viewport": _resolve_viewport(
             page,
             raw_interactables.get("viewport")
@@ -1123,11 +1415,20 @@ def attach_web_capture(
         from web_capture.context import get_active_project
         from web_capture.locators import validate_capture_locators
         from web_capture.maps import apply_site_map, sync_interactables_from_capture
+        from web_capture.page_map import (
+            apply_content_defaults,
+            merge_capture_elements,
+            promote_clickable_content,
+            summarize_map_layers,
+        )
         from web_capture.screenshots import attach_screenshot_to_capture, persist_screenshot
         from web_capture.visual import collect_visual_tiles, resolve_visual_map
 
         _progress("geometry")
-        capture = build_capture(state, context=context)
+        map_elements = merge_capture_elements(state)
+        capture = build_capture(state, context=context, elements=map_elements)
+        layer_summary = summarize_map_layers(list(capture.get("elements") or []))
+        capture.setdefault("summary", {}).update(layer_summary)
         _progress("geometry", capture=capture)
         _progress("locators")
         validate_capture_locators(page, capture)
@@ -1136,6 +1437,8 @@ def attach_web_capture(
         if analyze:
             _progress("analyzing")
             analyze_capture(capture)
+        else:
+            apply_content_defaults(capture)
         project = get_active_project()
         apply_site_map(capture, project)
         _progress("visual")
@@ -1160,6 +1463,7 @@ def attach_web_capture(
                 capture["screenshot"] = screenshot_rel
         attach_screenshot_to_capture(capture, project)
         sync_interactables_from_capture(state, capture)
+        promote_clickable_content(state, capture)
         state["web_capture"] = capture
         _progress("complete", capture=capture)
     except Exception as exc:
