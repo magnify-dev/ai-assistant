@@ -16,6 +16,8 @@ from web_capture.page_map import apply_content_defaults
 _CACHE: dict[str, dict[str, Any]] = {}
 _CACHE_LOCK = Lock()
 _MAX_CACHE = 40
+_UNDERSTAND_CACHE: dict[str, dict[str, Any]] = {}
+_UNDERSTAND_LOCK = Lock()
 
 
 def _compact_element(item: dict[str, Any]) -> dict[str, Any]:
@@ -29,6 +31,7 @@ def _compact_element(item: dict[str, Any]) -> dict[str, Any]:
         "aria": item.get("aria"),
         "label": item.get("label"),
         "name": item.get("name"),
+        "href": item.get("href"),
         "input_type": item.get("input_type"),
         "disabled": bool(item.get("disabled")),
         "rect": item.get("rect"),
@@ -40,6 +43,8 @@ def _compact_element(item: dict[str, Any]) -> dict[str, Any]:
         "content_role": item.get("content_role"),
         "likely_clickable": bool(item.get("likely_clickable")),
         "dates": item.get("dates"),
+        "authors": item.get("authors"),
+        "byline": item.get("byline"),
     }
 
 
@@ -149,4 +154,115 @@ def analyze_capture(capture: dict[str, Any]) -> dict[str, Any]:
             "duration_ms": round((time.perf_counter() - started) * 1000),
         }
     apply_content_defaults(capture)
+    return capture
+
+
+def _compact_understand_payload(capture: dict[str, Any], state: dict[str, Any] | None = None) -> dict[str, Any]:
+    state = state or {}
+    elements = [
+        _compact_element(item)
+        for item in (capture.get("elements") or [])[:180]
+        if isinstance(item, dict)
+    ]
+    return {
+        "url": capture.get("url") or state.get("url"),
+        "title": capture.get("title") or state.get("title"),
+        "viewport": capture.get("viewport") or state.get("viewport"),
+        "elements": elements,
+        "visible_text": str(state.get("visible_text") or "")[:3500],
+        "semantic_snapshot": str(state.get("semantic_snapshot") or "")[:3500],
+    }
+
+
+def understand_page_capture(
+    capture: dict[str, Any],
+    state: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Describe page structure from mapped visible elements (what a user would see)."""
+    started = time.perf_counter()
+    fingerprint = f"understand:{capture.get('fingerprint') or ''}"
+    with _UNDERSTAND_LOCK:
+        cached = deepcopy(_UNDERSTAND_CACHE.get(fingerprint))
+    if cached:
+        capture["page_understanding"] = cached.get("understanding")
+        capture["page_understanding_meta"] = {
+            "status": "ready",
+            "cached": True,
+            "model": cached.get("_model"),
+            "duration_ms": 0,
+        }
+        return capture
+
+    if os.environ.get("WEB_CAPTURE_AI", "1").strip().lower() in {"0", "false", "off"}:
+        capture["page_understanding_meta"] = {"status": "disabled", "duration_ms": 0}
+        return capture
+
+    config = load_engine_config()
+    url = ollama_url(config)
+    model = ollama_model(config)
+    payload = _compact_understand_payload(capture, state)
+    try:
+        with httpx.Client(timeout=30.0) as client:
+            response = client.post(
+                f"{url.rstrip('/')}/api/chat",
+                json={
+                    "model": model,
+                    "stream": False,
+                    "format": "json",
+                    "messages": [
+                        {"role": "system", "content": get_prompt("web_capture.understand")},
+                        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                    ],
+                },
+            )
+            response.raise_for_status()
+        content = (response.json().get("message") or {}).get("content") or ""
+        parsed = json.loads(content)
+        if not isinstance(parsed, dict):
+            raise ValueError("understanding response was not an object")
+        understanding = {
+            "page_type": str(parsed.get("page_type") or "other")[:40],
+            "summary": str(parsed.get("summary") or "").strip()[:600],
+            "regions": [
+                row
+                for row in (parsed.get("regions") or [])
+                if isinstance(row, dict)
+            ][:12],
+            "feed_items": [
+                row
+                for row in (parsed.get("feed_items") or [])
+                if isinstance(row, dict)
+            ][:40],
+            "how_to_proceed": [
+                str(item).strip()
+                for item in (parsed.get("how_to_proceed") or [])
+                if str(item).strip()
+            ][:8],
+            "open_questions": [
+                str(item).strip()
+                for item in (parsed.get("open_questions") or [])
+                if str(item).strip()
+            ][:8],
+        }
+        with _UNDERSTAND_LOCK:
+            if len(_UNDERSTAND_CACHE) >= _MAX_CACHE:
+                _UNDERSTAND_CACHE.pop(next(iter(_UNDERSTAND_CACHE)))
+            _UNDERSTAND_CACHE[fingerprint] = {
+                "understanding": understanding,
+                "_model": model,
+            }
+        capture["page_understanding"] = understanding
+        capture["page_understanding_meta"] = {
+            "status": "ready",
+            "cached": False,
+            "model": model,
+            "duration_ms": round((time.perf_counter() - started) * 1000),
+        }
+    except Exception as exc:
+        capture["page_understanding_meta"] = {
+            "status": "unavailable",
+            "model": model,
+            "error": str(exc)[:300],
+            "duration_ms": round((time.perf_counter() - started) * 1000),
+        }
     return capture

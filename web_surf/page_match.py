@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 _QUERY_STOPWORDS = frozenset(
     {
@@ -227,15 +227,71 @@ def seed_url_priority(
     parsed = urlsplit(str(url or "").lower())
     score = score_result_url(url, query)
     preferred = preferred_domains or parse_user_preferred_domains(query)
-    if preferred and url_on_preferred_source(url, preferred):
+    on_preferred = bool(preferred and url_on_preferred_source(url, preferred))
+    if on_preferred:
         score += 1000
-    if is_secondary_host(url) and not (preferred and url_on_preferred_source(url, preferred)):
+    if is_secondary_host(url) and not on_preferred:
         score -= 80
-    if is_publisher_content_url(url) and not (preferred and url_on_preferred_source(url, preferred)):
+    if is_publisher_content_url(url) and not on_preferred:
         score += 60
     if "patch" in parsed.path and "note" in parsed.path:
         score += 30
+    # Named site + "latest news": start on the listing hub and discover the article
+    # in-browser. Search often returns a specific old/random article — demote those.
+    if on_preferred and _wants_browse_discovery(query):
+        if is_content_listing_url(url):
+            score += 500
+        elif is_deep_article_url(url):
+            score -= 450
     return (score, score)
+
+
+def _wants_browse_discovery(query: str) -> bool:
+    """True when newest content must be found on-site, not picked from search memory."""
+    focused = focus_query(query)
+    if query_implies_recency(focused):
+        return True
+    return bool(re.search(r"\b(news|updates?|headlines|announcements?)\b", focused, re.I))
+
+
+def is_deep_article_url(url: str) -> bool:
+    """True for /news/<slug> style article URLs (not the listing itself)."""
+    path = urlsplit(str(url or "")).path.lower().rstrip("/")
+    return bool(_DEEP_ARTICLE_PATH_RE.search(path))
+
+
+def listing_hub_url(url: str) -> str | None:
+    """Collapse a deep article URL to its news/blog listing hub when possible."""
+    parsed = urlsplit(str(url or "").strip())
+    if not parsed.scheme or not parsed.netloc:
+        return None
+    path = parsed.path or "/"
+    match = _LISTING_HUB_PREFIX_RE.search(path)
+    if not match:
+        return None
+    hub_path = match.group(1).rstrip("/") or "/"
+    return urlunsplit((parsed.scheme, parsed.netloc, hub_path, "", ""))
+
+
+def preferred_discovery_seeds(query: str, candidate_urls: list[str]) -> list[str]:
+    """
+    When the user names a site and wants recent news, seed the listing hub(s)
+    derived from search hits — not the specific article pages search returned.
+    """
+    preferred = parse_user_preferred_domains(query)
+    if not preferred or not _wants_browse_discovery(query):
+        return []
+    seeds: list[str] = []
+    for raw in candidate_urls:
+        url = str(raw or "").strip()
+        if not url or not url_on_preferred_source(url, preferred):
+            continue
+        hub = listing_hub_url(url)
+        if hub and hub not in seeds:
+            seeds.append(hub)
+        elif is_content_listing_url(url) and url not in seeds:
+            seeds.append(url.split("#", 1)[0].rstrip("/") or url)
+    return seeds
 
 
 def registrable_domain(netloc: str) -> str:
@@ -461,10 +517,11 @@ def parse_target_dates(query: str) -> list[tuple[int, int, int]]:
 
 
 _RELATIVE_AGO_RE = re.compile(
-    r"\b(\d+)\s+(minute|hour|day|week|month|year)s?\s+ago\b",
+    r"\b(?:(an?|\d+)\s+(minute|hour|day|week|month|year)s?\s+ago)\b",
     re.I,
 )
 _URL_DATE_RE = re.compile(r"/(\d{4})/(\d{1,2})(?:/(\d{1,2}))?(?:/|$|\?)")
+_NEWS_ID_RE = re.compile(r"(?:news[=/]|/news/)(\d{5,})", re.I)
 
 
 def parse_content_date(text: str, *, reference: date | None = None) -> date | None:
@@ -481,7 +538,8 @@ def parse_content_date(text: str, *, reference: date | None = None) -> date | No
 
     relative = _RELATIVE_AGO_RE.search(blob)
     if relative:
-        amount = int(relative.group(1))
+        amount_raw = str(relative.group(1) or "1").lower()
+        amount = 1 if amount_raw in {"a", "an"} else int(amount_raw)
         unit = relative.group(2).lower()
         if unit.startswith("minute") or unit.startswith("hour"):
             return ref
@@ -658,7 +716,13 @@ _RECENCY_RE = re.compile(
     r")\b",
     re.I,
 )
-_LISTING_PATH_RE = re.compile(r"/(news|updates?|blog|articles?)(?:/|$|\?)", re.I)
+# Listing endpoints only — NOT deep articles under /news/<slug>.
+_LISTING_PATH_RE = re.compile(r"/(news|updates?|blog|articles?)/?$", re.I)
+_DEEP_ARTICLE_PATH_RE = re.compile(r"/(news|updates?|blog|articles?)/[^/]+", re.I)
+_LISTING_HUB_PREFIX_RE = re.compile(
+    r"^(.*?/(?:news|updates?|blog|articles?))(?:/|$)",
+    re.I,
+)
 _NAV_SHELL_MARKERS = (
     "log in",
     "sign in",
@@ -682,7 +746,9 @@ def should_apply_date_filter(query: str) -> bool:
 
 
 def is_content_listing_url(url: str) -> bool:
-    return bool(_LISTING_PATH_RE.search(urlsplit(str(url or "")).path.lower()))
+    """True for news/blog index pages, not individual articles under them."""
+    path = urlsplit(str(url or "")).path.lower().rstrip("/")
+    return bool(_LISTING_PATH_RE.search(path))
 
 
 def snapshot_viewport(snapshot: dict[str, Any]) -> dict[str, float]:
@@ -748,11 +814,122 @@ def should_defer_collect_on_listing(snapshot: dict[str, Any], query: str) -> boo
     return False
 
 
+def element_publication_date(el: dict[str, Any], *, reference: date | None = None) -> date | None:
+    """Publication date from element-local fields only — never nearby_text (avoids bleed)."""
+    chunks: list[str] = []
+    dates = el.get("dates") if isinstance(el.get("dates"), list) else []
+    for value in dates[:2]:
+        chunks.append(str(value))
+    for key in ("byline", "title", "text", "aria", "label"):
+        value = str(el.get(key) or "").strip()
+        if value:
+            chunks.append(value)
+    href = str(el.get("href") or "").strip()
+    if href:
+        chunks.append(href)
+    for chunk in chunks:
+        parsed = parse_content_date(chunk, reference=reference)
+        if parsed:
+            return parsed
+    return None
+
+
+def _title_tokens(text: str) -> set[str]:
+    return {token for token in re.findall(r"[a-z0-9]+", str(text or "").lower()) if len(token) >= 3}
+
+
+def page_understanding_from_snapshot(snapshot: dict[str, Any]) -> dict[str, Any] | None:
+    understanding = snapshot.get("page_understanding")
+    if isinstance(understanding, dict):
+        return understanding
+    capture = snapshot.get("web_capture")
+    if isinstance(capture, dict):
+        nested = capture.get("page_understanding")
+        if isinstance(nested, dict):
+            return nested
+    return None
+
+
+def match_feed_item_interactable(
+    feed_item: dict[str, Any],
+    interactables: list[dict[str, Any]] | None,
+) -> dict[str, Any] | None:
+    """Map a page-understanding feed row onto a real clickable interactable."""
+    best: dict[str, Any] | None = None
+    best_score = 0
+    feed_href = str(feed_item.get("href") or "").strip().lower()
+    feed_title = str(feed_item.get("title") or "").strip()
+    feed_tokens = _title_tokens(feed_title)
+    feed_news_id = ""
+    news_match = _NEWS_ID_RE.search(feed_href)
+    if news_match:
+        feed_news_id = news_match.group(1)
+    feed_path = urlsplit(feed_href).path.rstrip("/") if feed_href else ""
+    for raw in interactables or []:
+        if not isinstance(raw, dict) or raw.get("disabled") or not raw.get("id"):
+            continue
+        kind = str(raw.get("kind") or "").lower()
+        if kind not in {"link", "button", "menuitem", "blz-button", "card"}:
+            continue
+        href = str(raw.get("href") or "").strip().lower()
+        if not href:
+            continue
+        el_path = urlsplit(href).path.rstrip("/")
+        # Skip bare origins / section hubs — they falsely substring-match article hrefs.
+        if not el_path or el_path == "/" or (
+            len(el_path) < 12 and not any(hint in el_path for hint in _CONTENT_PATH_HINTS)
+        ):
+            if not (feed_news_id and feed_news_id in href):
+                continue
+        score = 0
+        if feed_news_id and feed_news_id in href:
+            score += 100
+        if feed_href and href and feed_href == href:
+            score += 50
+        elif feed_path and el_path and len(el_path) >= 12:
+            if feed_path in el_path or el_path in feed_path:
+                score += 40
+        label = str(raw.get("text") or raw.get("title") or raw.get("aria") or "")
+        overlap = len(feed_tokens & _title_tokens(label))
+        if overlap:
+            score += 8 * overlap
+        if score > best_score:
+            best_score = score
+            best = raw
+    # Require a real article match: news-id hit or solid title overlap (not nav crumbs).
+    if best and best_score >= 24:
+        return best
+    return None
+
+
+def newest_feed_item(understanding: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(understanding, dict):
+        return None
+    best: dict[str, Any] | None = None
+    best_date: date | None = None
+    for raw in understanding.get("feed_items") or []:
+        if not isinstance(raw, dict):
+            continue
+        title = str(raw.get("title") or "").strip()
+        if not title:
+            continue
+        published = parse_content_date(
+            " ".join(
+                str(raw.get(key) or "")
+                for key in ("date", "byline", "title")
+            )
+        )
+        if best is None or (published and (best_date is None or published > best_date)):
+            best = raw
+            best_date = published
+    return best
+
+
 def score_content_link(el: dict[str, Any], query: str, *, dom_index: int = 0) -> int:
     href = str(el.get("href") or "").lower()
     label = " ".join(
         str(el.get(key) or "")
-        for key in ("text", "aria", "label", "nearby_text")
+        for key in ("text", "title", "aria", "label")
     ).strip()
     blob = f"{label} {href}".lower()
     score = score_interactable(el, query)
@@ -760,7 +937,7 @@ def score_content_link(el: dict[str, Any], query: str, *, dom_index: int = 0) ->
     score += sum(3 for hint in _CONTENT_PATH_HINTS if hint in path)
     if re.search(r"\b(patch notes|changelog|release notes|updates?|what's new|whats new)\b", blob, re.I):
         score += 12
-    parsed_date = parse_content_date(f"{label} {href}")
+    parsed_date = element_publication_date(el)
     if parsed_date:
         score += parsed_date.toordinal()
     elif query_implies_recency(query):
@@ -775,10 +952,36 @@ def suggest_content_link_action(
     *,
     min_score: int = 6,
 ) -> dict[str, Any] | None:
-    """Click the top news/article link when browsing a listing page for latest content."""
+    """Click the newest article using the page map first, then dated interactables."""
     url = str(snapshot.get("url") or "")
     if not (is_content_listing_url(url) or query_implies_recency(query)):
         return None
+
+    understanding = page_understanding_from_snapshot(snapshot)
+    feed = newest_feed_item(understanding)
+    if feed:
+        matched = match_feed_item_interactable(feed, snapshot.get("interactables") or [])
+        if matched:
+            label = str(feed.get("title") or matched.get("text") or matched.get("aria") or "")[:80]
+            published = parse_content_date(
+                " ".join(str(feed.get(key) or "") for key in ("date", "byline", "title"))
+            )
+            date_note = f" dated {published.isoformat()}" if published else ""
+            shown = str(feed.get("date") or "").strip()
+            if shown:
+                date_note = f" ({shown})"
+            return {
+                "action": "click",
+                "target_id": str(matched["id"]),
+                "reason": (
+                    f'Open the newest mapped feed item "{label}"{date_note} '
+                    "(from page_understanding.feed_items)."
+                ),
+                "from_page_map": True,
+                "feed_title": label,
+                "feed_date": shown or None,
+            }
+
     best: dict[str, Any] | None = None
     best_score = 0
     current_path = urlsplit(url).path.rstrip("/")
@@ -801,13 +1004,14 @@ def suggest_content_link_action(
             best_score = score
             best = raw
     if best and best_score >= min_score:
-        label = str(best.get("text") or best.get("aria") or "")[:60]
-        published = parse_content_date(f"{label} {best.get('href') or ''}")
+        label = str(best.get("text") or best.get("title") or best.get("aria") or "")[:60]
+        published = element_publication_date(best)
         date_note = f" dated {published.isoformat()}" if published else ""
         return {
             "action": "click",
             "target_id": str(best["id"]),
             "reason": f"Open the newest relevant article link ({label}{date_note})",
+            "from_page_map": False,
         }
     return None
 

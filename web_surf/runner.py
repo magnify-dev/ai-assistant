@@ -175,6 +175,12 @@ def _explore_candidate_tier(
             for item in (spec.get("success_criteria") or [])
             if str(item).strip()
         ],
+        data_needed=[
+            str(item)
+            for item in (spec.get("data_needed") or [])
+            if str(item).strip()
+        ],
+        accomplishment_steps=list(spec.get("accomplishment_steps") or []),
         form_values={
             str(key): str(value)
             for key, value in (cfg.get("form_values") or {}).items()
@@ -215,13 +221,34 @@ def _synthesize_answer(
 ) -> str:
     from web_surf.spec import _get_prompt
 
+    from web_surf.plan import compact_plan_for_prompt, normalize_accomplishment_steps
+
     question = focus_query(query)
     scoped_index = index
     scoped_facts = {"facts": facts_for_query(facts_doc, question, max_facts=30)}
     copy_mode = wants_verbatim_copy(query)
     prompt_key = "web_research.answer_copy" if copy_mode else "web_research.answer"
+    plan_steps = normalize_accomplishment_steps(
+        spec.get("accomplishment_steps"),
+        query=question,
+    )
+    plan = compact_plan_for_prompt(plan_steps) if plan_steps else {}
+    needed = [
+        str(item).strip()
+        for item in (spec.get("data_needed") or [])
+        if str(item).strip()
+    ]
+    criteria = [
+        str(item).strip()
+        for item in (spec.get("success_criteria") or [])
+        if str(item).strip()
+    ]
     user = (
         f"question: {question}\n"
+        f"summary: {str(spec.get('summary') or question)}\n"
+        f"need: {', '.join(needed) if needed else 'answer the question'}\n"
+        f"success_criteria: {'; '.join(criteria) if criteria else 'complete answer'}\n"
+        f"plan: {' → '.join(str(s.get('description') or '') for s in plan.get('user_goal_steps') or [])}\n"
         f"pages:\n{index_summary_for_agent(scoped_index, query=question, max_pages=12)}\n"
         f"facts:\n{facts_summary_for_agent(scoped_facts, query=question, max_facts=20)}"
     )
@@ -434,7 +461,7 @@ def run_web_research(
     search_budget = max_search_results if max_search_results is not None else int(cfg["max_search_results"])
 
     if emit_events:
-        web_events.web_progress(step="spec", message="Structuring research plan")
+        web_events.web_progress(step="spec", message="Structuring research plan from your prompt")
     if use_llm:
         spec = structure_research_spec(
             query=query,
@@ -455,6 +482,35 @@ def run_web_research(
         spec=spec,
         store_dir=str(project_path / ".agent" / "web"),
     )
+    if emit_events:
+        steps = list(spec.get("accomplishment_steps") or [])
+        step_preview = " → ".join(
+            str(item.get("description") or "")[:80]
+            for item in steps[:6]
+            if isinstance(item, dict)
+        )
+        web_events.web_progress(
+            step="plan",
+            message=f"Accomplishment plan: {step_preview}" if step_preview else "Research plan ready",
+        )
+        web_events.criteria(
+            {
+                "goal": focus_query(query),
+                "criteria": [
+                    {"criterion": str(item), "met": False}
+                    for item in (spec.get("success_criteria") or [])
+                    if str(item).strip()
+                ],
+                "unmet_criteria": [
+                    str(item)
+                    for item in (spec.get("success_criteria") or [])
+                    if str(item).strip()
+                ],
+                "accomplishment_steps": steps,
+                "data_needed": list(spec.get("data_needed") or []),
+                "summary": spec.get("summary"),
+            }
+        )
 
     all_search: list[SearchResult] = []
     search_errors: list[str] = []

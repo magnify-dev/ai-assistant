@@ -5,6 +5,7 @@ export type InteractableElement = {
   test_id?: string | null;
   role?: string | null;
   text?: string | null;
+  title?: string | null;
   aria?: string | null;
   href?: string | null;
   input_type?: string | null;
@@ -12,6 +13,8 @@ export type InteractableElement = {
   name?: string | null;
   placeholder?: string | null;
   action_hint?: string | null;
+  content_role?: string | null;
+  dates?: string[] | null;
 };
 
 export type BrowserState = {

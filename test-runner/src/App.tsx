@@ -32,6 +32,7 @@ import {
 import type { PhaseMap, RunEvent } from "@/types";
 import type { WebCapture, WebCaptureBuildStatus, WebCaptureElement, WebCaptureReview } from "@/lib/webCaptureTypes";
 import { WEB_CAPTURE_BUILDING_PHASES } from "@/lib/webCaptureTypes";
+import { normalizeCaptureUrl } from "@/lib/webCaptureUrl";
 import { buildUiDisplaySnapshot, isUiDebugEnabled, traceUiDisplay } from "@/lib/uiRunDebug";
 import { UiRunDebugPanel } from "@/components/UiRunDebugPanel";
 
@@ -226,6 +227,7 @@ function applyStateFromServer(
     webResearch?: WebResearchState | null;
     playwrightSession?: PlaywrightSession | null;
     webCapture?: WebCapture | null;
+    capturesByUrl?: Record<string, WebCapture>;
   },
   setters: {
     setRunning: (v: boolean) => void;
@@ -242,6 +244,7 @@ function applyStateFromServer(
     setWebResearch?: (v: WebResearchState | null) => void;
     setPlaywrightSession?: (v: PlaywrightSession | null) => void;
     setWebCapture?: (v: WebCapture | null) => void;
+    setCapturesByUrl?: Dispatch<SetStateAction<Record<string, WebCapture>>>;
   },
   options?: { protectActiveRun?: boolean; protectInspectedSession?: boolean },
 ) {
@@ -306,6 +309,11 @@ function applyStateFromServer(
   }
   if (data.webCapture !== undefined && setters.setWebCapture) {
     setters.setWebCapture(data.webCapture as WebCapture | null);
+  }
+  if (data.capturesByUrl && typeof data.capturesByUrl === "object" && setters.setCapturesByUrl) {
+    // Merge so a sparse server snapshot cannot wipe earlier page maps from the UI.
+    const incoming = data.capturesByUrl as Record<string, WebCapture>;
+    setters.setCapturesByUrl((prev) => ({ ...prev, ...incoming }));
   }
 }
 
@@ -422,6 +430,8 @@ export default function App() {
   const [collaborationResult, setCollaborationResult] = useState<CollaborationResult | null>(null);
   const [webResearch, setWebResearch] = useState<WebResearchState | null>(null);
   const [webCapture, setWebCapture] = useState<WebCapture | null>(null);
+  const [capturesByUrl, setCapturesByUrl] = useState<Record<string, WebCapture>>({});
+  const [selectedMapUrl, setSelectedMapUrl] = useState<string | null>(null);
   const [captureBuild, setCaptureBuild] = useState<WebCaptureBuildStatus | null>(null);
   const [latestWebCaptureReview, setLatestWebCaptureReview] = useState<WebCaptureReview | null>(null);
   const [collabConfig, setCollabConfig] = useState<CollaborationConfig | null>(null);
@@ -447,6 +457,36 @@ export default function App() {
   const showRunView = useCallback(() => setView("run"), [setView]);
   const showConfigView = useCallback(() => setView("config"), [setView]);
 
+  /** Keep one stable map per URL; keep the previous map while a rebuild is in progress. */
+  useEffect(() => {
+    if (!webCapture?.url) return;
+    const key = normalizeCaptureUrl(webCapture.url);
+    if (!key) return;
+    const useful =
+      (webCapture.elements?.length ?? 0) > 0 || Boolean(webCapture.scroll_map?.stitched);
+    if (!useful) return;
+    const phase = captureBuild?.phase;
+    const buildingThisUrl =
+      Boolean(phase && WEB_CAPTURE_BUILDING_PHASES.has(phase)) &&
+      normalizeCaptureUrl(captureBuild?.url || webCapture.url) === key;
+    setCapturesByUrl((prev) => {
+      const existing = prev[key];
+      if (!existing) return { ...prev, [key]: webCapture };
+      if (phase === "complete" || !buildingThisUrl) return { ...prev, [key]: webCapture };
+      // Same map growing via scroll stitch — update in place.
+      const prevSlices = existing.scroll_map?.slice_count ?? 0;
+      const nextSlices = webCapture.scroll_map?.slice_count ?? 0;
+      if (
+        nextSlices > prevSlices ||
+        (webCapture.scroll_map?.stitched && !existing.scroll_map?.stitched)
+      ) {
+        return { ...prev, [key]: webCapture };
+      }
+      // Rebuild in progress — keep previous map until phase=complete.
+      return prev;
+    });
+  }, [webCapture, captureBuild?.phase, captureBuild?.url]);
+
   runningRef.current = running || startingRunRef.current || collabActiveRef.current;
 
   const runApiOptions = useMemo(() => runTargetOptions(testTargetMode), [testTargetMode]);
@@ -468,6 +508,8 @@ export default function App() {
     setCollaborationResult(null);
     setWebResearch(null);
     setWebCapture(null);
+    setCapturesByUrl({});
+    setSelectedMapUrl(null);
     setCaptureBuild(null);
     setLatestWebCaptureReview(null);
   }, []);
@@ -558,6 +600,7 @@ export default function App() {
             setWebResearch,
             setPlaywrightSession,
             setWebCapture,
+            setCapturesByUrl,
           },
           {
             protectActiveRun: runningRef.current || startingRunRef.current,
@@ -670,6 +713,7 @@ export default function App() {
         hasRun?: boolean;
         playwrightSession?: PlaywrightSession | null;
         webCapture?: WebCapture | null;
+        capturesByUrl?: Record<string, WebCapture>;
         webCaptureReviews?: WebCaptureReview[];
       }) => {
         if (runningRef.current) return;
@@ -690,10 +734,15 @@ export default function App() {
             setPlaywrightSession(data.playwrightSession ?? report.playwright_session ?? null);
           }
         }
+        if (data.capturesByUrl && typeof data.capturesByUrl === "object") {
+          setCapturesByUrl((prev) => ({ ...prev, ...data.capturesByUrl }));
+        }
         if (data.webCapture) {
           setWebCapture(data.webCapture);
           setLatestWebCaptureReview(data.webCaptureReviews?.at(-1) ?? null);
-        } else {
+          const key = normalizeCaptureUrl(data.webCapture.url);
+          if (key) setCapturesByUrl((prev) => ({ ...prev, [key]: data.webCapture as WebCapture }));
+        } else if (!data.capturesByUrl || Object.keys(data.capturesByUrl).length === 0) {
           setWebCapture(null);
           setLatestWebCaptureReview(null);
         }
@@ -1031,6 +1080,8 @@ export default function App() {
         setViewingRunId(null);
         setWebResearch(null);
         setWebCapture(null);
+        setCapturesByUrl({});
+        setSelectedMapUrl(null);
         setLatestWebCaptureReview(null);
         return;
       }
@@ -1049,6 +1100,8 @@ export default function App() {
       setCollaborationResult(null);
       setWebResearch(null);
       setWebCapture(null);
+      setCapturesByUrl({});
+      setSelectedMapUrl(null);
       setLatestWebCaptureReview(null);
     }
     if (event.type === "done" && !collabActiveRef.current && !startingRunRef.current) {
@@ -1275,6 +1328,7 @@ export default function App() {
           structuredTask?: StructuredTask;
           playwrightSession?: PlaywrightSession | null;
           webCapture?: WebCapture | null;
+          capturesByUrl?: Record<string, WebCapture>;
           webCaptureReviews?: WebCaptureReview[];
           collaborationTranscript?: {
             task?: string;
@@ -1298,6 +1352,15 @@ export default function App() {
         setPlaywrightSession(data.playwrightSession ?? null);
         setWebCapture(data.webCapture ?? null);
         setLatestWebCaptureReview(data.webCaptureReviews?.at(-1) ?? null);
+        const restoredMaps: Record<string, WebCapture> = {
+          ...(data.capturesByUrl && typeof data.capturesByUrl === "object" ? data.capturesByUrl : {}),
+        };
+        if (data.webCapture?.url) {
+          const key = normalizeCaptureUrl(data.webCapture.url);
+          if (key) restoredMaps[key] = data.webCapture;
+        }
+        setCapturesByUrl(restoredMaps);
+        setSelectedMapUrl(null);
         setSessionFrameIndex(0);
 
         if (data.report) {
@@ -1787,6 +1850,8 @@ export default function App() {
     setCollaborationResult(null);
     setWebResearch(null);
     setWebCapture(null);
+    setCapturesByUrl({});
+    setSelectedMapUrl(null);
     setLatestWebCaptureReview(null);
     try {
       const res = await apiFetch("/api/run", {
@@ -2238,6 +2303,7 @@ export default function App() {
               skipDeploy={runApiOptions.skipDeploy}
               webResearch={webResearch}
               captureBuild={captureBuild}
+              ollamaPrep={ollamaSwitch}
               onStop={() => void stopRun()}
             />
           ) : null}
@@ -2267,7 +2333,7 @@ export default function App() {
             </section>
           ) : null}
 
-          {(showLiveSession || webCapture || browserState?.url || captureBuild) ? (
+          {(showLiveSession || webCapture || browserState?.url || captureBuild || Object.keys(capturesByUrl).length > 0) ? (
             <section
               className={cn(
                 "surface-card shrink-0 p-4 transition-shadow duration-700",
@@ -2278,14 +2344,15 @@ export default function App() {
                 state={replayMode ? null : browserState}
                 session={playwrightSession}
                 capture={webCapture}
+                capturesByUrl={capturesByUrl}
                 captureBuild={captureBuild}
                 frameIndex={sessionFrameIndex}
                 onFrameIndexChange={setSessionFrameIndex}
                 lastAction={lastActionLine}
                 replayMode={replayMode}
-                latestReview={latestWebCaptureReview}
                 projectPath={project.trim() || undefined}
-                onReview={saveWebCaptureReview}
+                selectedMapUrl={selectedMapUrl}
+                onSelectedMapUrlChange={setSelectedMapUrl}
               />
             </section>
           ) : null}

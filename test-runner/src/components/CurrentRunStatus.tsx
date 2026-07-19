@@ -7,6 +7,7 @@ import {
   stripPipelineKeys,
   stripStepStatus,
   stepLabel,
+  type OllamaPrepStatus,
   type RunStepKey,
 } from "@/lib/runProgress";
 import type { WebCaptureBuildStatus } from "@/lib/webCaptureTypes";
@@ -27,6 +28,7 @@ type Props = {
   skipDeploy?: boolean;
   webResearch?: WebResearchState | null;
   captureBuild?: WebCaptureBuildStatus | null;
+  ollamaPrep?: OllamaPrepStatus | null;
   onStop?: () => void;
 };
 
@@ -69,11 +71,12 @@ export function CurrentRunStatus({
   skipDeploy = false,
   webResearch,
   captureBuild,
+  ollamaPrep,
   onStop,
 }: Props) {
   const status = useMemo(
-    () => resolveActiveRunStep(phases, agentCards, running),
-    [phases, agentCards, running],
+    () => resolveActiveRunStep(phases, agentCards, running, ollamaPrep),
+    [phases, agentCards, running, ollamaPrep],
   );
   const webWait = useMemo(
     () =>

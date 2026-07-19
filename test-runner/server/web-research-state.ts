@@ -7,6 +7,9 @@ export type WebResearchState = JsonRecord & {
   currentUrl?: string;
   snapshot?: JsonRecord;
   decision?: JsonRecord;
+  /** Distilled next-action process from the browser agent. */
+  decisionProcess?: JsonRecord;
+  accomplishmentSteps?: JsonRecord[];
   steps?: JsonRecord[];
   candidates?: JsonRecord[];
   visitGraph?: JsonRecord;
@@ -134,6 +137,10 @@ export function composeWebResearchState(
     next.controller = { ...(next.controller ?? {}), ...payload, ts };
     const url = payload.current_url ?? payload.currentUrl ?? payload.url;
     if (typeof url === "string" && url) next.currentUrl = url;
+    const process = record(event.process) ?? record(payload.process);
+    if (process) {
+      next.decisionProcess = { ...process, ts };
+    }
   } else if (
     type === "web_page_snapshot" ||
     type === "web_snapshot" ||
@@ -144,7 +151,12 @@ export function composeWebResearchState(
     const url = payload.url ?? event.url;
     if (typeof url === "string" && url) next.currentUrl = url;
   } else if (type === "web_decision" || type === "web_agent_decision") {
-    next.decision = { ...eventPayload(event, "decision"), ts };
+    const decision = eventPayload(event, "decision");
+    next.decision = { ...decision, ts };
+    const process = record(event.process) ?? record(decision.process);
+    if (process) {
+      next.decisionProcess = { ...process, ts, step_id: event.step_id };
+    }
   } else if (type === "web_step") {
     next.steps = appendBounded(next.steps, { ...eventPayload(event, "step"), ts });
   } else if (type === "web_state_transition") {
@@ -193,6 +205,9 @@ export function composeWebResearchState(
         ?.filter((criterion) => criterion.met === false || criterion.satisfied === false)
         .map((criterion) => String(criterion.criterion ?? criterion.text ?? criterion.label ?? ""))
         .filter(Boolean);
+    const steps = records(event.accomplishment_steps);
+    if (steps?.length) next.accomplishmentSteps = steps;
+    if (typeof event.goal === "string" && event.goal) next.query = next.query || event.goal;
   } else if (type === "web_help_request" || type === "web_help_response") {
     next.helperExchanges = appendBounded(next.helperExchanges, {
       ...event,

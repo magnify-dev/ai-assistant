@@ -25,20 +25,88 @@ def _rect_overlap_ratio(inner: dict[str, Any], outer: dict[str, Any]) -> float:
     return (overlap_w * overlap_h) / inner_area
 
 
-def _control_rects(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    rects: list[dict[str, Any]] = []
-    for item in items:
-        rect = item.get("rect")
-        if isinstance(rect, dict) and _rect_area(rect) > 0:
-            rects.append(rect)
-    return rects
+_WEAK_LABELS = frozenset(
+    {
+        "read more",
+        "learn more",
+        "more",
+        "here",
+        "click here",
+        "link",
+        "continue",
+        "see more",
+        "view",
+        "view more",
+        "details",
+        "open",
+        "→",
+        "»",
+        "…",
+        "...",
+    }
+)
 
 
-def _covered_by_controls(item: dict[str, Any], control_rects: list[dict[str, Any]], *, threshold: float = 0.72) -> bool:
+def _control_label(item: dict[str, Any]) -> str:
+    return str(
+        item.get("text") or item.get("title") or item.get("aria") or item.get("label") or ""
+    ).strip()
+
+
+def _is_weak_label(label: str) -> bool:
+    text = str(label or "").strip()
+    if not text or len(text) < 3:
+        return True
+    return text.lower() in _WEAK_LABELS
+
+
+def _covering_controls(
+    item: dict[str, Any],
+    controls: list[dict[str, Any]],
+    *,
+    threshold: float = 0.72,
+) -> list[dict[str, Any]]:
     rect = item.get("rect")
     if not isinstance(rect, dict):
-        return True
-    return any(_rect_overlap_ratio(rect, control) >= threshold for control in control_rects)
+        return []
+    covering: list[dict[str, Any]] = []
+    for control in controls:
+        control_rect = control.get("rect")
+        if not isinstance(control_rect, dict):
+            continue
+        if _rect_overlap_ratio(rect, control_rect) >= threshold:
+            covering.append(control)
+    return covering
+
+
+def _transfer_content_label(control: dict[str, Any], content: dict[str, Any]) -> None:
+    """Copy card/article display info onto a weak overlapping control (e.g. news link)."""
+    content_label = str(content.get("title") or content.get("text") or "").strip()
+    if content_label and not _is_weak_label(content_label) and _is_weak_label(_control_label(control)):
+        control["text"] = content_label[:120]
+        if not str(control.get("title") or "").strip():
+            control["title"] = content_label[:120]
+    # Always merge visible meta the user can see on the card (dates/authors/byline).
+    if content.get("dates"):
+        existing = [
+            str(d).strip()
+            for d in (control.get("dates") or [])
+            if str(d).strip()
+        ]
+        for date in content.get("dates") or []:
+            value = str(date).strip()
+            if value and value.lower() not in {d.lower() for d in existing}:
+                existing.append(value)
+        if existing:
+            control["dates"] = existing[:4]
+    if content.get("authors") and not control.get("authors"):
+        control["authors"] = content.get("authors")
+    if content.get("byline") and not control.get("byline"):
+        control["byline"] = content.get("byline")
+    if content.get("content_role") or content.get("kind"):
+        control.setdefault("content_role", content.get("content_role") or content.get("kind"))
+    if content.get("href") and not control.get("href"):
+        control["href"] = content.get("href")
 
 
 def merge_capture_elements(state: dict[str, Any]) -> list[dict[str, Any]]:
@@ -54,7 +122,6 @@ def merge_capture_elements(state: dict[str, Any]) -> list[dict[str, Any]]:
     if not content_items:
         return controls
 
-    control_rects = _control_rects(controls)
     merged = list(controls)
     seen_content_keys: set[str] = set()
 
@@ -64,14 +131,64 @@ def merge_capture_elements(state: dict[str, Any]) -> list[dict[str, Any]]:
         key = _content_dedupe_key(item)
         if key in seen_content_keys:
             continue
-        if _covered_by_controls(item, control_rects):
+        rect = item.get("rect")
+        if not isinstance(rect, dict) or _rect_area(rect) <= 0:
+            continue
+        covering = _covering_controls(item, controls)
+        if covering:
+            # Prefer one labeled control over a duplicate content box under the same hit target.
+            for control in covering:
+                _transfer_content_label(control, item)
             continue
         merged.append(item)
         if key:
             seen_content_keys.add(key)
     for index, item in enumerate(merged):
         item["index"] = index
+    apply_merged_labels_to_interactables(state, merged)
     return merged
+
+
+def apply_merged_labels_to_interactables(
+    state: dict[str, Any],
+    merged: list[dict[str, Any]],
+) -> None:
+    """Push enriched display labels from the map back onto agent interactables."""
+    by_id = {
+        str(item.get("id")): item
+        for item in merged
+        if isinstance(item, dict)
+        and item.get("id")
+        and item.get("map_layer") != "content"
+    }
+    if not by_id:
+        return
+    for raw in state.get("interactables") or []:
+        if not isinstance(raw, dict):
+            continue
+        enriched = by_id.get(str(raw.get("id") or ""))
+        if not enriched:
+            continue
+        if enriched.get("text") and _is_weak_label(_control_label(raw)):
+            raw["text"] = enriched.get("text")
+        if enriched.get("title") and not str(raw.get("title") or "").strip():
+            raw["title"] = enriched.get("title")
+        if enriched.get("dates"):
+            existing = [str(d).strip() for d in (raw.get("dates") or []) if str(d).strip()]
+            for date in enriched.get("dates") or []:
+                value = str(date).strip()
+                if value and value.lower() not in {d.lower() for d in existing}:
+                    existing.append(value)
+            if existing:
+                raw["dates"] = existing[:4]
+        if enriched.get("authors") and not raw.get("authors"):
+            raw["authors"] = enriched.get("authors")
+        if enriched.get("byline") and not raw.get("byline"):
+            raw["byline"] = enriched.get("byline")
+        if enriched.get("content_role"):
+            raw.setdefault("content_role", enriched.get("content_role"))
+        if enriched.get("href") and not raw.get("href"):
+            raw["href"] = enriched.get("href")
 
 
 def _content_dedupe_key(item: dict[str, Any]) -> str:
@@ -148,6 +265,9 @@ def promote_clickable_content(state: dict[str, Any], capture: dict[str, Any]) ->
             "map_layer": "content",
             "content_role": raw.get("content_role") or raw.get("kind"),
             "dates": raw.get("dates"),
+            "authors": raw.get("authors"),
+            "byline": raw.get("byline"),
+            "title": raw.get("title") or label[:120] or None,
             "likely_clickable": True,
             "from_content_map": True,
             "widget": "click",

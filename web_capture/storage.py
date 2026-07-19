@@ -18,20 +18,29 @@ def project_capture_dir(project: Path) -> Path:
     return project / ".agent" / "web-capture"
 
 
-def _copy_screenshot_to_run(project: Path, session_dir: Path, capture: dict[str, Any]) -> None:
-    rel = str(capture.get("screenshot") or "").strip()
+def _copy_one_screenshot(project: Path, target_dir: Path, rel: str) -> None:
+    rel = str(rel or "").strip()
     if not rel:
         return
     source = project / ".agent" / "web-capture" / rel
     if not source.is_file():
         return
-    target_dir = capture_dir_for_session(session_dir) / "screenshots"
-    target_dir.mkdir(parents=True, exist_ok=True)
     target = target_dir / source.name
     try:
         target.write_bytes(source.read_bytes())
     except OSError:
         pass
+
+
+def _copy_screenshot_to_run(project: Path, session_dir: Path, capture: dict[str, Any]) -> None:
+    """Copy capture screenshot and every scroll-slice image into the run folder."""
+    target_dir = capture_dir_for_session(session_dir) / "screenshots"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    _copy_one_screenshot(project, target_dir, str(capture.get("screenshot") or ""))
+    scroll_map = capture.get("scroll_map") if isinstance(capture.get("scroll_map"), dict) else {}
+    for slice_row in scroll_map.get("slices") or []:
+        if isinstance(slice_row, dict):
+            _copy_one_screenshot(project, target_dir, str(slice_row.get("screenshot") or ""))
 
 
 def persist_capture(session_dir: Path, capture: dict[str, Any]) -> Path:

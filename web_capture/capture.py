@@ -28,7 +28,12 @@ def _viewport(raw: Any) -> Viewport:
     }
 
 
-def clip_rect(raw: Any, viewport: Viewport) -> Rect | None:
+def clip_rect(
+    raw: Any,
+    viewport: Viewport,
+    *,
+    coord_space: str = "viewport",
+) -> Rect | None:
     if not isinstance(raw, dict):
         return None
     x = _number(raw.get("x"))
@@ -37,8 +42,16 @@ def clip_rect(raw: Any, viewport: Viewport) -> Rect | None:
     height = max(0.0, _number(raw.get("height")))
     left = max(0.0, x)
     top = max(0.0, y)
-    right = min(viewport["width"], x + width)
-    bottom = min(viewport["height"], y + height)
+    if coord_space == "document":
+        from web_capture.full_page import MAX_FULL_PAGE_HEIGHT_PX, document_canvas_height
+
+        max_w = max(viewport["width"], float(viewport.get("document_width") or viewport["width"]))
+        max_h = document_canvas_height(viewport, max_height=MAX_FULL_PAGE_HEIGHT_PX)
+        right = min(max_w, x + width)
+        bottom = min(max_h, y + height)
+    else:
+        right = min(viewport["width"], x + width)
+        bottom = min(viewport["height"], y + height)
     if right <= left or bottom <= top:
         return None
     return {
@@ -74,8 +87,14 @@ def build_capture(
     *,
     context: str = "",
     elements: list[dict[str, Any]] | None = None,
+    coord_space: str | None = None,
 ) -> WebCapture:
     viewport = _viewport(state.get("viewport"))
+    space = coord_space or (
+        "document"
+        if str(state.get("screenshot_mode") or "") == "full_page"
+        else "viewport"
+    )
     source_elements = elements if elements is not None else list(state.get("interactables") or [])
     normalized: list[CaptureElement] = []
     seen: set[str] = set()
@@ -84,10 +103,20 @@ def build_capture(
         if not isinstance(raw, dict):
             continue
         element_id = str(raw.get("id") or f"element-{len(normalized)}")
-        rect = clip_rect(raw.get("rect"), viewport)
+        # Full-page maps: rects are viewport-relative at scrollY=0, including below-fold
+        # elements with y > viewport.height — clip to the document canvas instead.
+        rect_raw = raw.get("rect")
+        if space == "document" and isinstance(rect_raw, dict):
+            scroll_y = float(viewport.get("scroll_y") or 0)
+            if abs(scroll_y) > 0.5:
+                rect_raw = {
+                    **rect_raw,
+                    "y": float(rect_raw.get("y") or 0) + scroll_y,
+                }
+        rect = clip_rect(rect_raw, viewport, coord_space=space)
         issues: list[str] = []
         if not rect:
-            issues.append("outside_viewport")
+            issues.append("outside_document" if space == "document" else "outside_viewport")
         if raw.get("disabled"):
             issues.append("disabled")
         if element_id in seen:

@@ -68,12 +68,33 @@ class ContextCurateTests(unittest.TestCase):
             step_id="step_001",
             snapshot=snapshot,
             discovered_routes={"https://example.com/docs"},
+            accomplishment_steps=[
+                {
+                    "id": "s1",
+                    "description": "Open docs",
+                    "done_when": "on docs",
+                    "status": "pending",
+                },
+                {
+                    "id": "s2",
+                    "description": "Report the answer",
+                    "done_when": "done",
+                    "status": "pending",
+                },
+            ],
+            data_needed=["API endpoint"],
+            success_criteria=["Find the docs page"],
         )
         self.assertIn("page", payload)
         self.assertIn("overlays", payload)
         self.assertIn("controls", payload)
         self.assertNotIn("blockers", payload)
         self.assertEqual(payload["controls"][0]["action"], "click")
+        self.assertEqual(payload["goal"], "product documentation")
+        self.assertIn("user_goal_steps", payload)
+        self.assertEqual(payload["current_step"]["id"], "s1")
+        self.assertEqual(payload["data_needed"], ["API endpoint"])
+        self.assertFalse(payload["ready_to_report"])
 
     def test_browse_context_includes_age_gate_note(self) -> None:
         snapshot = {

@@ -432,6 +432,53 @@ class PageMatchTests(unittest.TestCase):
         assert action is not None
         self.assertEqual(action["target_id"], "el_new")
 
+    def test_suggest_content_link_prefers_page_map_feed_over_contaminated_dates(self) -> None:
+        """Regression: map said Hotfixes=1d / Moth=5d but link dates were bled to 1d."""
+        from web_surf.page_match import suggest_content_link_action
+
+        snapshot = {
+            "url": "https://www.wowhead.com/mop-classic/news",
+            "page_understanding": {
+                "page_type": "article_list",
+                "feed_items": [
+                    {
+                        "title": "Hotfixes: Siege of Orgrimmar Trinkets",
+                        "date": "1 day ago",
+                        "href": "https://www.wowhead.com/news=1485698",
+                    },
+                    {
+                        "title": "New Moth Mount Available on Battle.net Store",
+                        "date": "5 days ago",
+                        "href": "https://www.wowhead.com/news=1485578",
+                    },
+                ],
+            },
+            "interactables": [
+                {
+                    "id": "el-moth",
+                    "kind": "link",
+                    "text": "New Moth Mount & Pet on the Battle.net Store - Mists of Pandaria Classic",
+                    # Contaminated local date field — must NOT win over the map feed.
+                    "dates": ["1 day ago"],
+                    "href": "https://www.wowhead.com/mop-classic/news/new-moth-mount-and-pet-on-the-battle-net-store-382168",
+                    "disabled": False,
+                },
+                {
+                    "id": "el-hotfix",
+                    "kind": "link",
+                    "text": "Siege of Orgrimmar Trinkets Fixed in Challenge Mode Dungeons - Mists of Pandaria Classic",
+                    "dates": ["1 day ago"],
+                    "href": "https://www.wowhead.com/mop-classic/news/siege-of-orgrimmar-trinkets-fixed-in-challenge-mode-dungeons-382200",
+                    "disabled": False,
+                },
+            ],
+        }
+        action = suggest_content_link_action(snapshot, "copy the latest news on the page")
+        self.assertIsNotNone(action)
+        assert action is not None
+        self.assertEqual(action["target_id"], "el-hotfix")
+        self.assertTrue(action.get("from_page_map"))
+
     def test_filter_text_by_recency_keeps_newest_section(self) -> None:
         from web_surf.page_match import filter_text_by_recency
 

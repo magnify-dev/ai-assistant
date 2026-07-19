@@ -46,7 +46,7 @@ GATE_CONFIRM_RE = re.compile(
     re.I,
 )
 COOKIE_OVERLAY_RE = re.compile(
-    r"\b(cookie|consent|tracking|privacy preferences|gdpr|ccpa)\b",
+    r"\b(cookies?|consent|tracking|privacy preferences|gdpr|ccpa)\b",
     re.I,
 )
 LEGAL_LINK_RE = re.compile(

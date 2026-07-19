@@ -4,6 +4,7 @@ import unittest
 
 from web_capture.stitch import (
     accumulate_scroll_capture,
+    compute_unique_bands,
     is_stitched_capture,
     merge_scroll_captures,
 )
@@ -45,6 +46,24 @@ def _capture(*, scroll_y: float, elements: list[dict], height: float = 720) -> d
 
 
 class ScrollStitchTests(unittest.TestCase):
+    def test_unique_bands_match_measured_scroll_delta(self) -> None:
+        bands = compute_unique_bands(
+            [
+                {"scroll_y": 0, "height": 720, "screenshot": "a.jpg"},
+                {"scroll_y": 648, "height": 720, "screenshot": "b.jpg"},  # scrolled 648px
+                {"scroll_y": 1296, "height": 720, "screenshot": "c.jpg"},
+            ]
+        )
+        self.assertEqual(bands[0]["content_top"], 0)
+        self.assertEqual(bands[0]["content_height"], 720)
+        self.assertEqual(bands[0]["draw_top"], 0)
+        # Second slice only draws the newly revealed 648px band.
+        self.assertAlmostEqual(bands[1]["content_top"], 72)  # 720 - 648
+        self.assertAlmostEqual(bands[1]["content_height"], 648)
+        self.assertAlmostEqual(bands[1]["draw_top"], 720)
+        self.assertAlmostEqual(bands[1]["delta_from_prev"], 648)
+        self.assertAlmostEqual(bands[2]["draw_top"], 1368)
+
     def test_merge_places_elements_in_document_space(self) -> None:
         top = _capture(
             scroll_y=0,
@@ -62,7 +81,10 @@ class ScrollStitchTests(unittest.TestCase):
         self.assertTrue(is_stitched_capture(merged))
         self.assertEqual(merged["scroll_map"]["coords"], "document")
         self.assertEqual(merged["scroll_map"]["slice_count"], 2)
-        # Canvas grows with explored slices, not unread document height.
+        # Second band starts at previous coverage end (720), not raw scroll_y.
+        second = merged["scroll_map"]["slices"][1]
+        self.assertAlmostEqual(second["draw_top"], 720)
+        self.assertAlmostEqual(second["content_height"], 700)
         self.assertAlmostEqual(merged["scroll_map"]["canvas_height"], 1420)
         self.assertLess(merged["scroll_map"]["canvas_height"], 3000)
 
@@ -84,6 +106,31 @@ class ScrollStitchTests(unittest.TestCase):
         self.assertIn("Article B", texts)
         self.assertGreater(merged["scroll_map"]["persistent_skipped"], 0)
 
+    def test_merge_skips_overlap_band_elements(self) -> None:
+        """Elements still in the previously covered viewport band are not re-added."""
+        top = _capture(
+            scroll_y=0,
+            elements=[
+                _element("el_a", y=100, text="Keep", href="/a"),
+                _element("el_old", y=650, text="NearBottom", href="/old"),
+            ],
+        )
+        # After scrolling 700px, viewport y=50 is still in the overlapped strip (content_top=20).
+        lower = _capture(
+            scroll_y=700,
+            elements=[
+                # Still in the overlapped strip (content_top ≈ 20) — must not be re-added.
+                _element("el_old_again", y=0, text="NearBottom", href="/old"),
+                _element("el_b", y=200, text="Fresh", href="/b"),
+            ],
+        )
+        merged = merge_scroll_captures([top, lower])
+        assert merged is not None
+        texts = [item.get("text") for item in merged["elements"]]
+        self.assertEqual(texts.count("NearBottom"), 1)
+        self.assertIn("Fresh", texts)
+        self.assertIn("Keep", texts)
+
     def test_single_slice_keeps_viewport_canvas(self) -> None:
         top = _capture(scroll_y=0, elements=[_element("el_a", y=200, text="A")])
         annotated = merge_scroll_captures([top])
@@ -91,7 +138,6 @@ class ScrollStitchTests(unittest.TestCase):
         self.assertFalse(is_stitched_capture(annotated))
         self.assertEqual(annotated["scroll_map"]["coords"], "viewport")
         self.assertEqual(annotated["scroll_map"]["canvas_height"], 720)
-        # Element stays in viewport space (not document-stretched).
         self.assertAlmostEqual(annotated["elements"][0]["rect"]["y"], 200)
 
     def test_remerge_of_stitched_capture_does_not_double_offset(self) -> None:
@@ -115,12 +161,24 @@ class ScrollStitchTests(unittest.TestCase):
         self.assertTrue(is_stitched_capture(second))
         y_b = next(item["rect"]["y"] for item in second["elements"] if item["id"] == "el_b")
         self.assertAlmostEqual(y_b, 800)
-        # Feeding the stitched result back must not double-offset.
         third = accumulate_scroll_capture(cache, url="https://example.test/news", capture=second)
         assert third is not None
         y_b2 = next(item["rect"]["y"] for item in third["elements"] if item["id"] == "el_b")
         self.assertAlmostEqual(y_b2, 800)
         self.assertEqual(len(cache["https://example.test/news"]["by_scroll"]), 2)
+
+    def test_accumulate_skips_weaker_same_scroll_reprocess(self) -> None:
+        cache: dict = {}
+        rich = _capture(
+            scroll_y=0,
+            elements=[_element("el_a", y=10, text="A"), _element("el_b", y=40, text="B")],
+        )
+        poor = _capture(scroll_y=0, elements=[_element("el_a", y=10, text="A")])
+        accumulate_scroll_capture(cache, url="https://example.test/news", capture=rich)
+        accumulate_scroll_capture(cache, url="https://example.test/news", capture=poor)
+        self.assertEqual(len(cache["https://example.test/news"]["by_scroll"]), 1)
+        kept = cache["https://example.test/news"]["by_scroll"][0.0]
+        self.assertEqual(len(kept["elements"]), 2)
 
 
 if __name__ == "__main__":

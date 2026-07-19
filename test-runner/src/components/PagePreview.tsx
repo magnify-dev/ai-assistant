@@ -143,7 +143,7 @@ export function PagePreview({ state, session, frameIndex = 0, onFrameIndexChange
                     control.id === selectedId && "bg-violet-500/20 text-violet-100",
                   )}
                 >
-                  {control.kind} #{control.id ?? control.index} — {control.text ?? control.aria ?? control.placeholder ?? "Unlabelled control"}
+                  {control.kind} #{control.id ?? control.index} — {control.text ?? control.title ?? control.aria ?? control.placeholder ?? "Unlabelled control"}
                   {control.action_hint ? ` · ${control.action_hint}` : ""}
                 </li>
               ))}

@@ -21,6 +21,7 @@ type Props = {
 function elementLabel(element: WebCaptureElement): string {
   return (
     element.text?.trim() ||
+    element.title?.trim() ||
     element.aria?.trim() ||
     element.label?.trim() ||
     element.name?.trim() ||
@@ -164,6 +165,24 @@ export function WebCapturePanel({ capture, latestReview, onReview }: Props) {
                     ? ` · ${Math.round(selected.ai_confidence * 100)}%`
                     : ""}
                 </dd>
+                {selected.dates?.length ? (
+                  <>
+                    <dt className="text-white/40">Date</dt>
+                    <dd className="text-white/75">{selected.dates.filter(Boolean).join(", ")}</dd>
+                  </>
+                ) : null}
+                {selected.authors?.length ? (
+                  <>
+                    <dt className="text-white/40">Author</dt>
+                    <dd className="text-white/75">{selected.authors.filter(Boolean).join(", ")}</dd>
+                  </>
+                ) : null}
+                {selected.byline ? (
+                  <>
+                    <dt className="text-white/40">Byline</dt>
+                    <dd className="text-white/75">{selected.byline}</dd>
+                  </>
+                ) : null}
               </dl>
               {selected.locator ? (
                 <div>

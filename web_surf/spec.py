@@ -28,6 +28,8 @@ def _get_prompt(key: str) -> str:
 
 
 def fallback_research_spec(query: str) -> dict[str, Any]:
+    from web_surf.plan import fallback_accomplishment_steps
+
     text = query.strip()
     return {
         "summary": text[:200],
@@ -36,6 +38,7 @@ def fallback_research_spec(query: str) -> dict[str, Any]:
         "success_criteria": [f"Find reliable information about: {text}"] if text else [],
         "max_pages": 5,
         "official_sources": [],
+        "accomplishment_steps": fallback_accomplishment_steps(text),
         "notes": [],
     }
 
@@ -62,6 +65,8 @@ def structure_research_spec(
     )
     if not parsed:
         return fallback_research_spec(text)
+    from web_surf.plan import normalize_accomplishment_steps
+
     parsed["source_query"] = text
     queries = parsed.get("search_queries")
     if not isinstance(queries, list) or not queries:
@@ -74,6 +79,14 @@ def structure_research_spec(
         ]
     else:
         parsed["official_sources"] = []
+    parsed["accomplishment_steps"] = normalize_accomplishment_steps(
+        parsed.get("accomplishment_steps"),
+        query=text,
+    )
+    # Keep the original prompt attached so later stages never lose it.
+    parsed.setdefault("summary", text[:200])
+    if not str(parsed.get("summary") or "").strip():
+        parsed["summary"] = text[:200]
     return parsed
 
 

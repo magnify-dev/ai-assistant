@@ -22,7 +22,6 @@ from web_surf.explore_branches import (
 from web_surf.page_match import (
     focus_query,
     goal_is_satisfied,
-    is_content_listing_url,
     is_publisher_content_url,
     is_secondary_host,
     page_contains_target_date,
@@ -33,8 +32,8 @@ from web_surf.page_match import (
     page_text_for_goal,
     parse_target_dates,
     parse_user_preferred_domains,
-    query_implies_recency,
     score_page_content,
+    preferred_discovery_seeds,
     seed_url_priority,
     should_apply_date_filter,
     should_defer_collect_on_listing,
@@ -184,6 +183,9 @@ def ollama_decision_provider(
                     max_steps_per_branch=int(context.get("max_steps_per_branch") or 20),
                     helper_guidance=list(context.get("helper_guidance") or []),
                     collected_evidence=list(context.get("collected_evidence") or []),
+                    accomplishment_steps=list(context.get("accomplishment_steps") or []),
+                    data_needed=list(context.get("data_needed") or []),
+                    success_criteria=list(context.get("success_criteria") or []),
                 ),
                 ensure_ascii=False,
                 separators=(",", ":"),
@@ -522,36 +524,173 @@ def _snapshot(
     step_id: str,
     context: str,
     form_values: dict[str, str] | None = None,
+    analyze: bool = True,
+    emit_progress: bool = True,
+    screenshot_mode: str = "content",
+    build_map: bool = True,
 ) -> dict[str, Any]:
     from ui_test.browser_state import attach_web_capture, collect_page_state
 
-    state = _redact_form_values(collect_page_state(page, include_screenshot=True), form_values)
+    state = _redact_form_values(
+        collect_page_state(
+            page,
+            include_screenshot=True,
+            screenshot_mode=screenshot_mode,
+        ),
+        form_values,
+    )
     state["snapshot_id"] = f"snap_{uuid.uuid4().hex[:12]}"
     state["session_id"] = session_id
     state["step_id"] = step_id
     state["context"] = context
     # Push screenshot to the UI before the slower map rebuild finishes.
-    if state.get("screenshot_b64"):
+    if state.get("screenshot_b64") and emit_progress:
         events.snapshot(_compact_snapshot(state))
-    try:
-        from web_capture.capture import build_capture
-        from web_capture.progress import capture_progress_event
+    if emit_progress and build_map:
+        try:
+            from web_capture.capture import build_capture
+            from web_capture.progress import capture_progress_event
 
-        draft = build_capture(state, context=context)
-        capture_progress_event(
-            phase="geometry",
-            url=str(state.get("url") or ""),
-            capture=draft,
-            element_count=len(draft.get("elements") or []),
-            screenshot_b64=state.get("screenshot_b64"),
-            title=str(state.get("title") or ""),
-            interactables=list(state.get("interactables") or []),
+            draft = build_capture(state, context=context)
+            capture_progress_event(
+                phase="geometry",
+                url=str(state.get("url") or ""),
+                capture=draft,
+                element_count=len(draft.get("elements") or []),
+                screenshot_b64=state.get("screenshot_b64"),
+                title=str(state.get("title") or ""),
+                interactables=list(state.get("interactables") or []),
+            )
+        except Exception:
+            pass
+    if build_map:
+        attach_web_capture(
+            page,
+            state,
+            context=context,
+            analyze=analyze,
+            emit_progress=emit_progress,
         )
-    except Exception:
-        pass
-    attach_web_capture(page, state, context=context, analyze=True)
-    events.snapshot(_compact_snapshot(state))
+        if emit_progress:
+            events.snapshot(_compact_snapshot(state))
     return state
+
+
+def _clear_overlays_before_map(
+    page: Any,
+    snapshot: dict[str, Any],
+    *,
+    session_id: str,
+    step_id: str,
+    form_values: dict[str, str],
+    field_mapping: dict[str, str],
+    history: list[dict[str, Any]] | None = None,
+    max_attempts: int = 5,
+) -> tuple[dict[str, Any], bool]:
+    """
+    Dismiss cookie/age/consent blockers before the expensive full-page map build.
+
+    Returns (snapshot, cleared_any). If blockers remain (e.g. need LLM), snapshot still
+    has no full map — caller should skip map build until the page is clear.
+    """
+    from web_surf.form_values import suggest_overlay_action, snapshot_needs_overlay_action
+
+    if not snapshot_needs_overlay_action(snapshot):
+        return snapshot, False
+
+    events.controller(
+        {
+            "session_id": session_id,
+            "status": "overlay_dismiss",
+            "current_url": str(page.url or ""),
+            "reason": "Clearing blocking overlay before full-page map…",
+        }
+    )
+    events.log("Blocking overlay detected — clearing before map build", level="info")
+
+    cleared_any = False
+    blocked: list[str] = []
+    recent = list(history or [])
+
+    for attempt in range(max_attempts):
+        if not snapshot_needs_overlay_action(snapshot):
+            events.log("Overlay cleared — ready for full-page map", level="info")
+            return snapshot, cleared_any
+
+        suggested = suggest_overlay_action(
+            snapshot,
+            form_values,
+            field_mapping,
+            recent_history=recent,
+            blocked_attempts=blocked,
+        )
+        if not suggested:
+            events.log(
+                "Overlay still present but no deterministic dismiss — deferring to model",
+                level="info",
+            )
+            break
+
+        validated, error = validate_overlay_action(suggested, snapshot, form_values)
+        if validated is None:
+            validated, error = validate_action(
+                suggested,
+                snapshot,
+                set(),
+                None,
+                form_values,
+            )
+        if validated is None:
+            events.log(f"Pre-map overlay action rejected: {error}", level="info")
+            break
+
+        sig = action_signature(validated)
+        if sig:
+            blocked.append(sig)
+
+        events.log(
+            f"Pre-map overlay clear ({attempt + 1}/{max_attempts}): "
+            f"{validated.get('action')} {validated.get('target_id') or ''} — "
+            f"{str(validated.get('reason') or '')[:120]}",
+            level="info",
+        )
+        try:
+            _execute(page, validated)
+            cleared_any = True
+        except Exception as exc:
+            events.log(f"Pre-map overlay clear failed: {exc}", level="info")
+            recent.append(
+                {
+                    "action": validated.get("action"),
+                    "target_id": validated.get("target_id"),
+                    "ok": False,
+                    "error": str(exc)[:200],
+                    "reason": validated.get("reason"),
+                }
+            )
+            break
+
+        recent.append(
+            {
+                "action": validated.get("action"),
+                "target_id": validated.get("target_id"),
+                "ok": True,
+                "reason": validated.get("reason"),
+            }
+        )
+        snapshot = _snapshot(
+            page,
+            session_id=session_id,
+            step_id=f"{step_id}_overlay{attempt + 1}",
+            context="overlay_clear",
+            form_values=form_values,
+            analyze=False,
+            emit_progress=True,
+            screenshot_mode="content",
+            build_map=False,
+        )
+
+    return snapshot, cleared_any
 
 
 def _compact_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
@@ -920,17 +1059,32 @@ def stdin_help_provider(request: dict[str, Any]) -> dict[str, Any]:
         }
 
 
-def _scroll_to_top(page: Any) -> None:
+def _read_scroll_y(page: Any) -> float:
+    try:
+        return float(page.evaluate("() => window.scrollY || window.pageYOffset || 0"))
+    except Exception:
+        return 0.0
+
+
+def _scroll_to_top(page: Any) -> float:
     page.evaluate("() => window.scrollTo(0, 0)")
     page.wait_for_timeout(300)
+    return _read_scroll_y(page)
 
 
-def _scroll_to_next_view(page: Any, *, viewport_height: float | None = None) -> None:
-    if viewport_height:
-        page.evaluate("(h) => window.scrollBy(0, h * 0.92)", viewport_height)
-    else:
-        page.evaluate("() => window.scrollBy(0, window.innerHeight * 0.92)")
+def _scroll_by_measured(page: Any, *, delta_y: float) -> tuple[float, float]:
+    """Scroll by delta_y and return (before, after) measured scroll positions."""
+    before = _read_scroll_y(page)
+    page.evaluate("(dy) => window.scrollBy(0, dy)", float(delta_y))
     page.wait_for_timeout(400)
+    after = _read_scroll_y(page)
+    return before, after
+
+
+def _scroll_to_next_view(page: Any, *, viewport_height: float | None = None) -> tuple[float, float]:
+    """Scroll roughly one viewport; return measured before/after scrollY."""
+    step = float(viewport_height or 720) * 0.9
+    return _scroll_by_measured(page, delta_y=step)
 
 
 def _viewport_snapshot_score(snapshot: dict[str, Any], goal: str) -> int:
@@ -946,6 +1100,79 @@ def _viewport_snapshot_score(snapshot: dict[str, Any], goal: str) -> int:
     return score
 
 
+def _paging_view_budget(snapshot: dict[str, Any], *, max_views: int = 16) -> int:
+    """Cover the full document height (with small overlap), capped for safety."""
+    vp = snapshot_viewport(snapshot)
+    view_height = max(1.0, vp["height"])
+    doc_height = max(view_height, vp["document_height"])
+    step = view_height * 0.9
+    needed = int((doc_height + step - 1) // step) if step else 1
+    return max(1, min(max_views, needed))
+
+
+def _merge_paged_page_text(views: list[dict[str, Any]], *, max_chars: int = 16000) -> str:
+    """Concatenate unique text from scroll views so below-fold content is not lost."""
+    chunks: list[str] = []
+    seen: set[str] = set()
+    for snap in views:
+        text = str(snap.get("visible_text") or snap.get("semantic_snapshot") or "").strip()
+        if len(text) < 40:
+            continue
+        key = text[:240]
+        if key in seen:
+            continue
+        seen.add(key)
+        chunks.append(text)
+    merged = "\n\n".join(chunks)
+    return merged[:max_chars]
+
+
+def _wake_lazy_content(
+    page: Any,
+    *,
+    viewport_height: float,
+    max_steps: int = 14,
+) -> list[str]:
+    """Scroll through the page once so lazy media/DOM mounts, collecting text chunks."""
+    texts: list[str] = []
+    _scroll_to_top(page)
+    for step in range(max_steps):
+        try:
+            chunk = str(
+                page.evaluate(
+                    """() => (document.body && (document.body.innerText || "")) || "" """
+                )
+                or ""
+            ).strip()
+        except Exception:
+            chunk = ""
+        if len(chunk) >= 40:
+            texts.append(chunk[:8000])
+        before = _read_scroll_y(page)
+        _, after = _scroll_to_next_view(page, viewport_height=viewport_height)
+        if after <= before + 1.0:
+            break
+        try:
+            doc_h = float(
+                page.evaluate(
+                    """() => Math.max(
+                      document.documentElement ? document.documentElement.scrollHeight : 0,
+                      document.body ? document.body.scrollHeight : 0,
+                      1
+                    )"""
+                )
+                or 1
+            )
+        except Exception:
+            doc_h = after + viewport_height
+        if after + viewport_height >= doc_h - 2:
+            break
+        if step >= max_steps - 1:
+            break
+    _scroll_to_top(page)
+    return texts
+
+
 def _enhance_snapshot_with_viewport_paging(
     page: Any,
     snapshot: dict[str, Any],
@@ -957,97 +1184,77 @@ def _enhance_snapshot_with_viewport_paging(
     views_explored: dict[str, int],
     scroll_stitch_cache: dict[str, Any] | None = None,
     session_dir: Path | None = None,
-    max_views: int = 5,
+    max_views: int = 16,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    """Scroll through long pages and stitch captures into one document-tall map."""
+    """Build a full-page map with one screenshot (no multi-slice stitch)."""
     url_key = str(snapshot.get("url") or "")
-    if not page_extends_beyond_viewport(snapshot):
-        return snapshot, []
-    if not (query_implies_recency(goal) or is_content_listing_url(url_key)):
-        return snapshot, []
 
-    already = views_explored.get(url_key, 0)
-    if already >= max_views:
-        return snapshot, []
+    # Already captured this URL as a full-page map — reuse.
+    if scroll_stitch_cache is not None:
+        cached = (scroll_stitch_cache.get(url_key) or {}).get("merged")
+        if isinstance(cached, dict):
+            from web_capture.full_page import is_full_page_capture
+
+            if is_full_page_capture(cached) or (
+                isinstance(cached.get("scroll_map"), dict)
+                and cached["scroll_map"].get("coords") == "document"
+            ):
+                result = dict(snapshot)
+                result["web_capture"] = cached
+                views_explored[url_key] = max(views_explored.get(url_key, 0), 1)
+                _publish_web_capture(result, session_dir=session_dir)
+                return result, []
 
     vp = snapshot_viewport(snapshot)
-    best = snapshot
-    best_score = _viewport_snapshot_score(snapshot, goal)
-    extra_snapshots: list[dict[str, Any]] = []
-    view_snapshots: list[dict[str, Any]] = []
+    events.log(
+        "Capturing full-page screenshot for map (single image, no scroll stitch)",
+        level="info",
+    )
+    wake_texts = _wake_lazy_content(
+        page,
+        viewport_height=float(vp.get("height") or 720),
+        max_steps=min(max_views, 14),
+    )
 
-    _scroll_to_top(page)
-    top_snap = _snapshot(
+    full_snap = _snapshot(
         page,
         session_id=session_id,
-        step_id=f"{step_id}_view0",
-        context="viewport_paging",
+        step_id=f"{step_id}_full",
+        context="full_page",
         form_values=form_values,
+        analyze=True,
+        emit_progress=True,
+        screenshot_mode="full_page",
     )
-    view_snapshots.append(top_snap)
-    top_score = _viewport_snapshot_score(top_snap, goal)
-    if top_score > best_score:
-        best = top_snap
-        best_score = top_score
-    extra_snapshots.append(_compact_snapshot(top_snap))
-    views = 1
+    views_explored[url_key] = max(views_explored.get(url_key, 0), 1)
 
-    current = top_snap
-    while views < max_views and viewport_has_content_below(current):
-        _scroll_to_next_view(page, viewport_height=vp["height"])
-        view_snap = _snapshot(
-            page,
-            session_id=session_id,
-            step_id=f"{step_id}_view{views}",
-            context="viewport_paging",
-            form_values=form_values,
-        )
-        view_snapshots.append(view_snap)
-        extra_snapshots.append(_compact_snapshot(view_snap))
-        view_score = _viewport_snapshot_score(view_snap, goal)
-        if view_score > best_score:
-            best = view_snap
-            best_score = view_score
-        current = view_snap
-        views += 1
+    capture = full_snap.get("web_capture")
+    if isinstance(capture, dict):
+        from web_capture.full_page import annotate_full_page_capture, is_full_page_capture
 
-    views_explored[url_key] = already + views
+        if not is_full_page_capture(capture):
+            capture = annotate_full_page_capture(capture)
+            full_snap["web_capture"] = capture
+        if scroll_stitch_cache is not None:
+            entry = scroll_stitch_cache.setdefault(url_key, {"by_scroll": {}, "merged": None})
+            entry["merged"] = capture
 
-    from web_capture.stitch import accumulate_scroll_capture, merge_scroll_captures
-
-    view_captures = [
-        item["web_capture"]
-        for item in view_snapshots
-        if isinstance(item.get("web_capture"), dict)
-    ]
-    # Seed cache with raw viewport slices, then merge once.
-    stitched = None
-    if scroll_stitch_cache is not None:
-        for cap in view_captures:
-            stitched = accumulate_scroll_capture(
-                scroll_stitch_cache,
-                url=url_key,
-                capture=cap,
-            )
-    elif len(view_captures) > 1:
-        stitched = merge_scroll_captures(view_captures)
-    elif view_captures:
-        from web_capture.stitch import annotate_scroll_map
-
-        stitched = annotate_scroll_map(view_captures[0])
-
-    # Restore best scroll for text collection — do NOT re-snapshot (would overwrite stitch).
-    best_vp = snapshot_viewport(best)
-    page.evaluate("(y) => window.scrollTo(0, y)", best_vp["scroll_y"])
-    page.wait_for_timeout(200)
-
-    result = dict(best)
-    # Keep best-view text/interactables for the agent, but publish the stitched map.
-    if isinstance(stitched, dict):
-        result["web_capture"] = stitched
-    extra_snapshots.append(_compact_snapshot(result))
+    # Prefer wake-pass text when it found more below-fold content.
+    merged_text = _merge_paged_page_text(
+        [{"visible_text": t} for t in wake_texts]
+        + [full_snap, snapshot],
+    )
+    result = dict(full_snap)
+    if merged_text:
+        result["visible_text"] = merged_text
+        result["semantic_snapshot"] = merged_text
+        result["page_text_stitched"] = True
+    # Keep goal-scoring: if original snapshot text scored higher, still use full map image.
+    if _viewport_snapshot_score(snapshot, goal) > _viewport_snapshot_score(result, goal):
+        result["interactables"] = snapshot.get("interactables") or result.get("interactables")
+    extra = [_compact_snapshot(result)]
     _publish_web_capture(result, session_dir=session_dir)
-    return result, extra_snapshots
+    return result, extra
 
 
 def _apply_scroll_stitch(
@@ -1057,23 +1264,40 @@ def _apply_scroll_stitch(
     session_dir: Path | None = None,
     publish: bool = True,
 ) -> dict[str, Any]:
+    """Publish / cache the page map. Full-page captures skip multi-slice stitching."""
     capture = snapshot.get("web_capture")
     if not isinstance(capture, dict):
         return snapshot
     url = str(snapshot.get("url") or "")
+    from web_capture.full_page import is_full_page_capture
     from web_capture.stitch import accumulate_scroll_capture, is_stitched_capture
 
-    if is_stitched_capture(capture):
-        # Already merged — keep as-is and make sure UI has it.
+    if is_full_page_capture(capture) or is_stitched_capture(capture):
+        if scroll_stitch_cache is not None and url:
+            entry = scroll_stitch_cache.setdefault(url, {"by_scroll": {}, "merged": None})
+            entry["merged"] = capture
+        try:
+            from ui_test.browser_state import remember_web_capture
+
+            remember_web_capture(capture)
+        except Exception:
+            pass
         if publish:
             _publish_web_capture(snapshot, session_dir=session_dir)
         return snapshot
 
+    # Legacy path: accumulate viewport slices if anything still emits them.
     merged = accumulate_scroll_capture(scroll_stitch_cache, url=url, capture=capture)
     if not merged:
         return snapshot
     updated = dict(snapshot)
     updated["web_capture"] = merged
+    try:
+        from ui_test.browser_state import remember_web_capture
+
+        remember_web_capture(merged)
+    except Exception:
+        pass
     if publish:
         _publish_web_capture(updated, session_dir=session_dir)
     return updated
@@ -1268,6 +1492,8 @@ def explore_candidates_in_browser(
     decision_provider: DecisionProvider | None = None,
     help_provider: HelpProvider | None = None,
     success_criteria: list[str] | None = None,
+    data_needed: list[str] | None = None,
+    accomplishment_steps: list[dict[str, Any]] | None = None,
     form_values: dict[str, str] | None = None,
     form_values_provider: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
     publisher_domains: set[str] | None = None,
@@ -1276,10 +1502,17 @@ def explore_candidates_in_browser(
     """Explore from result origins, executing exactly one validated model action per step."""
     from playwright.sync_api import sync_playwright
     from ui_test.playwright_session import PlaywrightSessionRecorder, session_manifest_paths
+    from web_surf.plan import (
+        infer_step_completion,
+        mark_step_done,
+        normalize_accomplishment_steps,
+        plan_progress,
+    )
 
     session_id = f"web_{uuid.uuid4().hex}"
     # Strip the collaboration wrapper so decisions and scoring see the user's task.
     goal = focus_query(query)
+    plan_steps = normalize_accomplishment_steps(accomplishment_steps, query=goal)
     recorder = PlaywrightSessionRecorder(
         project_path / ".agent" / "current" / "web-artifacts" / "playwright-session"
     )
@@ -1307,21 +1540,38 @@ def explore_candidates_in_browser(
     planned_form_fingerprints: set[str] = set()
     field_mapping: dict[str, str] = {}
     form_value_reasoning = ""
-    seed_urls: list[str] = []
-    for row in candidates[:max_visits]:
+    raw_candidate_urls: list[str] = []
+    for row in candidates[: max(max_visits * 3, max_visits)]:
         url = _safe_normalize(str(getattr(row, "url", "")))
+        if url and url not in raw_candidate_urls:
+            raw_candidate_urls.append(url)
+    # Named site + latest/news: start on the listing hub and discover the article
+    # on-page. Do not land on a specific search-result article first.
+    discovery_hubs = [
+        _safe_normalize(url)
+        for url in preferred_discovery_seeds(goal, raw_candidate_urls)
+        if _safe_normalize(url)
+    ]
+    seed_urls: list[str] = []
+    for url in discovery_hubs + raw_candidate_urls:
         if url and url not in seed_urls:
             seed_urls.append(url)
     seed_urls.sort(
         key=lambda url: seed_url_priority(url, goal, preferred_domains=preferred_domain_set),
         reverse=True,
     )
+    # Keep exploration focused: hubs first, then a few search hits as fallbacks.
+    seed_urls = seed_urls[: max(max_visits, len(discovery_hubs) + 1)]
     origins = list(dict.fromkeys(origin_url(url) for url in seed_urls))
     allowed_origins = set(origins)
-    # Search results are trusted starting points: land on them directly and let
-    # the model navigate back to them at any time.
+    # Listing hubs + search results are trusted starting points.
     discovered_routes = set(origins) | set(seed_urls)
     start_urls = seed_urls or origins
+    if discovery_hubs:
+        events.log(
+            f"Preferred-site discovery: start on listing hub(s) {', '.join(discovery_hubs[:3])}",
+            level="info",
+        )
     max_steps = max(max_steps, len(start_urls) * max(1, max_steps_per_branch))
     history: list[dict[str, Any]] = []
     agent_memory: list[dict[str, Any]] = []
@@ -1340,6 +1590,7 @@ def explore_candidates_in_browser(
     goal_met = False
     session_state: dict[str, Any] = {
         "query": query,
+        "goal": goal,
         "status": "starting",
         "seed_urls": seed_urls,
         "origins": origins,
@@ -1348,6 +1599,9 @@ def explore_candidates_in_browser(
         "snapshots": snapshots,
         "transitions": transitions,
         "discovered_routes": sorted(discovered_routes),
+        "accomplishment_steps": plan_steps,
+        "data_needed": list(data_needed or []),
+        "success_criteria": list(success_criteria or []),
     }
     save_session_state(project_path, session_id, session_state)
     events.candidates(
@@ -1372,6 +1626,9 @@ def explore_candidates_in_browser(
                 for criterion in (success_criteria or [])
             ],
             "unmet_criteria": list(success_criteria or []),
+            "accomplishment_steps": plan_steps,
+            "data_needed": list(data_needed or []),
+            "goal": goal,
         }
     )
 
@@ -1456,6 +1713,19 @@ def explore_candidates_in_browser(
                         step_id=bootstrap_id,
                     )
                     events.visit_graph({"session_id": session_id, "graph": graph})
+                    # Already on the requested site — don't force a homepage detour for s1.
+                    if preferred_domain_set and url_on_preferred_source(
+                        str(page.url or ""),
+                        preferred_domain_set,
+                    ):
+                        marked = infer_step_completion(
+                            plan_steps,
+                            action="navigate",
+                            on_preferred_source=True,
+                            page_relevant=False,
+                        )
+                        if marked:
+                            session_state["accomplishment_steps"] = plan_steps
                 except Exception as exc:
                     item = {
                         "step_id": bootstrap_id,
@@ -1490,19 +1760,54 @@ def explore_candidates_in_browser(
                             "max_steps": max_steps,
                         }
                     )
+                    # Light observe first — do not build a full-page map under a blocker.
                     snapshot = _snapshot(
                         page,
                         session_id=session_id,
                         step_id=step_id,
                         context="decision",
                         form_values=session_form_values,
+                        analyze=False,
+                        build_map=False,
+                        screenshot_mode="content",
                     )
-                    recorder.record_frame(
-                        page,
-                        label=step_id,
-                        context="decision",
-                        snapshot=snapshot,
-                    )
+                    # Age/cookie gates often need form values before deterministic dismiss.
+                    if snapshot_needs_overlay_action(snapshot):
+                        plan_result = ensure_form_values(
+                            query=goal,
+                            snapshot=snapshot,
+                            form_values=session_form_values,
+                            planned_fingerprints=planned_form_fingerprints,
+                            ollama_url=ollama_url,
+                            model=model,
+                            timeout_sec=timeout_sec,
+                            provider=form_values_provider,
+                        )
+                        if plan_result:
+                            session_form_values.update(plan_result.get("form_values") or {})
+                            field_mapping.update(plan_result.get("field_mapping") or {})
+                            events.form_values_plan(
+                                {
+                                    "session_id": session_id,
+                                    "step_id": step_id,
+                                    "snapshot_id": snapshot["snapshot_id"],
+                                    "available_value_keys": sorted(session_form_values.keys()),
+                                    "field_mapping": field_mapping,
+                                    "reasoning": str(plan_result.get("reasoning") or ""),
+                                    "new_keys": sorted((plan_result.get("form_values") or {}).keys()),
+                                    "trigger": "pre_map_overlay",
+                                }
+                            )
+                        snapshot, _cleared = _clear_overlays_before_map(
+                            page,
+                            snapshot,
+                            session_id=session_id,
+                            step_id=step_id,
+                            form_values=session_form_values,
+                            field_mapping=field_mapping,
+                            history=history,
+                        )
+                    # Full-page map only when the page is clear — avoids rebuild after dismiss.
                     if not snapshot_needs_overlay_action(snapshot):
                         snapshot, paged_snapshots = _enhance_snapshot_with_viewport_paging(
                             page,
@@ -1518,13 +1823,20 @@ def explore_candidates_in_browser(
                         snapshots.extend(paged_snapshots)
                         if paged_snapshots:
                             events.log(
-                                "Scrolled through page views to find goal-relevant content",
+                                "Built full-page map after page was clear of blockers",
                                 level="info",
                             )
                     snapshot = _apply_scroll_stitch(
                         snapshot,
                         scroll_stitch_cache,
                         session_dir=recorder.session_dir,
+                    )
+                    # Record after map so history frames show the full scrollable page.
+                    recorder.record_frame(
+                        page,
+                        label=step_id,
+                        context="decision",
+                        snapshot=snapshot,
                     )
                     snapshots.append(_compact_snapshot(snapshot))
                     active_branch_url = resolve_active_branch_url(
@@ -1567,17 +1879,29 @@ def explore_candidates_in_browser(
                         if _safe_normalize(str(route))
                         and origin_url(str(route)) in allowed_origins
                     )
+                    map_content_link: dict[str, Any] | None = None
                     if should_defer_collect_on_listing(snapshot, goal):
-                        content_link = suggest_content_link_action(snapshot, goal)
-                        if content_link:
+                        map_content_link = suggest_content_link_action(snapshot, goal)
+                        if map_content_link:
                             helper_guidance.append(
                                 {
                                     "step_id": step_id,
                                     "kind": "listing_page",
                                     "instruction": (
                                         "This looks like a news/article listing page. "
-                                        f"Click the newest article link ({content_link.get('target_id')}) "
-                                        "before extract/report — do not settle for an older item."
+                                        "Use the built page map — open the newest feed item "
+                                        f"({map_content_link.get('target_id')}"
+                                        + (
+                                            f", {map_content_link.get('feed_title')}"
+                                            if map_content_link.get("feed_title")
+                                            else ""
+                                        )
+                                        + (
+                                            f", {map_content_link.get('feed_date')}"
+                                            if map_content_link.get("feed_date")
+                                            else ""
+                                        )
+                                        + "). Do not settle for an older item."
                                     ),
                                 }
                             )
@@ -1714,6 +2038,9 @@ def explore_candidates_in_browser(
                             }
                             for page_result in pages[-5:]
                         ],
+                        "accomplishment_steps": plan_steps,
+                        "data_needed": list(data_needed or []),
+                        "success_criteria": list(success_criteria or []),
                     }
                     current_fp = progress_fingerprint(snapshot)
                     blocked_attempts = sorted(state_attempts.get(current_fp, set()))
@@ -1749,12 +2076,67 @@ def explore_candidates_in_browser(
                             }
                         )
                     try:
-                        raw_decision = overlay_decide(model_context) if overlay_mode else decide(model_context)
+                        # When the page map already identified the newest feed item, act on
+                        # that map instead of letting the LLM re-pick from contaminated labels.
+                        if (
+                            not overlay_mode
+                            and isinstance(map_content_link, dict)
+                            and map_content_link.get("from_page_map")
+                            and map_content_link.get("target_id")
+                            and should_defer_collect_on_listing(snapshot, goal)
+                        ):
+                            raw_decision = {
+                                "action": "click",
+                                "target_id": str(map_content_link["target_id"]),
+                                "reason": str(
+                                    map_content_link.get("reason")
+                                    or "Open newest item from page map."
+                                ),
+                            }
+                            events.log(
+                                f"Using page map feed item for next click: {map_content_link.get('target_id')}",
+                                level="info",
+                            )
+                        else:
+                            raw_decision = (
+                                overlay_decide(model_context) if overlay_mode else decide(model_context)
+                            )
                     except Exception as exc:
                         raw_decision = {"action": "help", "question": f"Decision model unavailable: {exc}"}
                     coerced = normalize_decision(raw_decision)
                     if coerced is not None:
                         raw_decision = coerced
+                    progress_now = plan_progress(plan_steps)
+                    current_plan = progress_now.get("current") if isinstance(progress_now, dict) else None
+                    decision_process = {
+                        "goal": goal,
+                        "current_step": (
+                            {
+                                "id": current_plan.get("id"),
+                                "description": current_plan.get("description"),
+                                "done_when": current_plan.get("done_when"),
+                            }
+                            if isinstance(current_plan, dict)
+                            else None
+                        ),
+                        "action": str(raw_decision.get("action") or "")
+                        if isinstance(raw_decision, dict)
+                        else "",
+                        "target_id": str(raw_decision.get("target_id") or "")
+                        if isinstance(raw_decision, dict)
+                        else "",
+                        "url": str(raw_decision.get("url") or "")
+                        if isinstance(raw_decision, dict)
+                        else "",
+                        "reason": str(raw_decision.get("reason") or "")
+                        if isinstance(raw_decision, dict)
+                        else "",
+                        "completed_step_id": str(raw_decision.get("completed_step_id") or "")
+                        if isinstance(raw_decision, dict)
+                        else "",
+                        "page_url": str(snapshot.get("url") or ""),
+                        "overlay_dismiss": overlay_mode,
+                    }
                     events.decision(
                         {
                             "session_id": session_id,
@@ -1762,6 +2144,18 @@ def explore_candidates_in_browser(
                             "snapshot_id": snapshot["snapshot_id"],
                             "decision": raw_decision,
                             "overlay_dismiss": overlay_mode,
+                            "process": decision_process,
+                        }
+                    )
+                    events.controller(
+                        {
+                            "session_id": session_id,
+                            "status": "next_action",
+                            "current_url": str(snapshot.get("url") or ""),
+                            "step": len(history) + 1,
+                            "max_steps": max_steps,
+                            "reason": decision_process.get("reason") or "",
+                            "process": decision_process,
                         }
                     )
                     if snapshot.get("screenshot_b64"):
@@ -1812,6 +2206,17 @@ def explore_candidates_in_browser(
                         }
                     )
                     save_session_state(project_path, session_id, session_state)
+                    if isinstance(raw_decision, dict) and raw_decision.get("completed_step_id"):
+                        if mark_step_done(plan_steps, str(raw_decision.get("completed_step_id") or "")):
+                            session_state["accomplishment_steps"] = plan_steps
+                            events.criteria(
+                                {
+                                    "session_id": session_id,
+                                    "accomplishment_steps": plan_steps,
+                                    "goal": goal,
+                                    "plan_progress": plan_progress(plan_steps),
+                                }
+                            )
                     if action is None:
                         if (
                             "not available in the generated form value store" in validation_error
@@ -2098,7 +2503,26 @@ def explore_candidates_in_browser(
                         reject_report = False
                         reject_error = ""
                         if action["action"] == "report":
-                            if report_is_negative(report_reason, report_note):
+                            # Credit extract steps if we already collected page text earlier.
+                            if pages:
+                                infer_step_completion(
+                                    plan_steps,
+                                    action="extract",
+                                    page_relevant=True,
+                                    evidence_collected=True,
+                                )
+                            progress = plan_progress(plan_steps)
+                            if progress["blocking"]:
+                                reject_report = True
+                                blocking_desc = "; ".join(
+                                    str(step.get("description") or step.get("id") or "")
+                                    for step in progress["blocking"][:3]
+                                )
+                                reject_error = (
+                                    "report rejected: accomplishment plan still has unfinished steps — "
+                                    f"{blocking_desc}. Advance current_step before reporting."
+                                )
+                            elif report_is_negative(report_reason, report_note):
                                 reject_report = True
                                 reject_error = (
                                     "report rejected: reason indicates the answer was not found — "
@@ -2312,6 +2736,30 @@ def explore_candidates_in_browser(
                             pages.append(page_result)
                             found_content = page_result.text
                             goal_met = action["action"] == "report" and page_result.ok
+                            page_relevant = page_matches_query(page_result.text, goal)
+                            on_preferred = bool(
+                                preferred_domain_set
+                                and url_on_preferred_source(page_result.url, preferred_domain_set)
+                            )
+                            marked = infer_step_completion(
+                                plan_steps,
+                                action=str(action["action"]),
+                                page_relevant=page_relevant,
+                                evidence_collected=action["action"] in {"extract", "filter", "report"},
+                                reported=action["action"] == "report",
+                                on_preferred_source=on_preferred,
+                            )
+                            if marked:
+                                session_state["accomplishment_steps"] = plan_steps
+                                events.criteria(
+                                    {
+                                        "session_id": session_id,
+                                        "accomplishment_steps": plan_steps,
+                                        "goal": goal,
+                                        "plan_progress": plan_progress(plan_steps),
+                                        "marked_steps": marked,
+                                    }
+                                )
                             evidence_payload = {
                                 "session_id": session_id,
                                 "step_id": step_id,
@@ -2422,13 +2870,30 @@ def explore_candidates_in_browser(
                             "max_steps": max_steps,
                         }
                     )
+                    # After an action: observe lightly; only rebuild the full-page map
+                    # when blockers are gone (so overlay dismiss does not map twice).
                     post_snapshot = _snapshot(
                         page,
                         session_id=session_id,
                         step_id=step_id,
                         context="post_action",
                         form_values=session_form_values,
+                        analyze=False,
+                        build_map=False,
+                        screenshot_mode="content",
                     )
+                    if not snapshot_needs_overlay_action(post_snapshot):
+                        post_snapshot, _ = _enhance_snapshot_with_viewport_paging(
+                            page,
+                            post_snapshot,
+                            goal,
+                            session_id=session_id,
+                            step_id=f"{step_id}_after",
+                            form_values=session_form_values,
+                            views_explored=viewport_views_explored,
+                            scroll_stitch_cache=scroll_stitch_cache,
+                            session_dir=recorder.session_dir,
+                        )
                     post_snapshot = _apply_scroll_stitch(
                         post_snapshot,
                         scroll_stitch_cache,
@@ -2791,6 +3256,10 @@ def explore_candidates_in_browser(
                     "discovered_routes": sorted(discovered_routes),
                     "current_url": str(page.url or ""),
                     "goal_met": goal_met,
+                    "goal": goal,
+                    "accomplishment_steps": plan_steps,
+                    "data_needed": list(data_needed or []),
+                    "success_criteria": list(success_criteria or []),
                 }
             )
             save_session_state(project_path, session_id, session_state)
@@ -2832,4 +3301,8 @@ def explore_candidates_in_browser(
         "helper_history": helper_guidance,
         "agent_memory": agent_memory,
         "transitions": transitions,
+        "goal": goal,
+        "accomplishment_steps": plan_steps,
+        "data_needed": list(data_needed or []),
+        "plan_progress": plan_progress(plan_steps),
     }

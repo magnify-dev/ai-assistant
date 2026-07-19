@@ -22,13 +22,19 @@ type Props = {
 };
 
 function elementLabel(element: WebCaptureElement): string {
-  return (
+  const base = (
     element.text?.trim() ||
+    element.title?.trim() ||
     element.aria?.trim() ||
     element.label?.trim() ||
     element.name?.trim() ||
     element.kind
-  ).slice(0, 48);
+  ).slice(0, 40);
+  const date = element.dates?.find((value) => value?.trim())?.trim();
+  if (date && !base.toLowerCase().includes(date.toLowerCase())) {
+    return `${base} · ${date}`.slice(0, 52);
+  }
+  return base;
 }
 
 function resolveSliceSrc(
@@ -45,7 +51,6 @@ function resolveSliceSrc(
   } else if (rel && projectPath) {
     return `/api/project/web-capture/screenshot?path=${encodeURIComponent(projectPath)}&file=${encodeURIComponent(rel)}`;
   } else if (rel && capture.screenshotUrl?.includes("file=")) {
-    // Reuse the query shape from the main screenshot URL, swap the file=.
     try {
       const url = new URL(capture.screenshotUrl, "http://local");
       url.searchParams.set("file", rel);
@@ -75,28 +80,45 @@ export function MapOverlayView({
   const scrollMap = capture.scroll_map;
   const documentCoords = captureUsesDocumentCoords(capture);
   const tall = canvasHeight > capture.viewport.height * 1.05;
+  const fullPage = scrollMap?.mode === "full_page" || documentCoords || tall;
   const liveScreenshot = Boolean(screenshotSrc?.startsWith("data:image/"));
-  const useScrollSlices =
-    Boolean(scrollMap?.slices?.length && documentCoords) && !liveScreenshot;
-  const hasImage = Boolean(
-    screenshotSrc || scrollMap?.slices?.some((slice) => slice.screenshot || slice.screenshotUrl),
+  const useScrollSlices = Boolean(
+    scrollMap?.slices?.length &&
+      documentCoords &&
+      (scrollMap.slice_count ?? 0) > 1 &&
+      scrollMap.slices.some((slice) => slice.screenshot || slice.screenshotUrl),
   );
+  const hasImage = Boolean(
+    useScrollSlices ||
+      screenshotSrc ||
+      scrollMap?.slices?.some((slice) => slice.screenshot || slice.screenshotUrl),
+  );
+  // Live viewport JPEG must not stretch over a tall document canvas.
+  const pinLiveViewport = Boolean(documentCoords && tall && liveScreenshot && !useScrollSlices);
 
   return (
     <div className={cn("rounded-lg border border-white/15 bg-neutral-900 p-2", className)}>
       <div
         className={cn(
           "relative mx-auto w-full rounded shadow-inner scrollbar-thin",
-          tall ? "max-h-[640px] overflow-y-auto overflow-x-hidden" : "max-h-[520px] overflow-hidden",
+          // Scrollable viewport so the full-page screenshot + overlay can be inspected.
+          fullPage
+            ? "max-h-[min(75vh,880px)] overflow-y-scroll overflow-x-hidden overscroll-contain"
+            : "max-h-[520px] overflow-y-auto overflow-x-hidden",
           hasImage ? "bg-neutral-950" : "bg-white",
         )}
       >
         {updatingMap && hasImage ? (
-          <div className="pointer-events-none absolute left-3 top-3 z-30 flex items-center gap-1.5 rounded-md border border-sky-400/40 bg-black/75 px-2 py-1 text-[10px] font-medium text-sky-100 shadow-lg backdrop-blur-sm">
+          <div className="pointer-events-none sticky top-2 z-30 mx-2 mt-2 inline-flex items-center gap-1.5 rounded-md border border-sky-400/40 bg-black/75 px-2 py-1 text-[10px] font-medium text-sky-100 shadow-lg backdrop-blur-sm">
             <span className="inline-flex h-2.5 w-2.5 animate-spin rounded-full border-2 border-sky-200/30 border-t-sky-100" />
             {updatingMapMessage ?? "Updating map…"}
           </div>
         ) : null}
+
+        {/*
+          Explicit height from canvas aspect ratio so absolutely-positioned image + overlay
+          boxes create a real scrollable document taller than the viewport pane.
+        */}
         <div
           className="relative mx-auto w-full"
           style={{ aspectRatio: `${canvasWidth} / ${canvasHeight}` }}
@@ -104,21 +126,37 @@ export function MapOverlayView({
         >
           {useScrollSlices ? (
             scrollMap!.slices!.map((slice, index) => {
-              const src = resolveSliceSrc(capture, slice, screenshotSrc, projectPath);
+              const src = resolveSliceSrc(capture, slice, undefined, projectPath);
               if (!src) return null;
+              const sliceHeight = Math.max(1, slice.height || capture.viewport.height);
+              const contentTop = Math.max(0, slice.content_top ?? 0);
+              const contentHeight = Math.max(
+                0,
+                slice.content_height ?? sliceHeight - contentTop,
+              );
+              if (contentHeight < 1) return null;
+              const drawTop = slice.draw_top ?? slice.scroll_y + contentTop;
               return (
-                <img
+                <div
                   key={`${slice.scroll_y}-${index}`}
-                  src={src}
-                  alt=""
-                  aria-hidden
-                  className="absolute left-0 w-full object-cover object-left-top"
+                  className="absolute left-0 w-full overflow-hidden"
                   style={{
-                    top: `${(slice.scroll_y / canvasHeight) * 100}%`,
-                    height: `${(slice.height / canvasHeight) * 100}%`,
+                    top: `${(drawTop / canvasHeight) * 100}%`,
+                    height: `${(contentHeight / canvasHeight) * 100}%`,
                   }}
-                  draggable={false}
-                />
+                >
+                  <img
+                    src={src}
+                    alt=""
+                    aria-hidden
+                    className="pointer-events-none absolute left-0 w-full max-w-none object-fill object-left-top"
+                    style={{
+                      height: `${(sliceHeight / contentHeight) * 100}%`,
+                      top: `${(-contentTop / contentHeight) * 100}%`,
+                    }}
+                    draggable={false}
+                  />
+                </div>
               );
             })
           ) : hasImage && screenshotSrc ? (
@@ -127,19 +165,37 @@ export function MapOverlayView({
               src={screenshotSrc}
               alt=""
               aria-hidden
-              className="absolute inset-0 h-full w-full object-cover object-top"
+              className={
+                pinLiveViewport
+                  ? "pointer-events-none absolute left-0 top-0 w-full object-fill object-top"
+                  : "pointer-events-none absolute inset-0 h-full w-full object-fill object-top"
+              }
+              style={
+                pinLiveViewport
+                  ? { height: `${(capture.viewport.height / canvasHeight) * 100}%` }
+                  : undefined
+              }
               draggable={false}
             />
           ) : null}
 
           {documentCoords && scrollMap?.slices && scrollMap.slice_count > 1
-            ? scrollMap.slices.slice(1).map((slice, index) => (
-                <div
-                  key={`slice-line-${slice.scroll_y}-${index}`}
-                  className="pointer-events-none absolute left-0 z-10 w-full border-t border-dashed border-white/20"
-                  style={{ top: `${(slice.scroll_y / canvasHeight) * 100}%` }}
-                />
-              ))
+            ? scrollMap.slices.slice(1).map((slice, index) => {
+                const drawTop = slice.draw_top ?? slice.scroll_y + (slice.content_top ?? 0);
+                if ((slice.content_height ?? 1) < 1) return null;
+                return (
+                  <div
+                    key={`slice-line-${slice.scroll_y}-${index}`}
+                    className="pointer-events-none absolute left-0 z-10 w-full border-t border-dashed border-white/20"
+                    style={{ top: `${(drawTop / canvasHeight) * 100}%` }}
+                    title={
+                      slice.delta_from_prev
+                        ? `Scrolled ${Math.round(slice.delta_from_prev)}px`
+                        : undefined
+                    }
+                  />
+                );
+              })
             : null}
 
           {elements.map((element) => {
@@ -178,24 +234,19 @@ export function MapOverlayView({
               />
             );
           })}
+
           {!elements.length ? (
             <div className="absolute inset-0 flex items-center justify-center text-sm text-neutral-400">
-              No elements match this filter
+              No mapped elements on this page
             </div>
           ) : null}
         </div>
       </div>
-      {documentCoords && (scrollMap?.slice_count ?? 0) > 1 ? (
+      {fullPage || tall ? (
         <p className="mt-2 text-[10px] text-white/45">
-          Stitched map · {scrollMap?.slice_count ?? 0} scroll views ·{" "}
-          {Math.round(canvasHeight)}px tall
-          {scrollMap?.persistent_skipped
-            ? ` · ${scrollMap.persistent_skipped} sticky duplicate(s) hidden`
-            : ""}
-        </p>
-      ) : tall ? (
-        <p className="mt-2 text-[10px] text-white/45">
-          Map · {Math.round(canvasWidth)} × {Math.round(canvasHeight)}px
+          Scroll inside the map to inspect the full page · {Math.round(canvasWidth)} ×{" "}
+          {Math.round(canvasHeight)}px
+          {scrollMap?.mode === "full_page" ? " · full-page screenshot" : ""}
         </p>
       ) : null}
       {!hasImage ? (

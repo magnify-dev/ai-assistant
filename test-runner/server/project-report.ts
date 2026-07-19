@@ -510,7 +510,9 @@ export function readRunBundle(
     (task?.structured_task as Record<string, unknown> | undefined) ??
     (report?.requested as Record<string, unknown> | undefined);
   const status = readJsonFile<Record<string, unknown>>(path.join(root, "status.json"));
-  const webCapture = light ? { capture: null, reviews: [] as Record<string, unknown>[] } : readWebCapture(projectPath, runId);
+  const webCapture = light
+    ? { capture: null, capturesByUrl: {} as Record<string, Record<string, unknown>>, reviews: [] as Record<string, unknown>[] }
+    : readWebCapture(projectPath, runId);
   let playwrightSession = session.manifest;
   if (light && playwrightSession && Array.isArray(playwrightSession.frames)) {
     // Keep counts without shipping multi-MB frame payloads into the history mapper.
@@ -536,6 +538,7 @@ export function readRunBundle(
     hasRun: Boolean(report || collaborationTranscript || session.manifest),
     collaborationTranscript,
     webCapture: webCapture.capture,
+    capturesByUrl: webCapture.capturesByUrl,
     webCaptureReviews: webCapture.reviews,
   };
 }
@@ -726,6 +729,102 @@ export function resolveRunArtifact(projectPath: string, runId: string, fileRel: 
   return full;
 }
 
+function normalizeCaptureUrlKey(url: unknown): string {
+  const raw = String(url ?? "").trim();
+  if (!raw) return "";
+  try {
+    const parsed = new URL(raw);
+    parsed.hash = "";
+    if (parsed.pathname.length > 1 && parsed.pathname.endsWith("/")) {
+      parsed.pathname = parsed.pathname.slice(0, -1);
+    }
+    return parsed.toString();
+  } catch {
+    return raw.split("#")[0]?.replace(/\/$/, "") || raw;
+  }
+}
+
+function hydrateCapture(
+  projectPath: string,
+  runId: string,
+  capture: Record<string, unknown> | null,
+): Record<string, unknown> | null {
+  if (!capture) return null;
+  return attachVisualToCapture(
+    projectPath,
+    attachScreenshotToCapture(
+      projectPath,
+      runId,
+      applySavedMapToCapture(projectPath, capture),
+    ),
+  );
+}
+
+function captureSortKey(capture: Record<string, unknown>): number {
+  const stamp = String(capture.created_at || capture.updated_at || "");
+  const parsed = Date.parse(stamp);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function loadCapturesFromDirs(
+  projectPath: string,
+  runId: string,
+  dirs: string[],
+): Record<string, Record<string, unknown>> {
+  const byUrl: Record<string, Record<string, unknown>> = {};
+  const seenFiles = new Set<string>();
+
+  for (const dir of dirs) {
+    if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) continue;
+    let entries: string[] = [];
+    try {
+      entries = fs.readdirSync(dir);
+    } catch {
+      continue;
+    }
+    for (const name of entries) {
+      if (!name.endsWith(".json") || name === "by-url.json" || name === "reviews.jsonl") continue;
+      const full = path.join(dir, name);
+      let stat: fs.Stats;
+      try {
+        stat = fs.statSync(full);
+      } catch {
+        continue;
+      }
+      if (seenFiles.has(full) || !stat.isFile()) continue;
+      seenFiles.add(full);
+      const capture = readJsonFile<Record<string, unknown>>(full);
+      if (!capture || typeof capture !== "object") continue;
+      const key = normalizeCaptureUrlKey(capture.url);
+      if (!key) continue;
+      const elements = Array.isArray(capture.elements) ? capture.elements : [];
+      const scrollMap = capture.scroll_map as { stitched?: boolean } | undefined;
+      if (elements.length === 0 && !scrollMap?.stitched) continue;
+      const existing = byUrl[key];
+      if (!existing || captureSortKey(capture) >= captureSortKey(existing)) {
+        const hydrated = hydrateCapture(projectPath, runId, capture);
+        if (hydrated) byUrl[key] = hydrated;
+      }
+    }
+  }
+  return byUrl;
+}
+
+/** Rebuild the per-URL map catalog from every persisted capture in the run. */
+export function readCapturesByUrl(projectPath: string, runId = "current") {
+  const root = runRoot(projectPath, runId);
+  const runDirs = [path.join(root, "web-capture", "raw"), path.join(root, "web-capture")];
+  let byUrl = loadCapturesFromDirs(projectPath, runId, runDirs);
+  // Only fall back to project-level captures for the live "current" run.
+  if (Object.keys(byUrl).length === 0 && runId === "current") {
+    byUrl = loadCapturesFromDirs(projectPath, runId, [
+      path.join(projectPath, ".agent", "web-capture", "raw"),
+      path.join(projectPath, ".agent", "web-capture"),
+    ]);
+  }
+  return byUrl;
+}
+
 export function readWebCapture(projectPath: string, runId = "current") {
   const root = runRoot(projectPath, runId);
   let capture = readJsonFile<Record<string, unknown>>(
@@ -736,13 +835,18 @@ export function readWebCapture(projectPath: string, runId = "current") {
       path.join(projectPath, ".agent", "web-capture", "latest.json"),
     );
   }
+  capture = hydrateCapture(projectPath, runId, capture);
+  const capturesByUrl = readCapturesByUrl(projectPath, runId);
   if (capture) {
-    capture = attachScreenshotToCapture(
-      projectPath,
-      runId,
-      applySavedMapToCapture(projectPath, capture),
-    );
-    capture = attachVisualToCapture(projectPath, capture);
+    const key = normalizeCaptureUrlKey(capture.url);
+    if (key && !capturesByUrl[key]) capturesByUrl[key] = capture;
+  }
+  // Prefer latest.json as the "current" capture, but never drop earlier page maps.
+  if (!capture) {
+    const values = Object.values(capturesByUrl);
+    if (values.length) {
+      capture = values.sort((a, b) => captureSortKey(b) - captureSortKey(a))[0] ?? null;
+    }
   }
   const reviewsPath = path.join(root, "web-capture", "reviews.jsonl");
   const reviews: Record<string, unknown>[] = [];
@@ -757,7 +861,7 @@ export function readWebCapture(projectPath: string, runId = "current") {
       reviews.length = 0;
     }
   }
-  return { capture, reviews: reviews.slice(-100) };
+  return { capture, capturesByUrl, reviews: reviews.slice(-100) };
 }
 
 export function saveWebCaptureReview(

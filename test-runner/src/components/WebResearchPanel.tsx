@@ -1,4 +1,5 @@
 import { useState, type ReactNode } from "react";
+import { NextActionCard } from "@/components/NextActionCard";
 import { OperationWaitBanner } from "@/components/OperationWaitBanner";
 import type {
   WebResearchItem,
@@ -52,7 +53,9 @@ function itemLabel(item: WebResearchItem): string {
 
 function interactableLabel(item: WebResearchItem): string {
   const kind = text(item.kind || item.role || "element");
-  const label = text(item.text || item.aria || item.label || item.placeholder || "Unlabelled control");
+  const label = text(
+    item.text || item.title || item.aria || item.label || item.placeholder || "Unlabelled control",
+  );
   const action = text(item.action_hint);
   return `${kind} #${text(item.id)} — ${label}${action ? ` · ${action}` : ""}`;
 }
@@ -211,6 +214,8 @@ export function WebResearchPanel({ state, captureBuild, running = true }: Props)
 
       {wait ? <OperationWaitBanner wait={wait} /> : null}
 
+      <NextActionCard state={state} />
+
       {blockers.length ? (
         <section className="rounded-md border border-amber-400/30 bg-amber-400/10 p-3">
           <h3 className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-amber-100">
@@ -220,26 +225,16 @@ export function WebResearchPanel({ state, captureBuild, running = true }: Props)
         </section>
       ) : null}
 
-      {snapshot?.screenshot_b64 ? (
-        <div className="overflow-hidden rounded-md border border-white/10 bg-black/30 p-1">
-          <img
-            src={`data:image/jpeg;base64,${snapshot.screenshot_b64}`}
-            alt="Current web exploration page"
-            className="max-h-80 w-full object-contain"
-          />
-        </div>
-      ) : null}
-
       <div className="grid gap-3 lg:grid-cols-2">
         <section className="rounded-md border border-white/10 bg-black/20 p-3">
-          <h3 className="mb-2 text-[10px] font-semibold uppercase tracking-wide text-white/45">Recent actions</h3>
+          <h3 className="mb-2 text-[10px] font-semibold uppercase tracking-wide text-white/45">Action history</h3>
           <StepTimeline steps={state.steps} />
         </section>
         <section className="rounded-md border border-white/10 bg-black/20 p-3">
           <h3 className="mb-2 text-[10px] font-semibold uppercase tracking-wide text-white/45">
-            Page controls
+            Menu targets
             {highlightId ? (
-              <span className="ml-2 font-normal normal-case text-sky-200/80">target #{highlightId}</span>
+              <span className="ml-2 font-normal normal-case text-sky-200/80">→ #{highlightId}</span>
             ) : null}
           </h3>
           <InteractablesList items={interactables} highlightId={highlightId} />

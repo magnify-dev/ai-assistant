@@ -51,6 +51,8 @@ class CaptureElement(TypedDict, total=False):
     likely_clickable: bool | None
     title: str | None
     dates: list[str] | None
+    authors: list[str] | None
+    byline: str | None
     deterministic_issues: list[str]
     raw: dict[str, Any]
 
@@ -67,3 +69,5 @@ class WebCapture(TypedDict, total=False):
     elements: list[CaptureElement]
     summary: dict[str, int]
     ai: dict[str, Any]
+    page_understanding: dict[str, Any]
+    page_understanding_meta: dict[str, Any]

@@ -507,6 +507,9 @@ def curate_browse_context(
     max_steps_per_branch: int = 20,
     helper_guidance: list[dict[str, Any]] | None = None,
     collected_evidence: list[dict[str, Any]] | None = None,
+    accomplishment_steps: list[dict[str, Any]] | None = None,
+    data_needed: list[str] | None = None,
+    success_criteria: list[str] | None = None,
 ) -> dict[str, Any]:
     from web_surf.form_values import _snapshot_blockers
 
@@ -562,6 +565,62 @@ def curate_browse_context(
         ),
         "routes": compact_routes(list(discovered_routes)),
     }
+    understanding = snapshot.get("page_understanding")
+    if not isinstance(understanding, dict):
+        capture = snapshot.get("web_capture")
+        if isinstance(capture, dict):
+            understanding = capture.get("page_understanding")
+    if isinstance(understanding, dict) and (
+        understanding.get("summary") or understanding.get("feed_items")
+    ):
+        feed_items = [
+            {
+                "title": str(item.get("title") or "").strip()[:140] or None,
+                "date": str(item.get("date") or "").strip()[:48] or None,
+                "author": str(item.get("author") or "").strip()[:60] or None,
+                "byline": str(item.get("byline") or "").strip()[:120] or None,
+                "element_id": str(item.get("element_id") or "").strip() or None,
+                "href": str(item.get("href") or "").strip()[:240] or None,
+            }
+            for item in (understanding.get("feed_items") or [])
+            if isinstance(item, dict) and str(item.get("title") or "").strip()
+        ][:20]
+        payload["page_understanding"] = {
+            "page_type": str(understanding.get("page_type") or "")[:40] or None,
+            "summary": str(understanding.get("summary") or "").strip()[:500] or None,
+            "feed_items": feed_items,
+            "how_to_proceed": [
+                str(item).strip()
+                for item in (understanding.get("how_to_proceed") or [])
+                if str(item).strip()
+            ][:6],
+        }
+        from web_surf.page_match import suggest_content_link_action
+
+        map_next = suggest_content_link_action(snapshot, focused_goal)
+        if map_next and map_next.get("from_page_map"):
+            payload["map_recommended_next"] = {
+                "action": "click",
+                "target_id": map_next.get("target_id"),
+                "title": map_next.get("feed_title"),
+                "date": map_next.get("feed_date"),
+                "reason": map_next.get("reason"),
+            }
+            payload["map_decision_note"] = (
+                "A page map was built for this URL. For latest/newest requests, treat "
+                "page_understanding.feed_items dates as ground truth and follow "
+                "map_recommended_next — do not pick an older story from menu labels alone."
+            )
+    needed = [str(item).strip() for item in (data_needed or []) if str(item).strip()]
+    if needed:
+        payload["data_needed"] = needed[:8]
+    criteria = [str(item).strip() for item in (success_criteria or []) if str(item).strip()]
+    if criteria:
+        payload["success_criteria"] = criteria[:8]
+    if accomplishment_steps:
+        from web_surf.plan import compact_plan_for_prompt
+
+        payload.update(compact_plan_for_prompt(list(accomplishment_steps)))
     if page_extends_beyond_viewport(snapshot):
         vp = snapshot_viewport(snapshot)
         payload["viewport"] = {
@@ -580,10 +639,10 @@ def curate_browse_context(
         payload["recency_requirement"] = True
         payload["recency_note"] = (
             "Timing is part of the user's request — pick the NEWEST matching item, not just any "
-            "related article. On listing pages prefer links with the latest published date "
-            "(usually first/top). When several dated sections appear on one page, collect only "
-            "the newest dated section. Do not report older content when newer content is visible "
-            "or one click away."
+            "related article. Prefer page_understanding.feed_items / map_recommended_next when "
+            "present (those dates come from the built page map). On listing pages open that "
+            "newest mapped item before extract/report. Do not report older content when a newer "
+            "dated feed item is visible on the map."
         )
 
     publisher_routes = [
@@ -745,9 +804,10 @@ def curate_browse_context(
     }
     payload["menu"] = menu
     payload["explore_note"] = (
-        "Pick ONE action from menu[]. Read user_directive, stuck, branch_note, failed, avoid, guidance, "
-        "evidence_collected before choosing. "
-        "Clear overlays before extract/report. Swap branch only when stalled."
+        "Pick ONE action from menu[]. Read goal, current_step / user_goal_steps, user_directive, "
+        "stuck, branch_note, failed, avoid, guidance, evidence_collected before choosing. "
+        "Advance the current accomplishment step. Clear overlays before extract/report. "
+        "Swap branch only when stalled. Do not report until ready_to_report is true."
     )
 
     if looks_like_age_gate(snapshot):
@@ -906,13 +966,33 @@ def curate_extract_context(
         ]
     ).strip()
     from web_surf.page_match import focus_query, query_implies_recency
+    from web_surf.plan import compact_plan_for_prompt, normalize_accomplishment_steps
 
     focused = focus_query(query)
     curated = curate_text(page_text, query=focused, max_chars=max_chars)
     lines = [
-        f"goal: {research_spec.get('summary') or query}",
+        f"goal: {research_spec.get('summary') or research_spec.get('source_query') or query}",
         f"need: {', '.join(needed) if needed else 'relevant facts'}",
     ]
+    plan_steps = normalize_accomplishment_steps(
+        research_spec.get("accomplishment_steps"),
+        query=str(research_spec.get("source_query") or focused),
+    )
+    if plan_steps:
+        plan = compact_plan_for_prompt(plan_steps)
+        current = plan.get("current_step") or {}
+        lines.append(
+            "plan: "
+            + " → ".join(
+                f"{step.get('id')}:{step.get('description')}"
+                for step in plan.get("user_goal_steps") or []
+            )
+        )
+        if current:
+            lines.append(
+                f"current_step: {current.get('id')} — {current.get('description')} "
+                f"(done when: {current.get('done_when')})"
+            )
     if query_implies_recency(focused):
         lines.append(
             "timing: user wants the newest/most recent item — extract facts only from the "

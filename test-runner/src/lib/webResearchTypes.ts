@@ -37,8 +37,28 @@ export type WebResearchSnapshot = {
 export type WebResearchDecision = {
   action?: string;
   target?: string;
+  target_id?: string;
   reason?: string;
   confidence?: number;
+  [key: string]: unknown;
+};
+
+export type WebResearchDecisionProcess = {
+  goal?: string;
+  current_step?: {
+    id?: string;
+    description?: string;
+    done_when?: string;
+  } | null;
+  action?: string;
+  target_id?: string;
+  url?: string;
+  reason?: string;
+  completed_step_id?: string;
+  page_url?: string;
+  overlay_dismiss?: boolean;
+  step_id?: string;
+  ts?: string;
   [key: string]: unknown;
 };
 
@@ -96,6 +116,8 @@ export type WebResearchState = {
   currentUrl?: string;
   snapshot?: WebResearchSnapshot;
   decision?: WebResearchDecision;
+  decisionProcess?: WebResearchDecisionProcess;
+  accomplishmentSteps?: WebResearchItem[];
   steps?: WebResearchItem[];
   candidates?: WebResearchItem[];
   visitGraph?: {

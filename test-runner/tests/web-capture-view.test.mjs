@@ -47,6 +47,39 @@ test("scales captured geometry into viewport percentages", () => {
   });
 });
 
+test("stitched document canvas uses scroll_map height for box math", async () => {
+  const { captureBoxStyle: boxStyle, captureCanvasHeight } = await import(
+    "../src/lib/webCaptureView.ts"
+  );
+  const stitched = {
+    viewport: { width: 1000, height: 500 },
+    scroll_map: {
+      stitched: true,
+      coords: "document",
+      canvas_height: 2000,
+      slice_count: 3,
+    },
+  };
+  assert.equal(captureCanvasHeight(stitched), 2000);
+  assert.deepEqual(
+    boxStyle(
+      {
+        id: "deep",
+        kind: "link",
+        rect: { x: 100, y: 1000, width: 200, height: 100 },
+        locator_status: "unique",
+      },
+      stitched,
+    ),
+    {
+      left: "10%",
+      top: "50%",
+      width: "20%",
+      height: "5%",
+    },
+  );
+});
+
 test("filters effective, saved, and locator problems", () => {
   assert.deepEqual(filterCaptureElements([kept, saved, problem], "kept"), [kept, saved]);
   assert.deepEqual(filterCaptureElements([kept, saved, problem], "saved"), [saved]);

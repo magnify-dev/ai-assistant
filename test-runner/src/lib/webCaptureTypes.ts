@@ -49,6 +49,24 @@ export type WebCaptureElement = {
   likely_clickable?: boolean | null;
   title?: string | null;
   dates?: string[] | null;
+  authors?: string[] | null;
+  byline?: string | null;
+};
+
+export type WebCapturePageUnderstanding = {
+  page_type?: string;
+  summary?: string;
+  regions?: Array<{ name?: string; role?: string; notes?: string }>;
+  feed_items?: Array<{
+    title?: string;
+    date?: string | null;
+    author?: string | null;
+    byline?: string | null;
+    element_id?: string | null;
+    href?: string | null;
+  }>;
+  how_to_proceed?: string[];
+  open_questions?: string[];
 };
 
 export type WebCaptureMapInfo = {
@@ -77,6 +95,14 @@ export type WebCaptureVisual = {
 export type WebCaptureScrollSlice = {
   scroll_y: number;
   height: number;
+  /** Pixels to skip from the top of this screenshot (already covered by prior slice). */
+  content_top?: number;
+  /** Unique band height drawn on the canvas (viewport height − content_top). */
+  content_height?: number;
+  /** Document Y where the unique band starts. */
+  draw_top?: number;
+  /** Measured scroll delta from the previous slice. */
+  delta_from_prev?: number;
   screenshot?: string;
   screenshotUrl?: string;
   capture_id?: string;
@@ -88,10 +114,12 @@ export type WebCaptureScrollMap = {
   explored_height: number;
   persistent_skipped?: number;
   slices: WebCaptureScrollSlice[];
-  /** True when multiple scroll slices were merged into document space */
+  /** True when document-space map (full-page shot or legacy multi-slice stitch) */
   stitched?: boolean;
   /** "document" = rect.y includes scroll offset; "viewport" = raw getBoundingClientRect */
   coords?: "document" | "viewport";
+  /** "full_page" = one Playwright full-page screenshot (preferred) */
+  mode?: "full_page" | "scroll_stitch" | string;
 };
 
 export type WebCapture = {
@@ -134,6 +162,14 @@ export type WebCapture = {
   screenshotUrl?: string;
   /** Document-tall stitched map built from multiple scroll slices */
   scroll_map?: WebCaptureScrollMap;
+  page_understanding?: WebCapturePageUnderstanding;
+  page_understanding_meta?: {
+    status?: string;
+    cached?: boolean;
+    model?: string;
+    duration_ms?: number;
+    error?: string;
+  };
   ai: {
     status: "pending" | "ready" | "unavailable" | "disabled";
     model?: string;

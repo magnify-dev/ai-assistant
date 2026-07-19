@@ -273,7 +273,53 @@ let runState: Record<string, unknown> = {
   phase: "idle",
   phases: {},
   runKind: "ui_test",
+  capturesByUrl: {},
 };
+
+function normalizeCaptureUrlKey(url: unknown): string {
+  const raw = String(url ?? "").trim();
+  if (!raw) return "";
+  try {
+    const parsed = new URL(raw);
+    parsed.hash = "";
+    if (parsed.pathname.length > 1 && parsed.pathname.endsWith("/")) {
+      parsed.pathname = parsed.pathname.slice(0, -1);
+    }
+    return parsed.toString();
+  } catch {
+    return raw.split("#")[0]?.replace(/\/$/, "") || raw;
+  }
+}
+
+function rememberRunCapture(capture: Record<string, unknown> | null | undefined) {
+  if (!capture || typeof capture !== "object") return;
+  const key = normalizeCaptureUrlKey(capture.url);
+  if (!key) return;
+  const elements = Array.isArray(capture.elements) ? capture.elements : [];
+  const scrollMap = capture.scroll_map as { stitched?: boolean; slice_count?: number } | undefined;
+  if (elements.length === 0 && !scrollMap?.stitched) return;
+  const prev = (runState.capturesByUrl as Record<string, Record<string, unknown>> | undefined) ?? {};
+  const existing = prev[key];
+  const phase = (runState.captureBuild as { phase?: string; url?: string } | undefined)?.phase;
+  const buildingPhases = new Set(["geometry", "locators", "analyzing", "visual"]);
+  const buildingThisUrl =
+    Boolean(phase && buildingPhases.has(phase)) &&
+    normalizeCaptureUrlKey((runState.captureBuild as { url?: string } | undefined)?.url || capture.url) ===
+      key;
+  if (!existing) {
+    runState.capturesByUrl = { ...prev, [key]: capture };
+    return;
+  }
+  if (phase === "complete" || !buildingThisUrl) {
+    runState.capturesByUrl = { ...prev, [key]: capture };
+    return;
+  }
+  const prevSlices = (existing.scroll_map as { slice_count?: number } | undefined)?.slice_count ?? 0;
+  const nextSlices = scrollMap?.slice_count ?? 0;
+  if (nextSlices > prevSlices || (scrollMap?.stitched && !(existing.scroll_map as { stitched?: boolean })?.stitched)) {
+    runState.capturesByUrl = { ...prev, [key]: capture };
+  }
+}
 
 function resetRunStateForNewRun(
   project: string,
@@ -300,6 +346,7 @@ function resetRunStateForNewRun(
     webResearchProgress: null,
     playwrightSession: null,
     webCapture: null,
+    capturesByUrl: {},
   };
   pushEvent({ type: "run_cleared" });
   pushEvent({ type: "run_state", running: true });
@@ -370,6 +417,7 @@ function pushEvent(event: StoredEvent) {
         "current",
         event.web_capture as Record<string, unknown>,
       );
+      rememberRunCapture(runState.webCapture as Record<string, unknown>);
     }
   }
   if (event.type === "web_capture_progress") {
@@ -387,6 +435,7 @@ function pushEvent(event: StoredEvent) {
         "current",
         event.capture as Record<string, unknown>,
       );
+      rememberRunCapture(runState.webCapture as Record<string, unknown>);
     }
     if (event.url && (event.screenshot_b64 || event.interactables)) {
       runState.browserState = {
@@ -536,6 +585,7 @@ function pushEvent(event: StoredEvent) {
           "current",
           nested.web_capture as Record<string, unknown>,
         );
+        rememberRunCapture(runState.webCapture as Record<string, unknown>);
       }
     }
   } else if (
@@ -666,8 +716,19 @@ type CollaborationRunBody = {
   userNote?: string;
 };
 
+function pushCollaborationPhase(message: string): void {
+  pushEvent({
+    type: "phase",
+    phase: "collaboration",
+    status: "running",
+    message,
+  });
+}
+
 async function beginCollaborationRun(options: CollaborationRunBody): Promise<void> {
   try {
+    collaborationLoop.resetIfStale();
+    pushCollaborationPhase("Archiving previous run…");
     const archivedRunId = archivePreviousRun(options.project);
     initRunLogs(options.project);
     if (archivedRunId) {
@@ -680,9 +741,15 @@ async function beginCollaborationRun(options: CollaborationRunBody): Promise<voi
     emitRunPreflightWarnings(options.apiKey, options.cursorRuntime, options.project);
 
     if (!options.noOllama) {
+      pushCollaborationPhase("Checking Ollama model…");
       const ollamaCfg = readOllamaConfig();
       try {
-        await ensureOllamaReadyForRun(ollamaCfg, emitOllamaSwitch);
+        await ensureOllamaReadyForRun(ollamaCfg, (progress) => {
+          emitOllamaSwitch(progress);
+          if (progress.message?.trim()) {
+            pushCollaborationPhase(progress.message.trim());
+          }
+        });
         const ollama = await buildOllamaPayload(ollamaCfg);
         broadcastSystemEvent({
           type: "ollama_switch",
@@ -704,6 +771,7 @@ async function beginCollaborationRun(options: CollaborationRunBody): Promise<voi
       }
     }
 
+    pushCollaborationPhase("Starting local agent…");
     const result = await collaborationLoop.run({
       project: options.project,
       task: options.task,
@@ -1089,6 +1157,7 @@ app.get("/api/project/run-report", (req, res) => {
   res.json({
     ...bundle,
     webCapture: webCapture.capture,
+    capturesByUrl: webCapture.capturesByUrl,
     webCaptureReviews: webCapture.reviews,
     playwrightSession: playwrightSession
       ? { ...playwrightSession, source: bundle.sessionSource ?? "ui" }

@@ -43,6 +43,51 @@ web_capture:
       be visually interactive, but mention the locator problem in the reason.
     - Confidence describes classification certainty, not locator reliability.
 
+  understand: |
+    You build a structural understanding of a web page from the mapped elements a
+    user would see on screen. Use only the provided map/text — never invent stories,
+    dates, authors, or regions that are not evidenced by the input.
+
+    Return ONLY valid JSON:
+    {
+      "page_type": "article_list|article|form|nav|mixed|other",
+      "summary": "1-3 sentences: what this page is and what is visibly shown",
+      "regions": [
+        {
+          "name": "short label",
+          "role": "nav|main|feed|sidebar|footer|other",
+          "notes": "what a user would notice here"
+        }
+      ],
+      "feed_items": [
+        {
+          "title": "visible title",
+          "date": "visible date or null",
+          "author": "visible author or null",
+          "byline": "visible byline text or null",
+          "element_id": "exact id from input or null",
+          "href": "href if present or null"
+        }
+      ],
+      "how_to_proceed": [
+        "short next-step suggestions grounded in the visible structure"
+      ],
+      "open_questions": [
+        "what is still unclear from the map alone"
+      ]
+    }
+
+    Rules:
+    - Treat the map as the user's view: titles, dates, authors, bylines, and link text
+      are first-class facts when present on elements.
+    - feed_items must be DISTINCT visible cards/stories/links. Do not collapse a whole
+      feed into one item when multiple titles are present.
+    - Prefer element fields (title/text/dates/authors/byline/href) over guessing.
+    - If a date is relative ("1 day ago"), keep it as shown. Do not replace dates with
+      author names.
+    - how_to_proceed should help a later agent decide (e.g. open newest item, scroll
+      feed, use nav) without assuming site-specific knowledge.
+
 exploration:
   # System prompt for the step-by-step exploration decision agent.
   decide: |
@@ -140,10 +185,21 @@ web_research:
     Return JSON only: {"run_kind":"ui_test"|"web_research","reason":""}
     web_research = open-web facts. ui_test = user's own app UI.
 
-  # Turn a free-text research request into a structured search plan.
+  # Turn a free-text research request into a structured search + accomplishment plan.
   spec: |
-    You plan open-web research. Return JSON only:
-    {"summary":"","data_needed":[],"search_queries":[],"success_criteria":[],"max_pages":5,"official_sources":[]}
+    You plan open-web research. Break the user's request into ordered accomplishment steps
+    the browser agent will follow until the answer is ready. Return JSON only:
+    {
+      "summary":"",
+      "data_needed":[],
+      "search_queries":[],
+      "success_criteria":[],
+      "max_pages":5,
+      "official_sources":[],
+      "accomplishment_steps":[
+        {"id":"s1","description":"what to do","done_when":"how we know it is done"}
+      ]
+    }
 
     Rules:
     - summary keeps the user's goal exactly — do not generalize it.
@@ -157,6 +213,15 @@ web_research:
     - official_sources: use your world knowledge — list the organizations or publishers
       that own the primary/canonical source for this topic (studio, vendor, government
       agency, standards body, etc.). Names only, no URLs. Leave [] if unknown.
+    - accomplishment_steps: 3-6 ordered steps that decompose the FULL user prompt into
+      concrete browser accomplishments. Keep the user's site names and wording. Last step
+      should be reporting/returning the answer. ids like s1, s2, …
+    - When the user names a site AND asks for latest/newest/recent news or updates:
+      steps MUST be open that site's news/listing → pick the newest item FROM THE LISTING
+      (by dates shown on the page) → extract → report. Do NOT plan a specific article URL
+      or title from memory/search — recent headlines must be discovered by browsing.
+    - Do NOT require the site homepage. Never add fluff steps like "verify credibility".
+    - Prefer staying on useful content pages; do not plan a detour home just to "open" the site.
 
   # Label search hits as publisher-primary vs secondary summaries.
   classify_sources: |
@@ -177,31 +242,53 @@ web_research:
   # Choose one validated browser action from a semantic page snapshot.
   browse_decide: |
     Pick ONE browser action per step. Return JSON only:
-    {"action":"click|navigate|swap_branch|fill|select|press|scroll|back|wait|extract|filter|report|provide_values","target_id":"","url":"","value":"","value_key":"","form_values":{},"reason":""}
+    {"action":"click|navigate|swap_branch|fill|select|press|scroll|back|wait|extract|filter|report|provide_values","target_id":"","url":"","value":"","value_key":"","form_values":{},"completed_step_id":"","reason":""}
 
-    Read first: user_directive, stuck, branch_note, failed[], avoid[], menu[].
+    The user's original request is in goal. Follow user_goal_steps / current_step — these are
+    the ordered accomplishments that must be finished before the answer is ready.
+
+    Read first: goal, user_goal_steps, current_step, plan_note, user_directive, stuck,
+    branch_note, failed[], avoid[], menu[].
+    - current_step: the single accomplishment to advance right now
+    - remaining_steps: unfinished accomplishments — do not skip ahead to report
     - stuck: why this page is blocked right now
     - branch_note: active branch, steps, last swap_branch choice
     - failed[]: prior steps that failed and why
     - avoid[]: actions already tried — never repeat these
     - menu[]: numbered valid next moves — copy target_id/url exactly
     - recency_note / recency_requirement: timing matters — pick the newest dated item
+    - page_understanding / map_recommended_next: the built page map — trust its feed_items
+      dates over ambiguous menu labels when choosing the newest story
 
     Rules:
+    - Keep working the current_step; choose a menu action that advances it
+    - When current_step is finished by this action, set completed_step_id to that step id
+    - If already on the requested site, do NOT navigate to the homepage just to satisfy "open site"
     - Clear overlays (menu[]) before extract/report
+    - Do NOT report while ready_to_report is false / blocking steps remain
+    - When the user named a site for latest/recent news and you are on a deep article,
+      go to that site's news/listing first and pick the newest dated item from the page —
+      do not trust a specific article URL from search/memory as "the latest"
+    - When page_understanding.feed_items or map_recommended_next is present, use that map
+      to choose the newest story (copy map_recommended_next.target_id). Do not open an
+      older feed item just because a menu label looks related.
     - When recency_note is present, prefer menu entries with the latest published date;
       on listing pages open the newest article before extract/report — never settle for older news
     - swap_branch only when branch is stalled; copy url from branch.alternatives[]
     - target_id must come from menu[] or form_fields[], not overlay ids
     - Pick a different action than failed[] and avoid[]
+    - Never repeat the same navigate/click that avoid[] or failed[] already tried
 
   browse_decide_compact: |
-    Continue research. Return JSON:
-    {"action":"click|navigate|swap_branch|fill|select|press|scroll|back|wait|extract|filter|report|provide_values","target_id":"","url":"","value_key":"","reason":""}
+    Continue the user's plan. Return JSON:
+    {"action":"click|navigate|swap_branch|fill|select|press|scroll|back|wait|extract|filter|report|provide_values","target_id":"","url":"","value_key":"","completed_step_id":"","reason":""}
 
-    Read stuck, branch_note, failed, avoid, menu. Never repeat avoid[].
-    Clear overlays before extract/report. Pick from menu[].
+    Read goal, current_step, remaining_steps, stuck, branch_note, failed, avoid, menu.
+    Advance current_step; set completed_step_id when a step is finished.
+    Never repeat avoid[]. Clear overlays before extract/report. Pick from menu[].
+    Do not report until ready_to_report is true / non-report steps are done.
     When recency_note is present, choose the newest dated item — not an older match.
+    Prefer page_understanding.feed_items / map_recommended_next when present.
 
   choose_overlay_dismiss: |
     A blocking overlay covers the page. Return JSON only:
@@ -243,6 +330,7 @@ web_research:
     {"page_summary":"","facts":[{"field":"","value":"","quote":""}]}
 
     Rules:
+    - The user's original goal and accomplishment plan (need / plan steps) define what to extract.
     - quote must be copied verbatim from content — it is checked against the page. Keep it under 200 chars.
     - Prefer facts with dates, version numbers, names, and figures the goal asks for.
     - When timing/recency is mentioned in the goal, extract facts only from the newest dated
@@ -252,7 +340,8 @@ web_research:
 
   # Synthesize a final answer from stored facts.
   answer: |
-    Answer the question in 2-5 sentences using ONLY the pages and facts provided.
+    Answer the user's original question in 2-5 sentences using ONLY the pages and facts provided.
+    Honor the accomplishment plan / success criteria when present — cover every required fact.
     Cite source URLs. Prefer facts from official / primary-source pages over forums,
     social posts, or third-party summaries when both are available.
     When the user asked for latest/newest/most recent content, answer with the newest
@@ -263,6 +352,7 @@ web_research:
   # Verbatim copy when the user asked to copy/quote page content.
   answer_copy: |
     The user asked to COPY content from the page — do not paraphrase.
+    Follow the original request and plan steps (e.g. copy the latest news, not a summary).
     Return the requested text using verbatim quotes from the facts provided.
     Prefer the single most recent dated item when the user asked for "latest" news.
     Include the source URL. Use markdown block quotes for copied passages when helpful.

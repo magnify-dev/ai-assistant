@@ -118,6 +118,61 @@ class PageMapTests(unittest.TestCase):
         card = next(item for item in analyzed["elements"] if item["id"] == "el-card-headline-1")
         self.assertTrue(card["ai_interactive"])
 
+    def test_merge_transfers_card_title_onto_weak_news_link(self) -> None:
+        """News hit-targets are often empty/read-more links covering the card."""
+        state = {
+            "url": "https://news.example/",
+            "title": "News",
+            "viewport": {
+                "width": 1000,
+                "height": 800,
+                "scroll_x": 0,
+                "scroll_y": 0,
+                "document_width": 1000,
+                "document_height": 1600,
+            },
+            "interactables": [
+                {
+                    "id": "el-link-story",
+                    "index": 0,
+                    "kind": "link",
+                    "text": "Read more",
+                    "href": "https://news.example/story/patch-notes",
+                    "rect": {"x": 40, "y": 120, "width": 420, "height": 140},
+                }
+            ],
+            "page_content_map": [
+                {
+                    "id": "el-card-headline-1",
+                    "index": 0,
+                    "kind": "card",
+                    "content_role": "card",
+                    "map_layer": "content",
+                    "title": "Patch notes for July",
+                    "text": "Patch notes for July",
+                    "dates": ["1 day ago"],
+                    "authors": ["Archimtiros"],
+                    "byline": "Posted 1 day ago by Archimtiros",
+                    "likely_clickable": True,
+                    "rect": {"x": 40, "y": 120, "width": 420, "height": 140},
+                }
+            ],
+        }
+        merged = merge_capture_elements(state)
+        self.assertEqual(len(merged), 1)
+        link = merged[0]
+        self.assertEqual(link["kind"], "link")
+        self.assertEqual(link["text"], "Patch notes for July")
+        self.assertEqual(link["title"], "Patch notes for July")
+        self.assertEqual(link["dates"], ["1 day ago"])
+        self.assertEqual(link["authors"], ["Archimtiros"])
+        self.assertEqual(link["byline"], "Posted 1 day ago by Archimtiros")
+        self.assertEqual(link["content_role"], "card")
+        # Agent-facing interactables must get the same display label.
+        self.assertEqual(state["interactables"][0]["text"], "Patch notes for July")
+        self.assertEqual(state["interactables"][0]["title"], "Patch notes for July")
+        self.assertEqual(state["interactables"][0]["dates"], ["1 day ago"])
+
 
 if __name__ == "__main__":
     unittest.main()

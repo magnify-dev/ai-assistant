@@ -2,7 +2,7 @@ import type { AgentRunCard } from "@/lib/collaborationTypes";
 import { PHASES, type PhaseKey, type PhaseMap } from "@/types";
 import type { ProgressStatus } from "@/components/ProgressCard";
 
-export type RunStepKey = PhaseKey | "collaboration" | "cursor" | "local" | "helper" | "starting";
+export type RunStepKey = PhaseKey | "collaboration" | "cursor" | "local" | "helper" | "starting" | "ollama";
 
 const EXTRA_LABELS: Record<string, string> = {
   collaboration: "Local agent",
@@ -10,6 +10,14 @@ const EXTRA_LABELS: Record<string, string> = {
   helper: "Helper agent",
   local: "Local agent",
   starting: "Run",
+  ollama: "Preparing model",
+};
+
+export type OllamaPrepStatus = {
+  active?: boolean;
+  message?: string;
+  progress?: number;
+  step?: string;
 };
 
 export function stepLabel(key: RunStepKey): string {
@@ -62,8 +70,17 @@ export function resolveActiveRunStep(
   phases: PhaseMap,
   agentCards: AgentRunCard[],
   running: boolean,
+  ollamaPrep?: OllamaPrepStatus | null,
 ): { key: RunStepKey; label: string; message: string } | null {
   if (!running) return null;
+
+  if (ollamaPrep?.active) {
+    return {
+      key: "ollama",
+      label: "Preparing model",
+      message: ollamaPrep.message?.trim() || "Loading Ollama model into VRAM…",
+    };
+  }
 
   const helper = helperCardState(agentCards);
   if (helper?.status === "running" || phases.cursor?.status === "running") {

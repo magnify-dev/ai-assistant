@@ -26,6 +26,7 @@ from web_surf.form_values import (
     _pick_adult_year,
 )
 from web_surf.browser_explore import (
+    _clear_overlays_before_map,
     _content_collect_key,
     _content_collect_signature,
     _discover_official_outbound,
@@ -1219,6 +1220,87 @@ class RunnerIntegrationTests(unittest.TestCase):
         self.assertIn("$10", content)
         self.assertEqual(pages[0].url, f"{base}/target")
         self.assertEqual(metadata["unmet_criteria"], [])
+
+
+class ClearOverlaysBeforeMapTests(unittest.TestCase):
+    def test_skips_when_no_blocker(self) -> None:
+        page = SimpleNamespace(url="https://example.test/")
+        snapshot = {"url": page.url, "blocking_overlays": [], "interactables": []}
+        out, cleared = _clear_overlays_before_map(
+            page,
+            snapshot,
+            session_id="s1",
+            step_id="step_001",
+            form_values={},
+            field_mapping={},
+        )
+        self.assertIs(out, snapshot)
+        self.assertFalse(cleared)
+
+    def test_clicks_cookie_reject_then_rebuilds_light_snapshot(self) -> None:
+        page = SimpleNamespace(url="https://example.test/")
+        blocked = {
+            "url": page.url,
+            "blocking_overlays": [
+                {
+                    "id": "banner",
+                    "role": "dialog",
+                    "text": "We use cookies. Reject All or Accept All Cookies.",
+                },
+            ],
+            "interactables": [
+                {
+                    "id": "reject",
+                    "kind": "button",
+                    "text": "Reject All",
+                    "role": "button",
+                    "css_path": "button.reject",
+                    "nearby_text": "We use cookies for consent",
+                },
+                {
+                    "id": "accept",
+                    "kind": "button",
+                    "text": "Accept All Cookies",
+                    "role": "button",
+                    "css_path": "button.accept",
+                    "nearby_text": "We use cookies for consent",
+                },
+            ],
+        }
+        clear = {
+            "url": page.url,
+            "blocking_overlays": [],
+            "interactables": [{"id": "nav", "kind": "link", "text": "Home", "href": "/"}],
+            "snapshot_id": "after",
+        }
+        executed: list[dict] = []
+
+        def fake_execute(_page: object, action: dict) -> None:
+            executed.append(action)
+
+        with (
+            patch("web_surf.browser_explore._execute", side_effect=fake_execute),
+            patch(
+                "web_surf.browser_explore._snapshot",
+                return_value=clear,
+            ) as snap_mock,
+        ):
+            out, cleared = _clear_overlays_before_map(
+                page,
+                blocked,
+                session_id="s1",
+                step_id="step_001",
+                form_values={},
+                field_mapping={},
+            )
+
+        self.assertTrue(cleared)
+        self.assertEqual(out, clear)
+        self.assertEqual(len(executed), 1)
+        self.assertEqual(executed[0]["action"], "click")
+        self.assertEqual(executed[0]["target_id"], "reject")
+        self.assertTrue(snap_mock.called)
+        self.assertFalse(snap_mock.call_args.kwargs.get("build_map", True))
 
 
 if __name__ == "__main__":

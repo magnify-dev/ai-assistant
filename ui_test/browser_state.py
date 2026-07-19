@@ -29,6 +29,138 @@ _INTERACTABLE_JS = """() => {
   function clean(value, limit = 160) {
     return String(value || "").trim().replace(/\\s+/g, " ").slice(0, limit);
   }
+  const WEAK_LABEL_RE = /^(read more|learn more|more|here|click here|link|continue|see more|view|view more|details|open|→|»|…|\\.\\.\\.)$/i;
+  function isWeakLabel(value) {
+    const t = clean(value, 120);
+    if (!t) return true;
+    if (t.length < 3) return true;
+    if (WEAK_LABEL_RE.test(t)) return true;
+    return false;
+  }
+  function labelledByText(el) {
+    const ids = (el.getAttribute("aria-labelledby") || "").trim().split(/\\s+/).filter(Boolean);
+    if (!ids.length) return "";
+    return clean(
+      ids.map((id) => {
+        try {
+          const node = document.getElementById(id);
+          return node ? (node.innerText || node.textContent || "") : "";
+        } catch (err) {
+          return "";
+        }
+      }).filter(Boolean).join(" "),
+      160
+    );
+  }
+  function imageAlt(el) {
+    if (!el || !el.querySelectorAll) return "";
+    for (const img of el.querySelectorAll("img[alt]")) {
+      const alt = clean(img.getAttribute("alt"), 160);
+      if (!isWeakLabel(alt)) return alt;
+    }
+    return "";
+  }
+  function headingText(el) {
+    if (!el || !el.querySelector) return "";
+    const heading = el.querySelector("h1,h2,h3,h4,h5,h6,[role='heading']");
+    return heading ? clean(heading.innerText || heading.textContent || "", 160) : "";
+  }
+  function cardContainer(el) {
+    return el.closest(
+      "article, [role='article'], li, [role='listitem'], [class*='card' i], [class*='teaser' i], [class*='story' i], [class*='headline' i], [class*='item' i]"
+    );
+  }
+  function isMetaLine(value) {
+    const t = clean(value, 160);
+    if (!t) return true;
+    if (/\\b(?:posted|published|updated|written)\\b/i.test(t)) return true;
+    if (/\\b(?:(?:an?|\\d+)\\s+(?:minute|hour|day|week|month|year)s?\\s+ago|today|yesterday|just now)\\b/i.test(t)) return true;
+    if (/^by\\s+\\S+/i.test(t)) return true;
+    return false;
+  }
+  function extractDates(text) {
+    const out = [];
+    const seen = new Set();
+    const patterns = [
+      /\\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\\s+\\d{1,2},?\\s+\\d{4}\\b/gi,
+      /\\b\\d{4}-\\d{2}-\\d{2}\\b/g,
+      /\\b\\d{1,2}[./-]\\d{1,2}[./-]\\d{2,4}\\b/g,
+      /\\b(?:an?|\\d+)\\s+(?:minute|hour|day|week|month|year)s?\\s+ago\\b/gi,
+      /\\b(?:today|yesterday|just now)\\b/gi,
+    ];
+    for (const pattern of patterns) {
+      for (const match of String(text || "").matchAll(pattern)) {
+        const value = clean(match[0], 40);
+        if (!value || seen.has(value.toLowerCase())) continue;
+        seen.add(value.toLowerCase());
+        out.push(value);
+        if (out.length >= 4) return out;
+      }
+    }
+    return out;
+  }
+  function extractAuthors(text) {
+    const out = [];
+    const seen = new Set();
+    const patterns = [
+      /\\b(?:posted|published|updated|written)\\b[^\\n]{0,40}?\\bby\\s+([^\\n|,;]{2,60})/gi,
+      /\\bby\\s+([A-Z][\\w.'\\-]{1,40}(?:\\s+[A-Z][\\w.'\\-]{1,40}){0,2})\\b/g,
+    ];
+    for (const pattern of patterns) {
+      for (const match of String(text || "").matchAll(pattern)) {
+        const value = clean(match[1], 60);
+        if (!value || isMetaLine(value) || seen.has(value.toLowerCase())) continue;
+        seen.add(value.toLowerCase());
+        out.push(value);
+        if (out.length >= 3) return out;
+      }
+    }
+    return out;
+  }
+  function extractByline(text) {
+    const match = String(text || "").match(
+      /\\b(?:posted|published|updated|written)\\b[^\\n]{0,80}?(?:\\bby\\s+[^\\n|,;]{2,60})?/i
+    );
+    return match ? clean(match[0], 160) : "";
+  }
+  function cardDisplayText(el) {
+    const card = cardContainer(el);
+    if (!card) return "";
+    const fromHeading = headingText(card);
+    if (!isWeakLabel(fromHeading) && !isMetaLine(fromHeading)) return fromHeading;
+    const titled = card.querySelector("[title], [aria-label]");
+    if (titled) {
+      const fromAttr = clean(titled.getAttribute("aria-label") || titled.getAttribute("title"), 160);
+      if (!isWeakLabel(fromAttr) && !isMetaLine(fromAttr)) return fromAttr;
+    }
+    const fromAlt = imageAlt(card);
+    if (!isWeakLabel(fromAlt) && !isMetaLine(fromAlt)) return fromAlt;
+    const raw = clean(card.innerText || card.textContent || "", 220);
+    if (!raw || isWeakLabel(raw)) return "";
+    // Prefer the first substantial non-meta line from the card body (skip bylines/dates).
+    const first = clean(
+      raw.split(/[\\n•|]/)
+        .map((part) => part.trim())
+        .find((part) => part.length >= 8 && !isMetaLine(part) && !extractDates(part).length) || "",
+      160
+    );
+    return isWeakLabel(first) ? "" : first;
+  }
+  function resolveDisplayText(el, ownText, aria) {
+    const candidates = [
+      ownText,
+      aria,
+      labelledByText(el),
+      clean(el.getAttribute("title"), 160),
+      headingText(el),
+      imageAlt(el),
+      cardDisplayText(el),
+    ];
+    for (const candidate of candidates) {
+      if (!isWeakLabel(candidate)) return clean(candidate, 120);
+    }
+    return "";
+  }
   function associatedLabel(el) {
     if (el.labels && el.labels.length) return clean(Array.from(el.labels).map(textOf).join(" "));
     const id = el.getAttribute("id");
@@ -136,11 +268,15 @@ _INTERACTABLE_JS = """() => {
     else if (role === "spinbutton") kind = "spinbutton";
     const aria = (el.getAttribute("aria-label") || "").trim();
     const fieldName = (el.getAttribute("name") || "").trim();
-    let text = textOf(el);
+    const ownText = textOf(el);
+    let text = ownText;
     if (tag === "select") {
       text = aria || fieldName || associatedLabel(el) || text.slice(0, 40);
     } else if (kind === "textbox" || kind === "combobox" || kind === "spinbutton") {
       text = aria || fieldName || associatedLabel(el) || el.getAttribute("placeholder") || text.slice(0, 40);
+    } else if (kind === "link" || kind === "button" || role === "link" || role === "button") {
+      const display = resolveDisplayText(el, ownText, aria);
+      if (isWeakLabel(text) && display) text = display;
     }
     const href = el.href || "";
     const disabled = Boolean(el.disabled || el.getAttribute("aria-disabled") === "true");
@@ -150,6 +286,28 @@ _INTERACTABLE_JS = """() => {
     seen.add(key);
     if (!text && !aria && !testId && !href && !fieldName && kind !== "input" && kind !== "select" && kind !== "textarea" && kind !== "textbox" && kind !== "combobox" && kind !== "spinbutton") continue;
     const collapse = collapseMeta(el);
+    const titleAttr = clean(el.getAttribute("title"), 120);
+    const displayTitle = (!isWeakLabel(text) && isWeakLabel(ownText) && text !== ownText) ? text : "";
+    const card = (kind === "link" || kind === "button" || role === "link" || role === "button")
+      ? cardContainer(el)
+      : null;
+    const metaSource = card
+      ? clean(card.innerText || card.textContent || "", 280)
+      : (nearbyText(el) || "");
+    const dates = extractDates(metaSource);
+    const authors = extractAuthors(metaSource);
+    const byline = extractByline(metaSource);
+    // Never promote a bare author name over a real headline when meta is present.
+    if (
+      (kind === "link" || role === "link")
+      && authors.length
+      && text
+      && authors.some((name) => name.toLowerCase() === String(text).toLowerCase())
+      && (dates.length || byline)
+    ) {
+      const better = cardDisplayText(el);
+      if (better && better.toLowerCase() !== String(text).toLowerCase()) text = better;
+    }
     const row = {
       index: out.length,
       kind,
@@ -165,7 +323,10 @@ _INTERACTABLE_JS = """() => {
       value: (tag === "input" || tag === "textarea" || tag === "select" || kind === "textbox" || kind === "combobox" || kind === "spinbutton" || el.isContentEditable) ? String(el.value || "").slice(0, 120) : null,
       readonly: Boolean(el.readOnly || el.getAttribute("aria-readonly") === "true"),
       label: associatedLabel(el) || null,
-      title: clean(el.getAttribute("title"), 120) || null,
+      title: titleAttr || displayTitle || null,
+      dates: dates.length ? dates : null,
+      authors: authors.length ? authors : null,
+      byline: byline || null,
       nearest_heading: nearestHeading(el) || null,
       landmark: landmarkOf(el) || null,
       nearby_text: nearbyText(el) || null,
@@ -528,7 +689,7 @@ _BLOCKING_OVERLAYS_JS = """() => {
 _OVERLAY_GATE_KEYWORDS_RE = re.compile(
     r"\b(age.?verif\w*|verify your age|confirm your age|date of birth|birth.?year|"
     r"too young|enter your age|before you continue|we value your privacy|"
-    r"cookie|consent|privacy preferences|gdpr|ccpa|accept all cookies)\b",
+    r"cookies?|consent|privacy preferences|gdpr|ccpa|accept all cookies)\b",
     re.I,
 )
 _OVERLAY_FALSE_POSITIVE_RE = re.compile(
@@ -733,6 +894,24 @@ _PAGE_CONTENT_MAP_JS = """() => {
     }
     return parts.join(" > ");
   }
+  function isMetaLine(value) {
+    const t = clean(value, 160);
+    if (!t) return true;
+    if (/\\b(?:posted|published|updated|written)\\b/i.test(t)) return true;
+    if (/\\b(?:(?:an?|\\d+)\\s+(?:minute|hour|day|week|month|year)s?\\s+ago|today|yesterday|just now)\\b/i.test(t)) return true;
+    if (/^by\\s+\\S+/i.test(t)) return true;
+    return false;
+  }
+  function looksLikeDate(value) {
+    const t = clean(value, 48);
+    if (!t) return false;
+    return (
+      /\\b(?:(?:an?|\\d+)\\s+(?:minute|hour|day|week|month|year)s?\\s+ago|today|yesterday|just now)\\b/i.test(t)
+      || /\\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\\s+\\d{1,2},?\\s+\\d{4}\\b/i.test(t)
+      || /\\b\\d{4}-\\d{2}-\\d{2}\\b/.test(t)
+      || /\\b\\d{1,2}[./-]\\d{1,2}[./-]\\d{2,4}\\b/.test(t)
+    );
+  }
   function extractDates(text) {
     const out = [];
     const seen = new Set();
@@ -740,13 +919,13 @@ _PAGE_CONTENT_MAP_JS = """() => {
       /\\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\\s+\\d{1,2},?\\s+\\d{4}\\b/gi,
       /\\b\\d{4}-\\d{2}-\\d{2}\\b/g,
       /\\b\\d{1,2}[./-]\\d{1,2}[./-]\\d{2,4}\\b/g,
-      /\\b\\d+\\s+(?:minute|hour|day|week|month|year)s?\\s+ago\\b/gi,
+      /\\b(?:an?|\\d+)\\s+(?:minute|hour|day|week|month|year)s?\\s+ago\\b/gi,
       /\\b(?:today|yesterday|just now)\\b/gi,
     ];
     for (const pattern of patterns) {
       for (const match of String(text || "").matchAll(pattern)) {
         const value = clean(match[0], 40);
-        if (!value || seen.has(value.toLowerCase())) continue;
+        if (!value || !looksLikeDate(value) || seen.has(value.toLowerCase())) continue;
         seen.add(value.toLowerCase());
         out.push(value);
         if (out.length >= 4) return out;
@@ -754,16 +933,49 @@ _PAGE_CONTENT_MAP_JS = """() => {
     }
     return out;
   }
+  function extractAuthors(text) {
+    const out = [];
+    const seen = new Set();
+    const patterns = [
+      /\\b(?:posted|published|updated|written)\\b[^\\n]{0,40}?\\bby\\s+([^\\n|,;]{2,60})/gi,
+      /\\bby\\s+([A-Z][\\w.'\\-]{1,40}(?:\\s+[A-Z][\\w.'\\-]{1,40}){0,2})\\b/g,
+    ];
+    for (const pattern of patterns) {
+      for (const match of String(text || "").matchAll(pattern)) {
+        const value = clean(match[1], 60);
+        if (!value || looksLikeDate(value) || seen.has(value.toLowerCase())) continue;
+        seen.add(value.toLowerCase());
+        out.push(value);
+        if (out.length >= 3) return out;
+      }
+    }
+    return out;
+  }
+  function extractByline(text) {
+    const match = String(text || "").match(
+      /\\b(?:posted|published|updated|written)\\b[^\\n]{0,80}?(?:\\bby\\s+[^\\n|,;]{2,60})?/i
+    );
+    return match ? clean(match[0], 160) : "";
+  }
   function cardTitle(el) {
     const heading = el.querySelector("h1,h2,h3,h4,h5,h6,[role='heading']");
-    if (heading) return clean(heading.innerText || heading.textContent || "", 160);
+    if (heading) {
+      const headingLabel = clean(heading.innerText || heading.textContent || "", 160);
+      if (headingLabel && !isMetaLine(headingLabel)) return headingLabel;
+    }
     const time = el.querySelector("time,[datetime]");
     const text = blockText(el, 220);
     if (time) {
       const without = text.replace(clean(time.innerText || time.textContent || "", 40), "").trim();
-      if (without.length >= 8) return clean(without, 160);
+      if (without.length >= 8 && !isMetaLine(without)) return clean(without, 160);
     }
-    return clean(text, 160);
+    const first = clean(
+      text.split(/[\\n•|]/)
+        .map((part) => part.trim())
+        .find((part) => part.length >= 8 && !isMetaLine(part) && !looksLikeDate(part)) || text,
+      160
+    );
+    return first;
   }
   function isLikelyClickable(el) {
     if (!el || el.nodeType !== 1) return false;
@@ -832,23 +1044,38 @@ _PAGE_CONTENT_MAP_JS = """() => {
   const candidates = [];
   const seenElements = new Set();
   function consider(el) {
-    if (!el || seenElements.has(el) || !isVisible(el) || !inViewport(el) || inChrome(el)) return;
+    // Document-visible content (not only the current viewport) so feeds with many
+    // articles below the fold still become distinct mapped items.
+    if (!el || seenElements.has(el) || !isVisible(el) || inChrome(el)) return;
     if (el.matches(controlSelector)) return;
     const rect = el.getBoundingClientRect();
     if (rect.width < 24 || rect.height < 14) return;
     const role = contentRole(el);
-    const text = blockText(el, role === "heading" ? 180 : 220);
+    const text = blockText(el, role === "heading" ? 180 : 280);
     const title = role === "card" || role === "article" || role === "list-item" ? cardTitle(el) : "";
     const label = title || text;
     if (!label || label.length < (role === "date" ? 4 : 8)) return;
     if (role === "text" && label.length < 20) return;
     seenElements.add(el);
     const dates = extractDates(`${label} ${text}`);
+    const authors = extractAuthors(`${label} ${text}`);
+    const byline = extractByline(text);
     const timeEl = el.matches("time,[datetime]") ? el : el.querySelector("time,[datetime]");
     if (timeEl) {
-      const dt = clean(timeEl.getAttribute("datetime") || timeEl.innerText || timeEl.textContent || "", 40);
-      if (dt && !dates.includes(dt)) dates.unshift(dt);
+      const attr = clean(timeEl.getAttribute("datetime") || "", 40);
+      const shown = clean(timeEl.innerText || timeEl.textContent || "", 40);
+      // Only accept visible/attr values that actually look like dates — never author names.
+      if (attr && looksLikeDate(attr) && !dates.includes(attr)) dates.unshift(attr);
+      else if (shown && looksLikeDate(shown) && !dates.includes(shown)) dates.unshift(shown);
+      else {
+        for (const part of extractDates(shown)) {
+          if (!dates.includes(part)) dates.unshift(part);
+        }
+      }
     }
+    let href = null;
+    const nestedLink = el.querySelector("a[href]");
+    if (nestedLink && nestedLink.href) href = nestedLink.href;
     candidates.push({
       el,
       kind: role,
@@ -856,7 +1083,10 @@ _PAGE_CONTENT_MAP_JS = """() => {
       map_layer: "content",
       text: label,
       title: title || null,
+      href,
       dates: dates.length ? dates : null,
+      authors: authors.length ? authors : null,
+      byline: byline || null,
       likely_clickable: isLikelyClickable(el),
       tag: el.tagName.toLowerCase(),
       role: el.getAttribute("role") || null,
@@ -874,19 +1104,31 @@ _PAGE_CONTENT_MAP_JS = """() => {
   }
   for (const root of roots) {
     for (const el of root.querySelectorAll(contentSelector)) consider(el);
+    let pointerScan = 0;
     for (const el of root.querySelectorAll("div,section")) {
+      if (++pointerScan > 800) break;
       if (!isLikelyClickable(el)) continue;
       if (blockText(el, 220).length < 16) continue;
       consider(el);
     }
   }
+  function isContentLike(row) {
+    const role = row.content_role || row.kind;
+    return ["card", "article", "list-item", "row"].includes(role) || row.likely_clickable;
+  }
+  // Drop feed/list wrappers that contain multiple peer stories so each article stays distinct.
+  const containers = new Set();
+  for (const row of candidates) {
+    const kids = candidates.filter((other) => other !== row && row.el.contains(other.el) && isContentLike(other));
+    if (kids.length >= 2) containers.add(row);
+  }
   const filtered = [];
   for (const row of candidates) {
-    const el = row.el;
-    const nested = candidates.some(
-      (other) => other !== row && other.el !== el && other.el.contains(el)
+    if (containers.has(row)) continue;
+    const nestedInLeaf = candidates.some(
+      (other) => other !== row && !containers.has(other) && other.el.contains(row.el)
     );
-    if (nested) continue;
+    if (nestedInLeaf) continue;
     filtered.push(row);
   }
   const out = filtered.slice(0, 250).map((row, index) => {
@@ -935,11 +1177,18 @@ def _widget_for_item(item: dict[str, Any]) -> str:
 
 def _interactable_action_hint(item: dict[str, Any]) -> str:
     kind = str(item.get("kind") or "").lower()
-    label = str(item.get("text") or item.get("aria") or item.get("label") or "").strip()
+    label = str(
+        item.get("text") or item.get("title") or item.get("aria") or item.get("label") or ""
+    ).strip()
     href = str(item.get("href") or "").strip()
     widget = _widget_for_item(item)
-    if kind == "link" and href:
-        return f"Follow this link to {href}."
+    if kind == "link":
+        if label and href:
+            return f'Open "{label[:80]}" ({href}).'
+        if label:
+            return f'Open "{label[:80]}".'
+        if href:
+            return f"Follow this link to {href}."
     if kind == "button":
         return f'Click this button to "{label}".' if label else "Click this button."
     if widget in {"select", "combobox"}:
@@ -1046,12 +1295,14 @@ def _infer_gate_interactables_from_overlays(overlays: list[Any]) -> list[dict[st
 def _enrich_content_map(items: Any) -> list[dict[str, Any]]:
     if not isinstance(items, list):
         return []
+    from web_capture.display_meta import enrich_item_display_meta
+
     occurrences: dict[str, int] = {}
     result: list[dict[str, Any]] = []
     for raw in items:
         if not isinstance(raw, dict):
             continue
-        item = dict(raw)
+        item = enrich_item_display_meta(dict(raw))
         signature = "|".join(
             str(item.get(key) or "").strip().lower()
             for key in ("kind", "content_role", "text", "title", "tag", "role")
@@ -1074,12 +1325,14 @@ def _enrich_content_map(items: Any) -> list[dict[str, Any]]:
 def _enrich_interactables(items: Any, page_url: str) -> list[dict[str, Any]]:
     if not isinstance(items, list):
         return []
+    from web_capture.display_meta import enrich_item_display_meta
+
     occurrences: dict[str, int] = {}
     result: list[dict[str, Any]] = []
     for raw in items:
         if not isinstance(raw, dict):
             continue
-        item = dict(raw)
+        item = enrich_item_display_meta(dict(raw))
         href = str(item.get("href") or "").strip()
         if href:
             item["href"] = urljoin(page_url, href)
@@ -1130,8 +1383,13 @@ def _collect_iframe_interactables(page: Page) -> list[dict[str, Any]]:
     return collected
 
 
-def capture_screenshot_b64(page: Page) -> str | None:
-    """JPEG preview cropped to page content — avoids black viewport margins in headless Chrome."""
+def capture_screenshot_b64(page: Page, *, mode: str = "content") -> str | None:
+    """JPEG preview for UI / map building.
+
+    mode="content" — crop to main content (UI previews; may not match viewport height).
+    mode="viewport" — full browser viewport (legacy scroll-stitch slices).
+    mode="full_page" — one Playwright full-page shot of the scrollable document.
+    """
     try:
         page.evaluate(
             """() => {
@@ -1140,6 +1398,49 @@ def capture_screenshot_b64(page: Page) -> str | None:
           }
         }"""
         )
+        if mode == "full_page":
+            from web_capture.full_page import MAX_FULL_PAGE_HEIGHT_PX
+
+            # Soft-cap via CSS max-height on html so Playwright's full_page stays bounded.
+            page.evaluate(
+                """(maxH) => {
+              const root = document.documentElement;
+              root.dataset.prevMaxHeight = root.style.maxHeight || "";
+              root.dataset.prevOverflow = root.style.overflow || "";
+              const docH = Math.max(
+                root.scrollHeight || 0,
+                document.body ? document.body.scrollHeight : 0,
+                1,
+              );
+              if (docH > maxH) {
+                root.style.maxHeight = maxH + "px";
+                root.style.overflow = "hidden";
+              }
+            }""",
+                int(MAX_FULL_PAGE_HEIGHT_PX),
+            )
+            try:
+                raw = page.screenshot(type="jpeg", quality=45, full_page=True, timeout=20000)
+            finally:
+                page.evaluate(
+                    """() => {
+                  const root = document.documentElement;
+                  root.style.maxHeight = root.dataset.prevMaxHeight || "";
+                  root.style.overflow = root.dataset.prevOverflow || "";
+                  delete root.dataset.prevMaxHeight;
+                  delete root.dataset.prevOverflow;
+                }"""
+                )
+            if not raw:
+                return None
+            return base64.b64encode(raw).decode("ascii")
+
+        if mode == "viewport":
+            raw = page.screenshot(type="jpeg", quality=55, full_page=False, timeout=5000)
+            if not raw:
+                return None
+            return base64.b64encode(raw).decode("ascii")
+
         bounds = page.evaluate(
             """() => {
           const candidates = [
@@ -1247,6 +1548,36 @@ def build_semantic_snapshot(state: dict[str, Any], *, max_chars: int = 10000) ->
     title = str(state.get("title") or "").strip()
     if title:
         parts.append(f"# {title}")
+    understanding = state.get("page_understanding")
+    if isinstance(understanding, dict):
+        summary = str(understanding.get("summary") or "").strip()
+        page_type = str(understanding.get("page_type") or "").strip()
+        if summary:
+            header = f"## Page understanding ({page_type})" if page_type else "## Page understanding"
+            lines = [header, summary]
+            feed_items = understanding.get("feed_items")
+            if isinstance(feed_items, list) and feed_items:
+                lines.append("Visible feed items:")
+                for item in feed_items[:20]:
+                    if not isinstance(item, dict):
+                        continue
+                    label = str(item.get("title") or "").strip()
+                    if not label:
+                        continue
+                    meta_bits = [
+                        str(item.get("date") or "").strip(),
+                        str(item.get("author") or "").strip(),
+                    ]
+                    meta = ", ".join(bit for bit in meta_bits if bit)
+                    lines.append(f"- {label[:160]}" + (f" ({meta})" if meta else ""))
+            proceed = [
+                str(item).strip()
+                for item in (understanding.get("how_to_proceed") or [])
+                if str(item).strip()
+            ]
+            if proceed:
+                lines.append("How to proceed: " + "; ".join(proceed[:4]))
+            parts.append("\n".join(lines))
     headings = state.get("headings")
     if isinstance(headings, list) and headings:
         parts.append("## " + " · ".join(str(item) for item in headings[:12] if str(item).strip()))
@@ -1261,7 +1592,13 @@ def build_semantic_snapshot(state: dict[str, Any], *, max_chars: int = 10000) ->
             if not label:
                 continue
             dates = item.get("dates") if isinstance(item.get("dates"), list) else []
-            date_suffix = f" ({', '.join(str(d) for d in dates[:2])})" if dates else ""
+            authors = item.get("authors") if isinstance(item.get("authors"), list) else []
+            byline = str(item.get("byline") or "").strip()
+            meta_bits = [str(d) for d in dates[:2] if d]
+            meta_bits.extend(str(a) for a in authors[:1] if a)
+            if byline and byline.lower() not in " ".join(meta_bits).lower():
+                meta_bits.append(byline[:80])
+            date_suffix = f" ({'; '.join(meta_bits)})" if meta_bits else ""
             click_suffix = " [clickable]" if item.get("likely_clickable") else ""
             lines.append(f"- [{kind}]{click_suffix} {label[:180]}{date_suffix}")
         if len(lines) > 1:
@@ -1272,7 +1609,12 @@ def build_semantic_snapshot(state: dict[str, Any], *, max_chars: int = 10000) ->
     return "\n\n".join(parts)[:max_chars]
 
 
-def collect_page_state(page: Page, *, include_screenshot: bool = True) -> dict[str, Any]:
+def collect_page_state(
+    page: Page,
+    *,
+    include_screenshot: bool = True,
+    screenshot_mode: str = "content",
+) -> dict[str, Any]:
     """Create a compact semantic snapshot with stable IDs and page context."""
     try:
         raw_interactables = page.evaluate(_INTERACTABLE_JS)
@@ -1365,10 +1707,33 @@ def collect_page_state(page: Page, *, include_screenshot: bool = True) -> dict[s
     }
     state["semantic_snapshot"] = build_semantic_snapshot(state)
     if include_screenshot:
-        shot = capture_screenshot_b64(page)
+        shot = capture_screenshot_b64(page, mode=screenshot_mode)
         if shot:
             state["screenshot_b64"] = shot
+            state["screenshot_mode"] = screenshot_mode
     return state
+
+
+_CAPTURE_BY_URL: dict[str, dict[str, Any]] = {}
+
+
+def _url_cache_key(url: str) -> str:
+    return str(url or "").strip().split("#", 1)[0].rstrip("/")
+
+
+def remember_web_capture(capture: dict[str, Any] | None) -> None:
+    """Keep the latest map per URL so same-page observes can patch instead of redraw."""
+    if not isinstance(capture, dict):
+        return
+    key = _url_cache_key(str(capture.get("url") or ""))
+    if key:
+        _CAPTURE_BY_URL[key] = capture
+
+
+def previous_web_capture_for_url(url: str) -> dict[str, Any] | None:
+    key = _url_cache_key(url)
+    prior = _CAPTURE_BY_URL.get(key)
+    return prior if isinstance(prior, dict) else None
 
 
 def attach_web_capture(
@@ -1410,9 +1775,14 @@ def attach_web_capture(
             pass
 
     try:
-        from web_capture.analyzer import analyze_capture
+        from web_capture.analyzer import analyze_capture, understand_page_capture
         from web_capture.capture import build_capture
         from web_capture.context import get_active_project
+        from web_capture.incremental import (
+            apply_preserved_labels,
+            maybe_incremental_capture,
+            signature_overlap,
+        )
         from web_capture.locators import validate_capture_locators
         from web_capture.maps import apply_site_map, sync_interactables_from_capture
         from web_capture.page_map import (
@@ -1424,9 +1794,21 @@ def attach_web_capture(
         from web_capture.screenshots import attach_screenshot_to_capture, persist_screenshot
         from web_capture.visual import collect_visual_tiles, resolve_visual_map
 
+        previous = previous_web_capture_for_url(url)
         _progress("geometry")
         map_elements = merge_capture_elements(state)
-        capture = build_capture(state, context=context, elements=map_elements)
+        for item in state.get("interactables") or []:
+            if isinstance(item, dict):
+                item["action_hint"] = _interactable_action_hint(item)
+        coord_space = (
+            "document" if str(state.get("screenshot_mode") or "") == "full_page" else "viewport"
+        )
+        capture = build_capture(
+            state,
+            context=context,
+            elements=map_elements,
+            coord_space=coord_space,
+        )
         layer_summary = summarize_map_layers(list(capture.get("elements") or []))
         capture.setdefault("summary", {}).update(layer_summary)
         _progress("geometry", capture=capture)
@@ -1434,9 +1816,67 @@ def attach_web_capture(
         validate_capture_locators(page, capture)
         capture.setdefault("ai", {"status": "pending"})
         _progress("locators", capture=capture)
+
+        # Same URL: patch prior map / reuse labels before AI so we only analyze deltas.
+        if previous is not None:
+            capture = maybe_incremental_capture(previous, capture)
+            if str((capture.get("map_update") or {}).get("mode") or "") != "patch":
+                apply_preserved_labels(previous, capture)
+
+        overlap = float((capture.get("map_update") or {}).get("overlap") or 0)
+        if previous is not None and overlap <= 0:
+            overlap = signature_overlap(
+                list(previous.get("elements") or []),
+                list(capture.get("elements") or []),
+            )
+        needs_full_ai = analyze and (
+            previous is None
+            or str((capture.get("map_update") or {}).get("mode") or "") == "full"
+            or overlap < 0.55
+        )
         if analyze:
             _progress("analyzing")
-            analyze_capture(capture)
+            if needs_full_ai:
+                analyze_capture(capture)
+            else:
+                # Analyze only elements that still lack an AI decision after reuse.
+                pending = [
+                    item
+                    for item in (capture.get("elements") or [])
+                    if isinstance(item, dict) and item.get("ai_interactive") is None
+                ]
+                if pending:
+                    from copy import deepcopy
+
+                    delta = deepcopy(capture)
+                    delta["elements"] = pending
+                    analyze_capture(delta)
+                    by_id = {
+                        str(item.get("id")): item
+                        for item in delta.get("elements") or []
+                        if isinstance(item, dict) and item.get("id")
+                    }
+                    for item in capture.get("elements") or []:
+                        if not isinstance(item, dict):
+                            continue
+                        refreshed = by_id.get(str(item.get("id") or ""))
+                        if refreshed is None:
+                            continue
+                        for field in (
+                            "ai_interactive",
+                            "ai_confidence",
+                            "ai_control_type",
+                            "ai_reason",
+                        ):
+                            if field in refreshed:
+                                item[field] = refreshed[field]
+                    capture.setdefault("ai", {"status": "partial"})
+                    capture["ai"]["incremental"] = True
+                    capture["ai"]["analyzed"] = len(pending)
+                else:
+                    capture.setdefault("ai", {"status": "cached"})
+                    capture["ai"]["incremental"] = True
+                    apply_content_defaults(capture)
         else:
             apply_content_defaults(capture)
         project = get_active_project()
@@ -1464,7 +1904,20 @@ def attach_web_capture(
         attach_screenshot_to_capture(capture, project)
         sync_interactables_from_capture(state, capture)
         promote_clickable_content(state, capture)
+        # Structural read of the mapped page — grounded in visible element fields.
+        understand_page_capture(capture, state)
+        if isinstance(capture.get("page_understanding"), dict):
+            state["page_understanding"] = capture["page_understanding"]
+            state["semantic_snapshot"] = build_semantic_snapshot(state)
+        if coord_space == "document":
+            from web_capture.full_page import annotate_full_page_capture
+
+            understanding = capture.get("page_understanding")
+            capture = annotate_full_page_capture(capture)
+            if isinstance(understanding, dict) and not capture.get("page_understanding"):
+                capture["page_understanding"] = understanding
         state["web_capture"] = capture
+        remember_web_capture(capture)
         _progress("complete", capture=capture)
     except Exception as exc:
         state["web_capture_error"] = str(exc)[:300]
