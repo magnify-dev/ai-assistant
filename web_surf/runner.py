@@ -23,17 +23,14 @@ from web_surf.spec import classify_search_sources
 from web_surf.search import SearchResult, web_search
 from web_surf.spec import fallback_research_spec, structure_research_spec, wants_verbatim_copy
 from web_surf.store import (
-    cache_page_markdown,
+    empty_facts,
+    empty_index,
     facts_for_query,
     facts_summary_for_agent,
     index_summary_for_agent,
-    load_facts,
-    load_index,
     merge_facts,
     merge_page_index,
     normalize_url,
-    save_facts,
-    save_index,
     save_run_state,
 )
 
@@ -367,7 +364,7 @@ def _ingest_page(
 ) -> tuple[dict[str, Any], dict[str, Any], int]:
     from web_surf import events as web_events
 
-    cache_page_markdown(project_path, page.content_hash, page.markdown)
+    # Page markdown / facts are run-local only — maps are the sole cross-run reuse.
     page_summary = ""
     new_facts: list[dict[str, Any]] = []
     if emit_events:
@@ -556,7 +553,7 @@ def run_web_research(
         result.answer = "Web search failed. Check network connectivity and ddgs installation."
         if emit_events:
             web_events.phase_done("web_research", ok=False, message=result.answer)
-            web_events.web_result_event(_result_payload(result, load_index(project_path), load_facts(project_path)))
+            web_events.web_result_event(_result_payload(result, empty_index(), empty_facts()))
             web_events.finish(overall_ok=False, error=result.answer)
             web_events.set_running(False)
         save_run_state(
@@ -566,8 +563,10 @@ def run_web_research(
         )
         return result
 
-    index = load_index(project_path)
-    facts_doc = load_facts(project_path)
+    # Fresh facts/index each run — prior research must not bias the answer.
+    # The only cross-run reuse is URL-keyed page maps under .agent/web-capture/by-url/.
+    index = empty_index()
+    facts_doc = empty_facts()
     pages_fetched = 0
     facts_added = 0
 
@@ -729,8 +728,7 @@ def run_web_research(
                 facts_added += added
                 visited_urls.add(page.url)
 
-    save_index(project_path, index)
-    save_facts(project_path, facts_doc)
+    # Do not persist facts/index across runs (stale answers). Maps persist via url_cache.
 
     result.pages_fetched = pages_fetched
     result.facts_added = facts_added

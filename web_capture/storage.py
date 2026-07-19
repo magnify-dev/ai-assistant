@@ -71,6 +71,13 @@ def persist_capture(session_dir: Path, capture: dict[str, Any]) -> Path:
         project_raw_tmp.write_text(payload, encoding="utf-8")
         project_raw_tmp.replace(project_raw / f"{capture_id}.json")
         _copy_screenshot_to_run(project, session_dir, capture)
+        # Canonical cross-run store: URL → map + screenshot (only reuse channel).
+        try:
+            from web_capture.url_cache import save_capture_for_url
+
+            save_capture_for_url(project, capture)
+        except Exception:
+            pass
         append_training_record(
             project,
             {

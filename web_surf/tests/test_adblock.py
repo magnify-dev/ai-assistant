@@ -13,6 +13,8 @@ class AdblockTests(unittest.TestCase):
         self.assertTrue(host_is_ad("adservice.google.de"))
         self.assertTrue(host_is_ad("cdn.taboola.com"))
         self.assertTrue(host_is_ad("ads.example-network.com"))
+        self.assertTrue(host_is_ad("cdn.venatusmedia.com"))
+        self.assertTrue(host_is_ad("scripts.nitropay.com"))
 
     def test_allows_content_hosts(self) -> None:
         self.assertFalse(host_is_ad("www.wowhead.com"))

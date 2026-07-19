@@ -4,6 +4,7 @@ import {
   boxTone,
   captureBoxStyle,
   filterCaptureElements,
+  isCaptureMapReady,
 } from "../src/lib/webCaptureView.ts";
 
 const capture = {
@@ -84,6 +85,32 @@ test("filters effective, saved, and locator problems", () => {
   assert.deepEqual(filterCaptureElements([kept, saved, problem], "kept"), [kept, saved]);
   assert.deepEqual(filterCaptureElements([kept, saved, problem], "saved"), [saved]);
   assert.deepEqual(filterCaptureElements([kept, saved, problem], "problems"), [problem]);
+});
+
+test("isCaptureMapReady requires stitched full-page image", () => {
+  assert.equal(
+    isCaptureMapReady({
+      viewport: { width: 1280, height: 720 },
+      elements: [],
+      scroll_map: { stitched: false, canvas_height: 720, slice_count: 1, slices: [] },
+    }),
+    false,
+  );
+  assert.equal(
+    isCaptureMapReady({
+      viewport: { width: 1280, height: 720 },
+      screenshot: "screenshots/page.jpg",
+      scroll_map: {
+        stitched: true,
+        mode: "full_page",
+        coords: "document",
+        canvas_height: 4000,
+        slice_count: 1,
+        slices: [{ scroll_y: 0, height: 4000, screenshot: "screenshots/page.jpg" }],
+      },
+    }),
+    true,
+  );
 });
 
 test("prioritizes saved map tone over AI tone", () => {

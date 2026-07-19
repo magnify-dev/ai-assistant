@@ -67,14 +67,26 @@ CONSENT_REGION_RE = re.compile(
     re.I,
 )
 OVERLAY_DISMISS_RE = re.compile(
-    r"\b(accept all cookies|accept cookies|agree and continue|accept all|reject all|got it|allow all)\b",
+    r"\b(accept all cookies|accept cookies|agree and continue|accept all|reject all|"
+    r"got it|allow all|keep watching|skip(?:\s+ad)?|close video|not interested)\b",
     re.I,
 )
 OVERLAY_BUTTON_RE = re.compile(
-    r"\b(accept|agree|allow|ok|okay|close|continue|confirm|dismiss|got it|understood|reject|decline|save)\b",
+    r"\b(accept|agree|allow|ok|okay|close|continue|confirm|dismiss|got it|understood|"
+    r"reject|decline|save|keep watching|skip)\b",
     re.I,
 )
-_OVERLAY_KIND_ORDER = {"cookie": 0, "generic": 1, "age_gate": 2}
+VIDEO_OVERLAY_RE = re.compile(
+    r"\b(keep watching|watch next|play video|video player|trailer|skip ad)\b",
+    re.I,
+)
+# Timestamped player chrome like "0:16 / 2:55 Keep Watching" — unstable for locators.
+_VIDEO_TIME_RE = re.compile(r"\b\d{1,2}:\d{2}(?:\s*/\s*\d{1,2}:\d{2})?\b")
+_VIDEO_DISMISS_LABEL_RE = re.compile(
+    r"\b(keep watching|skip(?:\s+ad)?|close(?:\s+video)?|not interested|watch next)\b",
+    re.I,
+)
+_OVERLAY_KIND_ORDER = {"cookie": 0, "video": 1, "generic": 2, "age_gate": 3}
 NEGATIVE_REPORT_RE = re.compile(
     r"\b("
     r"not available|not found|unable to find|cannot find|could not find|"
@@ -120,7 +132,15 @@ def _is_overlay_button(item: dict[str, Any]) -> bool:
     if item.get("disabled") or not item.get("id") or _is_legal_info_link(item):
         return False
     kind = str(item.get("kind") or item.get("role") or "").lower()
-    return kind in {"button", "blz-button"}
+    if kind in {"button", "blz-button"}:
+        return True
+    # Video/promo dismiss controls are often links or clickable divs.
+    primary = _primary_label(item)
+    if kind in {"link", "div"} and (
+        OVERLAY_DISMISS_RE.search(primary) or VIDEO_OVERLAY_RE.search(primary)
+    ):
+        return True
+    return False
 
 
 def _in_consent_region(item: dict[str, Any]) -> bool:
@@ -143,6 +163,8 @@ def classify_overlay(overlay: dict[str, Any]) -> str:
         return "cookie"
     if AGE_GATE_RE.search(blob):
         return "age_gate"
+    if VIDEO_OVERLAY_RE.search(blob):
+        return "video"
     return "generic"
 
 
@@ -251,6 +273,9 @@ def _is_cookie_overlay_control(item: dict[str, Any]) -> bool:
     if not _is_overlay_button(item):
         return False
     primary = _primary_label(item)
+    # Video player chrome must not be treated as a cookie/consent button.
+    if VIDEO_OVERLAY_RE.search(primary) and not COOKIE_OVERLAY_RE.search(primary):
+        return False
     if (
         OVERLAY_REJECT_RE.search(primary)
         or OVERLAY_ACCEPT_RE.search(primary)
@@ -698,13 +723,70 @@ def _cookie_buttons_from_interactables(interactables: list[Any]) -> list[dict[st
     ]
 
 
+def stable_video_dismiss_label(label: str) -> str:
+    """Strip ticking timestamps so Keep Watching locators stay matchable."""
+    cleaned = _VIDEO_TIME_RE.sub(" ", str(label or ""))
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    match = _VIDEO_DISMISS_LABEL_RE.search(cleaned)
+    if match:
+        # Prefer the stable phrase over the full noisy chrome string.
+        phrase = match.group(0)
+        if phrase.lower() == "keep watching":
+            return "Keep Watching"
+        return phrase
+    return cleaned
+
+
+def is_video_chrome_label(label: str) -> bool:
+    return bool(VIDEO_OVERLAY_RE.search(str(label or "")))
+
+
+def video_dismiss_failures(recent_history: list[dict[str, Any]] | None) -> int:
+    """How many recent failed attempts were video/promo dismiss clicks."""
+    count = 0
+    for row in recent_history or []:
+        if not isinstance(row, dict):
+            continue
+        if row.get("ok") is True or row.get("progress") is True:
+            continue
+        reason = str(row.get("reason") or "").lower()
+        target = str(row.get("target_id") or "").lower()
+        if "video" in reason or "keep watching" in reason or "keep-watching" in target:
+            count += 1
+    return count
+
+
+def strip_video_blockers(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Drop video/trailer blockers so browsing can continue after dismiss fails."""
+    overlays = snapshot.get("blocking_overlays") or []
+    kept = [
+        raw
+        for raw in overlays
+        if not (
+            isinstance(raw, dict)
+            and classify_overlay(raw) == "video"
+        )
+    ]
+    if len(kept) == len(overlays):
+        return snapshot
+    next_snap = dict(snapshot)
+    next_snap["blocking_overlays"] = kept
+    return next_snap
+
+
 def snapshot_needs_overlay_action(snapshot: dict[str, Any]) -> bool:
-    """True when deterministic overlay handling should run before the LLM decides."""
+    """True when deterministic overlay handling should run before the LLM decides.
+
+    Embedded video chrome ("Keep Watching" / "Video Player" on the page) is NOT a
+    consent overlay — only real blockers (cookie/age/dialog/pointer-block) count.
+    """
     if _snapshot_blockers(snapshot):
         return True
     if looks_like_age_gate(snapshot):
         return True
-    return _infer_cookie_overlay(snapshot) is not None
+    if _infer_cookie_overlay(snapshot) is not None:
+        return True
+    return False
 
 
 def suggest_overlay_action(
@@ -746,6 +828,18 @@ def suggest_overlay_action(
                 blocked=blocked,
             )
 
+    # After repeated failed Keep Watching clicks, stop retrying — let browse continue.
+    if video_dismiss_failures(recent_history) >= 2:
+        non_video = [
+            overlay
+            for overlay in overlays
+            if not (isinstance(overlay, dict) and classify_overlay(overlay) == "video")
+        ]
+        if len(non_video) < len(overlays):
+            overlays = non_video
+        if not overlays and not looks_like_age_gate(snapshot):
+            return None
+
     if _cookie_dismiss_failed(recent_history) and has_gate_work:
         action = _suggest_gate_field_action(
             snapshot,
@@ -770,6 +864,65 @@ def suggest_overlay_action(
         action = _pick_consent_action(cookie_buttons, blocked=blocked)
         if action:
             return action
+
+    # Video / "Keep Watching" layers that intercept article clicks.
+    # Prefer Skip/Close over the timestamped "Keep Watching" chrome itself.
+    for overlay_kind, overlay in _prioritized_overlays(overlays, snapshot):
+        if overlay_kind != "video":
+            continue
+        controls = _controls_for_overlay(interactables, overlay, "generic", all_overlays=overlays)
+        skip_close = [
+            item
+            for item in controls
+            if re.search(
+                r"\b(skip(?:\s+ad)?|close(?:\s+video)?|not interested|dismiss)\b",
+                _primary_label(item),
+                re.I,
+            )
+        ]
+        action = _pick_consent_action(
+            skip_close or controls,
+            prefer_reject=False,
+            reason="Dismiss video/promo overlay",
+            blocked=blocked,
+        )
+        if action:
+            # Annotate with a stable label so Playwright does not match ticking timestamps.
+            target = next(
+                (
+                    raw
+                    for raw in interactables
+                    if isinstance(raw, dict) and str(raw.get("id") or "") == action.get("target_id")
+                ),
+                None,
+            )
+            if isinstance(target, dict):
+                stable = stable_video_dismiss_label(_primary_label(target))
+                if stable:
+                    action["stable_label"] = stable
+                    action["force_click"] = True
+            return action
+        for raw in interactables:
+            if not isinstance(raw, dict) or not raw.get("id"):
+                continue
+            primary = _primary_label(raw)
+            if not (
+                OVERLAY_DISMISS_RE.search(primary)
+                or _VIDEO_DISMISS_LABEL_RE.search(primary)
+            ):
+                continue
+            # Never keep re-clicking the same ticking player chrome under a new id.
+            if is_video_chrome_label(primary) and video_dismiss_failures(recent_history) >= 1:
+                continue
+            candidate = {
+                "action": "click",
+                "target_id": str(raw["id"]),
+                "reason": f"Dismiss video/promo overlay ({stable_video_dismiss_label(primary) or primary})",
+                "stable_label": stable_video_dismiss_label(primary),
+                "force_click": True,
+            }
+            if not _action_is_blocked(candidate, blocked):
+                return candidate
 
     action = _suggest_gate_field_action(
         snapshot,

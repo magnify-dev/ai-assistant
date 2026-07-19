@@ -7,7 +7,9 @@ import type {
   WebCaptureReview,
 } from "@/lib/webCaptureTypes";
 import {
+  captureMapScreenshotSrc,
   filterCaptureElements,
+  isCaptureMapReady,
   type WebCaptureFilter,
 } from "@/lib/webCaptureView";
 import { MapOverlayView } from "@/components/MapOverlayView";
@@ -69,10 +71,15 @@ export function WebCapturePanel({ capture, latestReview, onReview }: Props) {
           ? "AI disabled — raw capture shown"
           : "AI analysis pending";
 
-  const screenshotSrc = capture.screenshotUrl
-    ? capture.screenshotUrl.startsWith("http") || capture.screenshotUrl.startsWith("data:")
-      ? capture.screenshotUrl
-      : apiUrl(capture.screenshotUrl)
+  const mapReady = isCaptureMapReady(capture);
+  const screenshotSrc = mapReady
+    ? captureMapScreenshotSrc(capture, (rel) =>
+        rel.startsWith("http") || rel.startsWith("data:") || rel.startsWith("/")
+          ? rel.startsWith("/")
+            ? apiUrl(rel)
+            : rel
+          : apiUrl(rel),
+      )
     : undefined;
 
   return (
@@ -119,13 +126,19 @@ export function WebCapturePanel({ capture, latestReview, onReview }: Props) {
       </div>
 
       <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_300px]">
-        <MapOverlayView
-          capture={capture}
-          elements={visible}
-          screenshotSrc={screenshotSrc}
-          selectedId={selected?.id ?? null}
-          onSelect={setSelectedId}
-        />
+        {mapReady && screenshotSrc ? (
+          <MapOverlayView
+            capture={capture}
+            elements={visible}
+            screenshotSrc={screenshotSrc}
+            selectedId={selected?.id ?? null}
+            onSelect={setSelectedId}
+          />
+        ) : (
+          <div className="flex min-h-[240px] flex-col items-center justify-center rounded-lg border border-dashed border-sky-400/25 bg-sky-500/5 p-8 text-center">
+            <p className="text-sm text-sky-100/90">Waiting for scrollable full-page map…</p>
+          </div>
+        )}
 
         <aside className="space-y-3 rounded-lg border border-white/10 bg-black/25 p-3">
           {selected ? (

@@ -61,9 +61,16 @@ from web_surf.store import (
     load_visit_graph,
     normalize_url,
     record_visit,
+    reset_session_visit_graph,
     save_session_state,
 )
-from ui_test.state_diff import action_signature, diff_page_states, is_no_progress, progress_fingerprint
+from ui_test.state_diff import (
+    action_signature,
+    diagnose_action_stall,
+    diff_page_states,
+    is_no_progress,
+    progress_fingerprint,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -371,7 +378,15 @@ def validate_action(
         if target_href and allowed_origins and origin_url(target_href) not in allowed_origins:
             return None, f"{action} target leaves the allowed candidate origins"
         validated["target_id"] = target_id
-        validated["target"] = elements[target_id]
+        target = dict(elements[target_id])
+        # Deterministic overlay dismiss may attach a timestamp-stable label.
+        stable_label = str(decision.get("stable_label") or "").strip()
+        if stable_label:
+            validated["stable_label"] = stable_label
+            target["stable_label"] = stable_label
+        if decision.get("force_click"):
+            validated["force_click"] = True
+        validated["target"] = target
     if action == "navigate":
         url = _safe_normalize(str(decision.get("url") or ""))
         if raw_action_name == "swap_branch" and seed_urls:
@@ -593,7 +608,13 @@ def _clear_overlays_before_map(
     Returns (snapshot, cleared_any). If blockers remain (e.g. need LLM), snapshot still
     has no full map — caller should skip map build until the page is clear.
     """
-    from web_surf.form_values import suggest_overlay_action, snapshot_needs_overlay_action
+    from web_surf.form_values import (
+        classify_overlay,
+        snapshot_needs_overlay_action,
+        strip_video_blockers,
+        suggest_overlay_action,
+        video_dismiss_failures,
+    )
 
     if not snapshot_needs_overlay_action(snapshot):
         return snapshot, False
@@ -611,11 +632,32 @@ def _clear_overlays_before_map(
     cleared_any = False
     blocked: list[str] = []
     recent = list(history or [])
+    pressed_escape = False
 
     for attempt in range(max_attempts):
         if not snapshot_needs_overlay_action(snapshot):
             events.log("Overlay cleared — ready for full-page map", level="info")
             return snapshot, cleared_any
+
+        # Embedded Keep Watching chrome that already failed: ignore and continue mapping.
+        if video_dismiss_failures(recent) >= 2:
+            only_video = all(
+                classify_overlay(raw) == "video"
+                for raw in (snapshot.get("blocking_overlays") or [])
+                if isinstance(raw, dict)
+            ) and not any(
+                classify_overlay(raw) in {"cookie", "age_gate"}
+                for raw in (snapshot.get("blocking_overlays") or [])
+                if isinstance(raw, dict)
+            )
+            if only_video or not suggest_overlay_action(
+                snapshot, form_values, field_mapping, recent_history=recent, blocked_attempts=blocked
+            ):
+                events.log(
+                    "Video/promo overlay dismiss failed repeatedly — continuing without it",
+                    level="info",
+                )
+                return strip_video_blockers(snapshot), cleared_any
 
         suggested = suggest_overlay_action(
             snapshot,
@@ -625,24 +667,74 @@ def _clear_overlays_before_map(
             blocked_attempts=blocked,
         )
         if not suggested:
+            # Escape often closes sticky video/promo layers when no button maps cleanly.
+            if not pressed_escape and any(
+                isinstance(raw, dict) and classify_overlay(raw) == "video"
+                for raw in (snapshot.get("blocking_overlays") or [])
+            ):
+                pressed_escape = True
+                events.log("Trying Escape to dismiss video/promo overlay", level="info")
+                try:
+                    page.keyboard.press("Escape")
+                    page.wait_for_timeout(350)
+                    cleared_any = True
+                except Exception as exc:
+                    events.log(f"Escape dismiss failed: {exc}", level="info")
+                snapshot = _snapshot(
+                    page,
+                    session_id=session_id,
+                    step_id=f"{step_id}_overlay_esc",
+                    context="overlay_clear",
+                    form_values=form_values,
+                    analyze=False,
+                    emit_progress=True,
+                    screenshot_mode="content",
+                    build_map=False,
+                )
+                if not snapshot_needs_overlay_action(snapshot):
+                    return snapshot, cleared_any
+                # Still only video? proceed — do not trap the run in overlay_mode.
+                if all(
+                    classify_overlay(raw) == "video"
+                    for raw in (snapshot.get("blocking_overlays") or [])
+                    if isinstance(raw, dict)
+                ):
+                    events.log(
+                        "Video overlay still present after Escape — continuing without dismiss",
+                        level="info",
+                    )
+                    return strip_video_blockers(snapshot), cleared_any
+                continue
             events.log(
                 "Overlay still present but no deterministic dismiss — deferring to model",
                 level="info",
             )
             break
 
-        validated, error = validate_overlay_action(suggested, snapshot, form_values)
+        # Prefer validate_action so video chrome in interactables (not overlay_map) still works.
+        validated, error = validate_action(
+            suggested,
+            snapshot,
+            set(),
+            None,
+            form_values,
+        )
         if validated is None:
-            validated, error = validate_action(
-                suggested,
-                snapshot,
-                set(),
-                None,
-                form_values,
-            )
+            validated, error = validate_overlay_action(suggested, snapshot, form_values)
         if validated is None:
             events.log(f"Pre-map overlay action rejected: {error}", level="info")
             break
+
+        # Carry stable_label / force_click from the deterministic suggestion.
+        if suggested.get("stable_label"):
+            validated["stable_label"] = suggested["stable_label"]
+            target = validated.get("target")
+            if isinstance(target, dict):
+                target = dict(target)
+                target["stable_label"] = suggested["stable_label"]
+                validated["target"] = target
+        if suggested.get("force_click"):
+            validated["force_click"] = True
 
         sig = action_signature(validated)
         if sig:
@@ -668,6 +760,17 @@ def _clear_overlays_before_map(
                     "reason": validated.get("reason"),
                 }
             )
+            # Don't burn more attempts on the same ticking Keep Watching control.
+            if "video" in str(validated.get("reason") or "").lower() or "keep watching" in str(
+                validated.get("reason") or ""
+            ).lower():
+                if video_dismiss_failures(recent) >= 1 and not pressed_escape:
+                    continue
+                events.log(
+                    "Giving up on video overlay dismiss before map — continuing",
+                    level="info",
+                )
+                return strip_video_blockers(snapshot), cleared_any
             break
 
         recent.append(
@@ -690,7 +793,255 @@ def _clear_overlays_before_map(
             build_map=False,
         )
 
+    # If only undismissable video remains, do not block the map/browse loop.
+    if snapshot_needs_overlay_action(snapshot):
+        remaining = [
+            raw
+            for raw in (snapshot.get("blocking_overlays") or [])
+            if isinstance(raw, dict)
+        ]
+        if remaining and all(classify_overlay(raw) == "video" for raw in remaining):
+            events.log(
+                "Only video/promo blockers remain — continuing without dismiss",
+                level="info",
+            )
+            return strip_video_blockers(snapshot), cleared_any
+
     return snapshot, cleared_any
+
+
+def _recover_stalled_action(
+    page: Any,
+    *,
+    before_snapshot: dict[str, Any],
+    post_snapshot: dict[str, Any],
+    action: dict[str, Any],
+    item: dict[str, Any],
+    session_id: str,
+    step_id: str,
+    form_values: dict[str, str],
+    field_mapping: dict[str, str],
+    history: list[dict[str, Any]],
+    delta: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], bool]:
+    """Rescan/compare after a dead click; clear blockers and optionally retry once.
+
+    Returns (post_snapshot, item, diagnosis, retried_ok).
+    """
+    diagnosis = diagnose_action_stall(
+        before_snapshot,
+        post_snapshot,
+        error=str(item.get("error") or ""),
+        action=action,
+        delta=delta,
+    )
+    stalled = (not item.get("ok")) or is_no_progress(before_snapshot, post_snapshot, delta)
+    if not stalled:
+        return post_snapshot, item, diagnosis, False
+
+    events.log(
+        f"Action stalled — rescan diagnosis: {diagnosis.get('reason')}",
+        level="info",
+    )
+    # Force a fresh overlay-aware rescan even when the light post snapshot looked empty.
+    rescanned = _snapshot(
+        page,
+        session_id=session_id,
+        step_id=f"{step_id}_stall_rescan",
+        context="stall_rescan",
+        form_values=form_values,
+        analyze=False,
+        emit_progress=True,
+        screenshot_mode="content",
+        build_map=False,
+    )
+    delta_rescan = diff_page_states(before_snapshot, rescanned)
+    diagnosis = diagnose_action_stall(
+        before_snapshot,
+        rescanned,
+        error=str(item.get("error") or ""),
+        action=action,
+        delta=delta_rescan,
+    )
+    post_snapshot = rescanned
+
+    from web_surf.form_values import snapshot_needs_overlay_action
+
+    should_clear = bool(
+        diagnosis.get("suspect_blocker")
+        or diagnosis.get("recommended") == "clear_blocker"
+        or snapshot_needs_overlay_action(post_snapshot)
+    )
+    retried_ok = False
+    if should_clear:
+        events.controller(
+            {
+                "session_id": session_id,
+                "status": "overlay_dismiss",
+                "current_url": str(page.url or ""),
+                "reason": (
+                    "Click/nav stalled — clearing likely popup/blocker from rescan diff…"
+                ),
+                "diagnosis": {
+                    "reason": diagnosis.get("reason"),
+                    "new_blockers": len(diagnosis.get("new_blockers") or []),
+                    "dismiss_controls": diagnosis.get("dismiss_controls") or [],
+                },
+            }
+        )
+        # If formal overlay rows are empty but the rescan found Close/Accept/etc.,
+        # seed a synthetic blocker so deterministic dismiss can still run.
+        if not snapshot_needs_overlay_action(post_snapshot) and diagnosis.get("dismiss_controls"):
+            seeded = dict(post_snapshot)
+            overlays = list(seeded.get("blocking_overlays") or [])
+            overlays.append(
+                {
+                    "id": "stall-inferred-popup",
+                    "tag": "div",
+                    "role": "dialog",
+                    "text": "Popup blocking interaction",
+                    "label": "blocking popup",
+                    "source": "stall_diagnosis",
+                }
+            )
+            seeded["blocking_overlays"] = overlays
+            post_snapshot = seeded
+
+        cleared_snapshot, cleared_any = _clear_overlays_before_map(
+            page,
+            post_snapshot,
+            session_id=session_id,
+            step_id=f"{step_id}_stall",
+            form_values=form_values,
+            field_mapping=field_mapping,
+            history=history,
+        )
+        post_snapshot = cleared_snapshot
+
+        # Last resort: click a dismiss-like control identified by the rescan diff,
+        # including video "Keep Watching" controls that intercept article clicks.
+        if not cleared_any:
+            dismiss_candidates = list(diagnosis.get("dismiss_controls") or [])
+            if diagnosis.get("click_error") or diagnosis.get("suspect_blocker"):
+                from web_surf.form_values import VIDEO_OVERLAY_RE, _primary_label
+
+                for raw in post_snapshot.get("interactables") or []:
+                    if not isinstance(raw, dict) or not raw.get("id"):
+                        continue
+                    label = _primary_label(raw)
+                    if VIDEO_OVERLAY_RE.search(label) or re.search(
+                        r"\b(close|dismiss|no thanks|skip)\b", label, re.I
+                    ):
+                        dismiss_candidates.append(
+                            {"id": raw.get("id"), "text": label, "kind": raw.get("kind")}
+                        )
+            seen_ids: set[str] = set()
+            for control in dismiss_candidates:
+                target_id = str(control.get("id") or "").strip()
+                if not target_id or target_id in seen_ids:
+                    continue
+                seen_ids.add(target_id)
+                try:
+                    events.log(
+                        f"Clicking rescan dismiss control {target_id} "
+                        f"({control.get('text') or ''})",
+                        level="info",
+                    )
+                    target = next(
+                        (
+                            item
+                            for item in (post_snapshot.get("interactables") or [])
+                            if isinstance(item, dict) and str(item.get("id") or "") == target_id
+                        ),
+                        {"id": target_id, "kind": control.get("kind") or "button"},
+                    )
+                    _execute(
+                        page,
+                        {
+                            "action": "click",
+                            "target_id": target_id,
+                            "target": target,
+                            "force_click": True,
+                        },
+                    )
+                    cleared_any = True
+                    post_snapshot = _snapshot(
+                        page,
+                        session_id=session_id,
+                        step_id=f"{step_id}_stall_dismiss",
+                        context="stall_dismiss",
+                        form_values=form_values,
+                        analyze=False,
+                        emit_progress=True,
+                        screenshot_mode="content",
+                        build_map=False,
+                    )
+                    break
+                except Exception as exc:
+                    events.log(f"Dismiss control {target_id} failed: {exc}", level="info")
+
+        if cleared_any and str(action.get("action") or "") in {"click", "navigate", "press"}:
+            try:
+                events.log("Retrying original action after clearing blocker", level="info")
+                retry_action = dict(action)
+                if retry_action.get("action") == "click":
+                    retry_action["force_click"] = True
+                _execute(page, retry_action)
+                post_snapshot = _snapshot(
+                    page,
+                    session_id=session_id,
+                    step_id=f"{step_id}_stall_retry",
+                    context="post_blocker_retry",
+                    form_values=form_values,
+                    analyze=False,
+                    emit_progress=True,
+                    screenshot_mode="content",
+                    build_map=False,
+                )
+                retry_delta = diff_page_states(before_snapshot, post_snapshot)
+                if not is_no_progress(before_snapshot, post_snapshot, retry_delta):
+                    item = {
+                        **item,
+                        "ok": True,
+                        "progress": True,
+                        "error": None,
+                        "blocker_recovery": diagnosis,
+                        "url": str(page.url or ""),
+                    }
+                    item.pop("error", None)
+                    retried_ok = True
+                else:
+                    item = {
+                        **item,
+                        "ok": False,
+                        "progress": False,
+                        "error": (
+                            str(item.get("error") or "no progress")
+                            + " | retried after clearing blocker, still no navigation"
+                        ),
+                        "blocker_recovery": diagnosis,
+                    }
+            except Exception as exc:
+                item = {
+                    **item,
+                    "ok": False,
+                    "progress": False,
+                    "error": f"{item.get('error') or 'action failed'} | retry after blocker: {exc}",
+                    "blocker_recovery": diagnosis,
+                }
+        else:
+            item = {
+                **item,
+                "blocker_recovery": diagnosis,
+                "error": (
+                    str(item.get("error") or "no progress")
+                    + f" | likely blocker: {diagnosis.get('reason')}"
+                ),
+            }
+    else:
+        item = {**item, "blocker_recovery": diagnosis}
+
+    return post_snapshot, item, diagnosis, retried_ok
 
 
 def _compact_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
@@ -755,6 +1106,8 @@ def _target_label(item: dict[str, Any]) -> str:
 
 
 def _locator_for(page: Any, item: dict[str, Any]) -> Any:
+    from web_surf.form_values import is_video_chrome_label, stable_video_dismiss_label
+
     root = _frame_root(page, item)
     test_id = str(item.get("test_id") or "")
     kind = str(item.get("kind") or "").lower()
@@ -766,6 +1119,9 @@ def _locator_for(page: Any, item: dict[str, Any]) -> Any:
     text = str(item.get("text") or aria or label or "")
     href = str(item.get("href") or "")
     css_path = str(item.get("css_path") or "").strip()
+    stable_label = str(item.get("stable_label") or "").strip()
+    if not stable_label and is_video_chrome_label(text):
+        stable_label = stable_video_dismiss_label(text)
     if test_id:
         return root.get_by_test_id(test_id).first
     if kind == "select" and name:
@@ -790,16 +1146,34 @@ def _locator_for(page: Any, item: dict[str, Any]) -> Any:
     if name and kind in {"select", "input", "textarea", "textbox", "spinbutton"}:
         tag = "input" if kind in {"textbox", "spinbutton"} else kind
         return root.locator(f"{tag}[name={json.dumps(name)}]").first
+    # Prefer href for links — exact role/name matches break on truncated headlines
+    # and are more likely to hit overlay-covered duplicates.
+    if href and (kind == "link" or role == "link"):
+        return root.locator(f"a[href={json.dumps(href)}]").first
     if href and (not text or len(text) > 100):
         return root.locator(f"a[href={json.dumps(href)}]").first
+    # Video chrome timestamps tick every second — never exact-match the full string.
+    if stable_label:
+        if role in {"link", "button", "menuitem"}:
+            return root.get_by_role(role, name=stable_label, exact=False).first
+        return root.get_by_text(stable_label, exact=False).first
     if role in {"link", "button", "menuitem", "textbox", "checkbox", "radio", "combobox", "spinbutton", "searchbox"} and text:
         if len(text) > 80:
             return root.get_by_role(role, name=text[:80], exact=False).first
-        return root.get_by_role(role, name=text, exact=True).first
+        return root.get_by_role(role, name=text, exact=False).first
     if href:
         return root.locator(f"a[href={json.dumps(href)}]").first
+    if css_path and kind in {"div", ""} and text:
+        # Prefer css for unlabeled/div chrome before brittle exact text.
+        loc = root.locator(css_path)
+        try:
+            if loc.count() >= 1:
+                return loc.first
+        except Exception:
+            pass
     if text and len(text) <= 80:
-        return root.get_by_text(text, exact=True).first
+        # Substring match — exact=True breaks on live video timestamps.
+        return root.get_by_text(text, exact=False).first
     placeholder = str(item.get("placeholder") or "")
     if placeholder:
         return root.get_by_placeholder(placeholder, exact=True).first
@@ -1013,12 +1387,31 @@ def _execute(page: Any, action: dict[str, Any]) -> None:
         page.goto(action["url"], wait_until="domcontentloaded", timeout=45000)
     elif kind == "click":
         target = action.get("target") if isinstance(action.get("target"), dict) else {}
-        loc = _locator_for(page, action["target"])
+        if isinstance(target, dict) and action.get("stable_label"):
+            target = {**target, "stable_label": action["stable_label"]}
+        loc = _locator_for(page, target if target else action["target"])
         try:
             loc.scroll_into_view_if_needed(timeout=3000)
         except Exception:
             pass
-        loc.click(timeout=5000)
+        force = bool(action.get("force_click"))
+        try:
+            loc.click(timeout=5000, force=force)
+        except Exception:
+            # Overlay may cover the control — retry once with force, then href fallback.
+            if not force:
+                try:
+                    loc.click(timeout=4000, force=True)
+                except Exception:
+                    href = str(target.get("href") or "") if isinstance(target, dict) else ""
+                    if href:
+                        page.locator(f"a[href={json.dumps(href)}]").first.click(
+                            timeout=4000, force=True
+                        )
+                    else:
+                        raise
+            else:
+                raise
         if is_collapse_toggle(target):
             wait_for_section_expand(page, target, timeout_ms=5000)
     elif kind == "fill":
@@ -1189,7 +1582,7 @@ def _enhance_snapshot_with_viewport_paging(
     """Build a full-page map with one screenshot (no multi-slice stitch)."""
     url_key = str(snapshot.get("url") or "")
 
-    # Already captured this URL as a full-page map — reuse.
+    # Already captured this URL as a full-page map — reuse (session, then disk).
     if scroll_stitch_cache is not None:
         cached = (scroll_stitch_cache.get(url_key) or {}).get("merged")
         if isinstance(cached, dict):
@@ -1204,6 +1597,45 @@ def _enhance_snapshot_with_viewport_paging(
                 views_explored[url_key] = max(views_explored.get(url_key, 0), 1)
                 _publish_web_capture(result, session_dir=session_dir)
                 return result, []
+
+    # Cross-run URL map cache — only reuse a real full-page/document map.
+    try:
+        from web_capture.context import get_active_project
+        from web_capture.full_page import is_full_page_capture
+        from web_capture.url_cache import capture_is_reusable, load_capture_for_url
+
+        disk_cached = load_capture_for_url(get_active_project(), url_key)
+    except Exception:
+        disk_cached = None
+        is_full_page_capture = lambda _c: False  # type: ignore[assignment,misc]
+        capture_is_reusable = lambda _c, **_k: False  # type: ignore[assignment,misc]
+    if isinstance(disk_cached, dict) and (
+        is_full_page_capture(disk_cached) or capture_is_reusable(disk_cached)
+    ):
+        result = dict(snapshot)
+        capture = dict(disk_cached)
+        capture["map_reuse"] = {"source": "url_cache", "url": url_key}
+        understanding = capture.get("page_understanding")
+        feed = understanding.get("feed_items") if isinstance(understanding, dict) else None
+        if not isinstance(understanding, dict) or not isinstance(feed, list) or not feed:
+            try:
+                from web_capture.analyzer import understand_page_capture
+                from web_capture.url_cache import save_capture_for_url
+
+                understand_page_capture(capture, result)
+                save_capture_for_url(get_active_project(), capture)
+            except Exception:
+                pass
+        result["web_capture"] = capture
+        if isinstance(capture.get("page_understanding"), dict):
+            result["page_understanding"] = capture["page_understanding"]
+        views_explored[url_key] = max(views_explored.get(url_key, 0), 1)
+        if scroll_stitch_cache is not None:
+            entry = scroll_stitch_cache.setdefault(url_key, {"by_scroll": {}, "merged": None})
+            entry["merged"] = capture
+        events.log(f"Reusing stored full-page map for {url_key}", level="info")
+        _publish_web_capture(result, session_dir=session_dir)
+        return result, []
 
     vp = snapshot_viewport(snapshot)
     events.log(
@@ -1510,6 +1942,7 @@ def explore_candidates_in_browser(
     )
 
     session_id = f"web_{uuid.uuid4().hex}"
+    reset_session_visit_graph()
     # Strip the collaboration wrapper so decisions and scoring see the user's task.
     goal = focus_query(query)
     plan_steps = normalize_accomplishment_steps(accomplishment_steps, query=goal)
@@ -1545,8 +1978,8 @@ def explore_candidates_in_browser(
         url = _safe_normalize(str(getattr(row, "url", "")))
         if url and url not in raw_candidate_urls:
             raw_candidate_urls.append(url)
-    # Named site + latest/news: start on the listing hub and discover the article
-    # on-page. Do not land on a specific search-result article first.
+    # Named site: start on the site origin (homepage), then navigate inward.
+    # Listing hubs may follow as fallbacks; never open a deep search article first.
     discovery_hubs = [
         _safe_normalize(url)
         for url in preferred_discovery_seeds(goal, raw_candidate_urls)
@@ -1560,16 +1993,16 @@ def explore_candidates_in_browser(
         key=lambda url: seed_url_priority(url, goal, preferred_domains=preferred_domain_set),
         reverse=True,
     )
-    # Keep exploration focused: hubs first, then a few search hits as fallbacks.
+    # Keep exploration focused: origin/hubs first, then a few search hits as fallbacks.
     seed_urls = seed_urls[: max(max_visits, len(discovery_hubs) + 1)]
     origins = list(dict.fromkeys(origin_url(url) for url in seed_urls))
     allowed_origins = set(origins)
-    # Listing hubs + search results are trusted starting points.
+    # Origins, listing hubs, and search results are trusted starting points.
     discovered_routes = set(origins) | set(seed_urls)
     start_urls = seed_urls or origins
     if discovery_hubs:
         events.log(
-            f"Preferred-site discovery: start on listing hub(s) {', '.join(discovery_hubs[:3])}",
+            f"Preferred-site discovery: start at {', '.join(discovery_hubs[:3])}",
             level="info",
         )
     max_steps = max(max_steps, len(start_urls) * max(1, max_steps_per_branch))
@@ -2046,7 +2479,31 @@ def explore_candidates_in_browser(
                     blocked_attempts = sorted(state_attempts.get(current_fp, set()))
                     if blocked_attempts:
                         model_context["blocked_attempts"] = blocked_attempts
+                    from web_surf.form_values import (
+                        classify_overlay as _classify_overlay,
+                        overlay_target_ids as _overlay_target_ids,
+                        strip_video_blockers as _strip_video_blockers,
+                        video_dismiss_failures as _video_dismiss_failures,
+                    )
+
                     overlay_mode = snapshot_needs_overlay_action(snapshot)
+                    # Don't trap the run in overlay-dismiss LLM mode when there is
+                    # nothing dismissable (empty overlay_map) or only failed video chrome.
+                    if overlay_mode:
+                        allowed_overlay_ids = _overlay_target_ids(snapshot)
+                        only_video = bool(snapshot.get("blocking_overlays")) and all(
+                            isinstance(raw, dict) and _classify_overlay(raw) == "video"
+                            for raw in (snapshot.get("blocking_overlays") or [])
+                        )
+                        if not allowed_overlay_ids and (
+                            only_video or _video_dismiss_failures(history) >= 1
+                        ):
+                            events.log(
+                                "Skipping overlay-dismiss mode — no usable overlay controls",
+                                level="info",
+                            )
+                            snapshot = _strip_video_blockers(snapshot)
+                            overlay_mode = snapshot_needs_overlay_action(snapshot)
                     events.controller(
                         {
                             "session_id": session_id,
@@ -2167,6 +2624,46 @@ def explore_candidates_in_browser(
                             snapshot,
                             session_form_values,
                         )
+                        # Empty overlay_map / bad model output must not burn steps in a loop.
+                        if action is None and (
+                            "no overlay controls" in validation_error
+                            or "not in the current snapshot" in validation_error
+                            or "must be copied from overlay_map" in validation_error
+                        ):
+                            events.log(
+                                f"Overlay dismiss unavailable ({validation_error}) — browsing normally",
+                                level="info",
+                            )
+                            snapshot = _strip_video_blockers(snapshot)
+                            overlay_mode = False
+                            action, validation_error = validate_action(
+                                raw_decision,
+                                snapshot,
+                                discovered_routes,
+                                allowed_origins,
+                                session_form_values,
+                                seed_urls=seed_urls,
+                            )
+                            # If the model returned an empty/invalid overlay decision, ask browse.
+                            if action is None:
+                                try:
+                                    raw_decision = decide(model_context)
+                                    coerced = normalize_decision(raw_decision)
+                                    if coerced is not None:
+                                        raw_decision = coerced
+                                except Exception as exc:
+                                    raw_decision = {
+                                        "action": "help",
+                                        "question": f"Decision model unavailable: {exc}",
+                                    }
+                                action, validation_error = validate_action(
+                                    raw_decision,
+                                    snapshot,
+                                    discovered_routes,
+                                    allowed_origins,
+                                    session_form_values,
+                                    seed_urls=seed_urls,
+                                )
                     else:
                         action, validation_error = validate_action(
                             raw_decision,
@@ -2927,6 +3424,35 @@ def explore_candidates_in_browser(
                             state_attempts = {}
 
                     delta = diff_page_states(snapshot, post_snapshot)
+                    stall_diagnosis: dict[str, Any] = {}
+                    nav_like = str(action.get("action") or "") in {
+                        "click",
+                        "navigate",
+                        "press",
+                        "submit",
+                    }
+                    if nav_like and (
+                        (not item.get("ok")) or is_no_progress(snapshot, post_snapshot, delta)
+                    ):
+                        post_snapshot, item, stall_diagnosis, _retried = _recover_stalled_action(
+                            page,
+                            before_snapshot=snapshot,
+                            post_snapshot=post_snapshot,
+                            action=action,
+                            item=item,
+                            session_id=session_id,
+                            step_id=step_id,
+                            form_values=session_form_values,
+                            field_mapping=field_mapping,
+                            history=history,
+                            delta=delta,
+                        )
+                        delta = diff_page_states(snapshot, post_snapshot)
+                        if _retried:
+                            events.log(
+                                "Stalled action recovered after blocker clear + retry",
+                                level="info",
+                            )
                     transition = {
                         "session_id": session_id,
                         "step_id": step_id,
@@ -2934,29 +3460,44 @@ def explore_candidates_in_browser(
                         "before_snapshot_id": snapshot["snapshot_id"],
                         "after_snapshot_id": post_snapshot["snapshot_id"],
                         "delta": delta,
+                        "stall_diagnosis": stall_diagnosis or None,
                     }
                     transitions.append(transition)
                     item["transition"] = delta
+                    if stall_diagnosis:
+                        item["stall_diagnosis"] = stall_diagnosis
                     events.transition(transition)
                     state_attempts.setdefault(current_fp, set()).add(attempt_signature)
-                    if is_no_progress(snapshot, post_snapshot, delta):
+                    if is_no_progress(snapshot, post_snapshot, delta) and not item.get("ok"):
                         item["ok"] = False
                         item["progress"] = False
-                        item["error"] = (
-                            "no progress — page state unchanged; "
-                            "try a different control or route"
-                        )
+                        if not item.get("error"):
+                            item["error"] = (
+                                "no progress — page state unchanged; "
+                                "try a different control or route"
+                            )
                     elif not item.get("ok"):
                         item["progress"] = False
-                    if delta["new_blockers"] or (
-                        not item["ok"] and "intercept" in str(item.get("error") or "").lower()
+                    if (
+                        delta["new_blockers"]
+                        or stall_diagnosis.get("suspect_blocker")
+                        or (
+                            not item["ok"]
+                            and "intercept" in str(item.get("error") or "").lower()
+                        )
                     ):
-                        blocker = delta["new_blockers"] or delta["blocking_overlays"]
+                        blocker = (
+                            delta["new_blockers"]
+                            or stall_diagnosis.get("blocking_overlays")
+                            or delta["blocking_overlays"]
+                        )
                         from web_surf.form_values import AGE_GATE_AGENT_NOTE, looks_like_age_gate
 
                         instruction = (
-                            "Resolve this blocker using available_value_keys and field_mapping. "
-                            "Use provide_values if new semantic keys are needed."
+                            "A page rescan after the failed action suggests a blocking popup. "
+                            "Dismiss/complete the overlay first (Accept/Close/age fields), then "
+                            "retry the original navigation. "
+                            f"Diagnosis: {stall_diagnosis.get('reason') or 'blocker suspected'}."
                         )
                         if looks_like_age_gate(post_snapshot):
                             instruction = f"{instruction} {AGE_GATE_AGENT_NOTE}"
@@ -2966,6 +3507,7 @@ def explore_candidates_in_browser(
                                 "kind": "blocking_overlay",
                                 "error": item.get("error", ""),
                                 "blockers": blocker,
+                                "diagnosis": stall_diagnosis,
                                 "instruction": instruction,
                             }
                         )
@@ -3137,16 +3679,27 @@ def explore_candidates_in_browser(
                             )
                             save_session_state(project_path, session_id, session_state)
                             continue
+                        stall = item.get("stall_diagnosis") if isinstance(item.get("stall_diagnosis"), dict) else {}
+                        if stall.get("suspect_blocker"):
+                            instruction = (
+                                "The last click/nav did nothing because a popup/blocker is likely covering "
+                                "the page (confirmed by comparing pre/post scans). Clear the overlay "
+                                f"first ({stall.get('reason')}), then retry — do not keep clicking the "
+                                "same covered control."
+                            )
+                        else:
+                            instruction = (
+                                "The last action left the page in the same state after a fresh rescan. "
+                                "Use action=filter or action=extract on the current page text, "
+                                "or scroll to reveal more content — do not repeat the same click."
+                            )
                         helper_guidance.append(
                             {
                                 "step_id": step_id,
                                 "kind": "no_progress",
                                 "error": item.get("error", ""),
-                                "instruction": (
-                                    "The last action left the page in the same state. "
-                                    "Use action=filter or action=extract on the current page text, "
-                                    "or scroll to reveal more content — do not repeat the same click."
-                                ),
+                                "diagnosis": stall or None,
+                                "instruction": instruction,
                             }
                         )
                         if sum(

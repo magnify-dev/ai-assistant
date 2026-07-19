@@ -304,7 +304,11 @@ class PageMatchTests(unittest.TestCase):
             goal_is_satisfied(
                 detailed,
                 query,
-                source_url="https://www.wowhead.com/mists-of-pandaria/news",
+                # Article page (not the news index) — preferred domain still beats Blizzard.
+                source_url=(
+                    "https://www.wowhead.com/mop-classic/news/"
+                    "mists-of-pandaria-classic-escalation-now-live-382100"
+                ),
                 publisher_domains={"blizzard.com"},
                 publisher_routes={
                     "https://news.blizzard.com/en-us/article/24267939/mists-of-pandaria-classic-escalation-now-live"
@@ -352,6 +356,65 @@ class PageMatchTests(unittest.TestCase):
             )
         )
         self.assertTrue(should_defer_collect_on_listing(snapshot, query))
+
+    def test_defer_collect_on_homepage_and_listing_for_latest_news(self) -> None:
+        from web_surf.page_match import goal_is_satisfied, should_defer_collect_on_listing
+
+        query = "go to wowhead and find wow mists of pandaria and copy the latest news on the page"
+        home = {
+            "url": "https://www.wowhead.com/",
+            "visible_text": (
+                "Mists of Pandaria Classic news Hotfixes Posted 1 day ago "
+                "Siege of Orgrimmar Trinkets Fixed in Challenge Mode Dungeons "
+            )
+            * 20,
+            "interactables": [
+                {
+                    "id": "el_mop",
+                    "kind": "link",
+                    "text": "Mists of Pandaria Classic",
+                    "href": "https://www.wowhead.com/mop-classic/news",
+                }
+            ],
+        }
+        listing = {
+            "url": "https://www.wowhead.com/mop-classic/news",
+            "visible_text": home["visible_text"],
+            "page_understanding": {
+                "feed_items": [
+                    {
+                        "title": "Siege of Orgrimmar Trinkets Fixed in Challenge Mode Dungeons",
+                        "date": "1 day ago",
+                    }
+                ]
+            },
+            "interactables": [
+                {
+                    "id": "el_article",
+                    "kind": "link",
+                    "text": "Siege of Orgrimmar Trinkets Fixed",
+                    "href": "https://www.wowhead.com/mop-classic/news/trinkets-fixed-382200",
+                }
+            ],
+        }
+        self.assertTrue(should_defer_collect_on_listing(home, query))
+        self.assertTrue(should_defer_collect_on_listing(listing, query))
+        self.assertFalse(
+            goal_is_satisfied(
+                home["visible_text"],
+                query,
+                source_url=home["url"],
+                preferred_domains={"wowhead.com"},
+            )
+        )
+        self.assertFalse(
+            goal_is_satisfied(
+                listing["visible_text"],
+                query,
+                source_url=listing["url"],
+                preferred_domains={"wowhead.com"},
+            )
+        )
 
     def test_viewport_helpers_detect_unexplored_long_page(self) -> None:
         from web_surf.page_match import (
@@ -478,6 +541,49 @@ class PageMatchTests(unittest.TestCase):
         assert action is not None
         self.assertEqual(action["target_id"], "el-hotfix")
         self.assertTrue(action.get("from_page_map"))
+
+    def test_homepage_opens_section_hub_not_unrelated_feed_item(self) -> None:
+        from web_surf.page_match import suggest_content_link_action
+
+        query = "go to wowhead and find wow mists of pandaria and copy the latest news"
+        snapshot = {
+            "url": "https://www.wowhead.com/",
+            "page_understanding": {
+                "feed_items": [
+                    {
+                        "title": "Quel'thalas and Northern Lordaemon in Classic+",
+                        "date": "46 minutes ago",
+                        "href": "/classic/news/quelthalas",
+                    },
+                    {
+                        "title": "Siege of Orgrimmar Trinkets Fixed",
+                        "date": "1 day ago",
+                        "href": "/mop-classic/news/trinkets",
+                    },
+                ],
+            },
+            "interactables": [
+                {
+                    "id": "el-quel",
+                    "kind": "link",
+                    "text": "Quel'thalas and Northern Lordaemon in Classic+",
+                    "href": "https://www.wowhead.com/classic/news/quelthalas",
+                    "disabled": False,
+                },
+                {
+                    "id": "el-mop-news",
+                    "kind": "link",
+                    "text": "Mists of Pandaria Classic News",
+                    "href": "https://www.wowhead.com/mop-classic/news",
+                    "disabled": False,
+                },
+            ],
+        }
+        action = suggest_content_link_action(snapshot, query)
+        self.assertIsNotNone(action)
+        assert action is not None
+        self.assertEqual(action["target_id"], "el-mop-news")
+        self.assertTrue(action.get("section_hub"))
 
     def test_filter_text_by_recency_keeps_newest_section(self) -> None:
         from web_surf.page_match import filter_text_by_recency

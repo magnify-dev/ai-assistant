@@ -37,6 +37,29 @@ function loadCapturesByUrlFromRaw(rawDir, latestPath) {
   return byUrl;
 }
 
+test("by-url store is the canonical cross-run map catalog", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "web-capture-by-url-store-"));
+  const byUrlDir = path.join(root, ".agent", "web-capture", "by-url");
+  fs.mkdirSync(byUrlDir, { recursive: true });
+  const home = {
+    capture_id: "cap_home",
+    created_at: "2026-07-19T10:00:00Z",
+    url: "https://www.wowhead.com/",
+    elements: [{ id: "a", kind: "link", text: "News", rect: { x: 0, y: 0, width: 10, height: 10 } }],
+    screenshot: "screenshots/home.jpg",
+    scroll_map: { stitched: true, mode: "full_page", coords: "document", canvas_height: 2000, slices: [] },
+  };
+  fs.writeFileSync(path.join(byUrlDir, "www-wowhead-com.json"), JSON.stringify(home));
+
+  const entries = fs.readdirSync(byUrlDir).filter((name) => name.endsWith(".json"));
+  assert.equal(entries.length, 1);
+  const loaded = JSON.parse(fs.readFileSync(path.join(byUrlDir, entries[0]), "utf8"));
+  assert.equal(normalizeCaptureUrlKey(loaded.url), "https://www.wowhead.com/");
+  assert.equal(loaded.capture_id, "cap_home");
+
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
 test("inspecting a run keeps every page map from raw/, not only latest.json", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "web-capture-by-url-"));
   const captureDir = path.join(root, "web-capture");

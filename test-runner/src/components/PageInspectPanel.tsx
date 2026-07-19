@@ -4,7 +4,11 @@ import { cn } from "@/lib/utils";
 import type { BrowserState, PlaywrightSession } from "@/lib/projectTypes";
 import type { WebCapture, WebCaptureBuildStatus } from "@/lib/webCaptureTypes";
 import { isScreenshotAheadOfMap, WEB_CAPTURE_BUILDING_PHASES } from "@/lib/webCaptureTypes";
-import { captureCanvasHeight } from "@/lib/webCaptureView";
+import {
+  captureCanvasHeight,
+  captureMapScreenshotSrc,
+  isCaptureMapReady,
+} from "@/lib/webCaptureView";
 import { captureUrlLabel, normalizeCaptureUrl } from "@/lib/webCaptureUrl";
 import { MapOverlayView } from "@/components/MapOverlayView";
 
@@ -133,18 +137,26 @@ export function PageInspectPanel({
   const frames = session?.frames ?? [];
   const activeFrame = frames[frameIndex] ?? frames[frames.length - 1];
 
+  const mapReady = isCaptureMapReady(displayCapture);
   const screenshotSrc = useMemo(() => {
-    // Prefer the saved full-page / document map image whenever we have one.
-    const fromCapture = displayCapture?.screenshotUrl;
-    if (fromCapture) {
-      return fromCapture.startsWith("http") || fromCapture.startsWith("data:")
-        ? fromCapture
-        : apiUrl(fromCapture);
-    }
-    // Live viewport shot only when there is no document map yet.
-    if (followingLive && state?.screenshot_b64 && !displayCapture?.scroll_map?.stitched) {
-      return `data:image/jpeg;base64,${state.screenshot_b64}`;
-    }
+    // Only use the scrollable full-page / stitch image for the map canvas.
+    const fromMap = captureMapScreenshotSrc(displayCapture, (rel) => {
+      if (rel.startsWith("http") || rel.startsWith("data:") || rel.startsWith("/")) {
+        return rel.startsWith("/") ? apiUrl(rel) : rel;
+      }
+      if (projectPath) {
+        return `/api/project/web-capture/screenshot?path=${encodeURIComponent(projectPath)}&file=${encodeURIComponent(rel)}`;
+      }
+      return apiUrl(rel);
+    });
+    if (fromMap) return fromMap;
+    // No ready map yet — do not feed a live viewport JPEG into the tall overlay
+    // (that squeezes the whole-page shot). Show a plain preview instead.
+    return undefined;
+  }, [displayCapture, projectPath]);
+
+  const livePreviewSrc = useMemo(() => {
+    if (mapReady) return undefined;
     if (followingLive && state?.screenshot_b64) {
       return `data:image/jpeg;base64,${state.screenshot_b64}`;
     }
@@ -155,7 +167,7 @@ export function PageInspectPanel({
         : apiUrl(screenshotUrl);
     }
     return undefined;
-  }, [followingLive, state?.screenshot_b64, displayCapture, activeFrame?.screenshotUrl]);
+  }, [mapReady, followingLive, state?.screenshot_b64, activeFrame?.screenshotUrl]);
 
   const showingPreviousMap =
     followingLive &&
@@ -172,13 +184,20 @@ export function PageInspectPanel({
     building && normalizeCaptureUrl(captureBuild?.url || liveUrl) === viewingUrl;
   const updatingMapOnScreenshot =
     followingLive &&
-    Boolean(screenshotSrc && state?.screenshot_b64) &&
+    Boolean(livePreviewSrc && state?.screenshot_b64) &&
     (buildingThisUrl || isScreenshotAheadOfMap(state?.ts, captureBuild));
   const updatingMapMessage = showingPreviousMap
     ? "Keeping previous page map while this URL builds…"
-    : (captureBuild?.message ?? "Updating map…");
+    : !mapReady && (buildingThisUrl || building)
+      ? (captureBuild?.message ?? "Building scrollable page map…")
+      : (captureBuild?.message ?? "Updating map…");
 
-  const showEmpty = !displayCapture && !screenshotSrc && !building && !captureBuild && urlKeys.length === 0;
+  const showEmpty =
+    !displayCapture &&
+    !livePreviewSrc &&
+    !building &&
+    !captureBuild &&
+    urlKeys.length === 0;
 
   const elements = displayCapture?.elements ?? [];
 
@@ -271,7 +290,7 @@ export function PageInspectPanel({
         <div className="flex min-h-[200px] flex-col items-center justify-center rounded-lg border border-dashed border-white/15 bg-black/20 p-8 text-center">
           <p className="text-sm text-white/50">Run a task with browser activity to inspect the page map.</p>
         </div>
-      ) : displayCapture ? (
+      ) : mapReady && displayCapture ? (
         <MapOverlayView
           capture={displayCapture}
           elements={elements}
@@ -286,15 +305,35 @@ export function PageInspectPanel({
               : updatingMapMessage
           }
         />
-      ) : buildingThisUrl || building ? (
-        <div className="flex min-h-[240px] flex-col items-center justify-center rounded-lg border border-dashed border-sky-400/25 bg-sky-500/5 p-8 text-center">
-          <span className="mb-3 inline-flex h-5 w-5 animate-spin rounded-full border-2 border-sky-200/30 border-t-sky-100" />
-          <p className="text-sm text-sky-100/90">Building first map for this URL…</p>
-          <p className="mt-1 max-w-md truncate font-mono text-[10px] text-white/40">{url}</p>
+      ) : buildingThisUrl || building || (displayCapture && !mapReady) ? (
+        <div className="space-y-2">
+          <div className="flex min-h-[160px] flex-col items-center justify-center rounded-lg border border-dashed border-sky-400/25 bg-sky-500/5 p-6 text-center">
+            <span className="mb-3 inline-flex h-5 w-5 animate-spin rounded-full border-2 border-sky-200/30 border-t-sky-100" />
+            <p className="text-sm text-sky-100/90">
+              Waiting for scrollable full-page map…
+            </p>
+            <p className="mt-1 max-w-md truncate font-mono text-[10px] text-white/40">{url}</p>
+          </div>
+          {livePreviewSrc ? (
+            <div className="overflow-auto rounded-lg border border-white/10 bg-black/30">
+              <img
+                src={livePreviewSrc}
+                alt="Live viewport preview (map not ready)"
+                className="mx-auto block h-auto max-h-[360px] w-auto max-w-full object-contain"
+              />
+              <p className="px-2 py-1 text-[10px] text-white/40">
+                Viewport preview only — overlay draws after the full-page capture is ready.
+              </p>
+            </div>
+          ) : null}
         </div>
-      ) : screenshotSrc ? (
+      ) : livePreviewSrc ? (
         <div className="overflow-auto rounded-lg border border-white/10 bg-black/30">
-          <img src={screenshotSrc} alt="Page screenshot" className="mx-auto block max-w-full" />
+          <img
+            src={livePreviewSrc}
+            alt="Page screenshot"
+            className="mx-auto block h-auto max-w-full object-contain"
+          />
         </div>
       ) : null}
     </div>

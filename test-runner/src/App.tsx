@@ -32,6 +32,7 @@ import {
 import type { PhaseMap, RunEvent } from "@/types";
 import type { WebCapture, WebCaptureBuildStatus, WebCaptureElement, WebCaptureReview } from "@/lib/webCaptureTypes";
 import { WEB_CAPTURE_BUILDING_PHASES } from "@/lib/webCaptureTypes";
+import { isCaptureMapReady } from "@/lib/webCaptureView";
 import { normalizeCaptureUrl } from "@/lib/webCaptureUrl";
 import { buildUiDisplaySnapshot, isUiDebugEnabled, traceUiDisplay } from "@/lib/uiRunDebug";
 import { UiRunDebugPanel } from "@/components/UiRunDebugPanel";
@@ -312,8 +313,15 @@ function applyStateFromServer(
   }
   if (data.capturesByUrl && typeof data.capturesByUrl === "object" && setters.setCapturesByUrl) {
     // Merge so a sparse server snapshot cannot wipe earlier page maps from the UI.
-    const incoming = data.capturesByUrl as Record<string, WebCapture>;
-    setters.setCapturesByUrl((prev) => ({ ...prev, ...incoming }));
+    // Only keep scrollable full-page maps — skip half-built viewport captures.
+    const incoming = Object.fromEntries(
+      Object.entries(data.capturesByUrl as Record<string, WebCapture>).filter(([, cap]) =>
+        isCaptureMapReady(cap),
+      ),
+    );
+    if (Object.keys(incoming).length) {
+      setters.setCapturesByUrl((prev) => ({ ...prev, ...incoming }));
+    }
   }
 }
 
@@ -462,9 +470,9 @@ export default function App() {
     if (!webCapture?.url) return;
     const key = normalizeCaptureUrl(webCapture.url);
     if (!key) return;
-    const useful =
-      (webCapture.elements?.length ?? 0) > 0 || Boolean(webCapture.scroll_map?.stitched);
-    if (!useful) return;
+    // Only publish maps that have a scrollable full-page/stitch image — never a
+    // half-built viewport shot that would squeeze into the overlay.
+    if (!isCaptureMapReady(webCapture)) return;
     const phase = captureBuild?.phase;
     const buildingThisUrl =
       Boolean(phase && WEB_CAPTURE_BUILDING_PHASES.has(phase)) &&
@@ -735,13 +743,22 @@ export default function App() {
           }
         }
         if (data.capturesByUrl && typeof data.capturesByUrl === "object") {
-          setCapturesByUrl((prev) => ({ ...prev, ...data.capturesByUrl }));
+          const ready = Object.fromEntries(
+            Object.entries(data.capturesByUrl as Record<string, WebCapture>).filter(([, cap]) =>
+              isCaptureMapReady(cap),
+            ),
+          );
+          if (Object.keys(ready).length) {
+            setCapturesByUrl((prev) => ({ ...prev, ...ready }));
+          }
         }
         if (data.webCapture) {
           setWebCapture(data.webCapture);
           setLatestWebCaptureReview(data.webCaptureReviews?.at(-1) ?? null);
           const key = normalizeCaptureUrl(data.webCapture.url);
-          if (key) setCapturesByUrl((prev) => ({ ...prev, [key]: data.webCapture as WebCapture }));
+          if (key && isCaptureMapReady(data.webCapture)) {
+            setCapturesByUrl((prev) => ({ ...prev, [key]: data.webCapture as WebCapture }));
+          }
         } else if (!data.capturesByUrl || Object.keys(data.capturesByUrl).length === 0) {
           setWebCapture(null);
           setLatestWebCaptureReview(null);
@@ -1352,10 +1369,13 @@ export default function App() {
         setPlaywrightSession(data.playwrightSession ?? null);
         setWebCapture(data.webCapture ?? null);
         setLatestWebCaptureReview(data.webCaptureReviews?.at(-1) ?? null);
-        const restoredMaps: Record<string, WebCapture> = {
-          ...(data.capturesByUrl && typeof data.capturesByUrl === "object" ? data.capturesByUrl : {}),
-        };
-        if (data.webCapture?.url) {
+        const restoredMaps: Record<string, WebCapture> = {};
+        if (data.capturesByUrl && typeof data.capturesByUrl === "object") {
+          for (const [key, cap] of Object.entries(data.capturesByUrl as Record<string, WebCapture>)) {
+            if (isCaptureMapReady(cap)) restoredMaps[key] = cap;
+          }
+        }
+        if (data.webCapture?.url && isCaptureMapReady(data.webCapture)) {
           const key = normalizeCaptureUrl(data.webCapture.url);
           if (key) restoredMaps[key] = data.webCapture;
         }

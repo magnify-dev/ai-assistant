@@ -217,6 +217,19 @@ def is_publisher_content_url(url: str) -> bool:
     )
 
 
+def site_origin_url(url: str) -> str | None:
+    """Return scheme://host/ for a URL, or None if it is not absolute."""
+    parsed = urlsplit(str(url or "").strip())
+    if not parsed.scheme or not parsed.netloc:
+        return None
+    return urlunsplit((parsed.scheme, parsed.netloc, "/", "", ""))
+
+
+def is_site_origin_url(url: str) -> bool:
+    path = (urlsplit(str(url or "")).path or "/").rstrip("/") or "/"
+    return path == "/"
+
+
 def seed_url_priority(
     url: str,
     query: str,
@@ -236,13 +249,19 @@ def seed_url_priority(
         score += 60
     if "patch" in parsed.path and "note" in parsed.path:
         score += 30
-    # Named site + "latest news": start on the listing hub and discover the article
-    # in-browser. Search often returns a specific old/random article — demote those.
-    if on_preferred and _wants_browse_discovery(query):
-        if is_content_listing_url(url):
-            score += 500
+    # Named site: prefer the homepage, then listing hubs; never land on a deep
+    # search-result article first — navigate inward from the site root instead.
+    if on_preferred:
+        if is_site_origin_url(url):
+            score += 800
+        elif is_content_listing_url(url):
+            score += 500 if _wants_browse_discovery(query) else 200
         elif is_deep_article_url(url):
             score -= 450
+        else:
+            # Nested section pages (/mop-classic, /guide/…) — middling fallback.
+            depth = max(0, (parsed.path or "/").count("/") - 1)
+            score -= min(240, depth * 40)
     return (score, score)
 
 
@@ -275,13 +294,27 @@ def listing_hub_url(url: str) -> str | None:
 
 def preferred_discovery_seeds(query: str, candidate_urls: list[str]) -> list[str]:
     """
-    When the user names a site and wants recent news, seed the listing hub(s)
-    derived from search hits — not the specific article pages search returned.
+    When the user names a site, seed that site's origin first so the browser
+    lands on the normal homepage and navigates inward. For latest/news tasks,
+    also include listing hubs derived from search hits (never deep articles).
     """
     preferred = parse_user_preferred_domains(query)
-    if not preferred or not _wants_browse_discovery(query):
+    if not preferred:
         return []
     seeds: list[str] = []
+    for raw in candidate_urls:
+        url = str(raw or "").strip()
+        if not url or not url_on_preferred_source(url, preferred):
+            continue
+        origin = site_origin_url(url)
+        if origin and origin not in seeds:
+            seeds.append(origin)
+    for domain in sorted(preferred):
+        if any(url_on_preferred_source(seed, {domain}) for seed in seeds):
+            continue
+        seeds.append(f"https://www.{domain}/")
+    if not _wants_browse_discovery(query):
+        return seeds
     for raw in candidate_urls:
         url = str(raw or "").strip()
         if not url or not url_on_preferred_source(url, preferred):
@@ -289,8 +322,10 @@ def preferred_discovery_seeds(query: str, candidate_urls: list[str]) -> list[str
         hub = listing_hub_url(url)
         if hub and hub not in seeds:
             seeds.append(hub)
-        elif is_content_listing_url(url) and url not in seeds:
-            seeds.append(url.split("#", 1)[0].rstrip("/") or url)
+        elif is_content_listing_url(url):
+            listing = url.split("#", 1)[0].rstrip("/") or url
+            if listing not in seeds:
+                seeds.append(listing)
     return seeds
 
 
@@ -798,10 +833,20 @@ def should_defer_collect_on_listing(snapshot: dict[str, Any], query: str) -> boo
     """Defer auto-collect when a listing page still needs scrolling or a deeper article link."""
     url = str(snapshot.get("url") or "")
     visible = str(snapshot.get("visible_text") or "")
-    recency = query_implies_recency(query)
+    recency = query_implies_recency(query) or _wants_browse_discovery(query)
     listing = is_content_listing_url(url)
+    # Homepage / site root is never the "latest news" answer — navigate inward first.
+    if recency and is_site_origin_url(url):
+        return True
+    understanding = page_understanding_from_snapshot(snapshot) or {}
+    feed_items = understanding.get("feed_items") if isinstance(understanding, dict) else None
+    if recency and isinstance(feed_items, list) and feed_items:
+        return True
     if not recency and not listing:
         return False
+    # Latest/news on a listing: open the newest article; don't collect the index.
+    if recency and listing:
+        return True
     if listing and (
         page_looks_like_nav_shell(visible, query)
         or page_has_goal_links(snapshot, query, min_score=4)
@@ -902,30 +947,157 @@ def match_feed_item_interactable(
     return None
 
 
-def newest_feed_item(understanding: dict[str, Any] | None) -> dict[str, Any] | None:
+_SECTION_QUERY_ALIASES: dict[str, tuple[str, ...]] = {
+    "mop": ("mop-classic", "mists", "pandaria"),
+    "mists": ("mop-classic", "mists", "pandaria"),
+    "pandaria": ("mop-classic", "mists", "pandaria"),
+    "tbc": ("tbc-classic", "burning-crusade"),
+    "wrath": ("wotlk-classic", "wrath"),
+    "wotlk": ("wotlk-classic", "wrath"),
+    "cataclysm": ("cata-classic", "cataclysm"),
+    "cata": ("cata-classic", "cataclysm"),
+    "classic": ("classic",),
+}
+
+
+def query_content_section_hints(query: str) -> list[str]:
+    """Path/title hints for the game/section the user asked about (e.g. mop-classic)."""
+    focused = focus_query(query).lower()
+    hints: list[str] = []
+    if re.search(r"mists?\s+of\s+pandaria|\bmop(?:\s|-)?classic\b|\bpandaria\b", focused, re.I):
+        hints.extend(("mop-classic", "mists", "pandaria", "mop"))
+    for token in query_tokens(focused, min_len=3):
+        aliases = _SECTION_QUERY_ALIASES.get(token)
+        if aliases:
+            hints.extend(aliases)
+            continue
+        if re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)+", token):
+            hints.append(token)
+    # Keep order, drop empties/dupes.
+    return list(dict.fromkeys(h for h in hints if h))
+
+
+def feed_item_matches_query(item: dict[str, Any], query: str, *, page_url: str = "") -> bool:
+    """True when a feed row belongs to the section/topic the user asked for."""
+    hints = query_content_section_hints(query)
+    if not hints:
+        return True
+    page_path = urlsplit(str(page_url or "")).path.lower()
+    # Already on a matching section listing — trust the page feed as-is.
+    if any(hint in page_path for hint in hints if len(hint) >= 4):
+        return True
+    blob = " ".join(
+        str(item.get(key) or "")
+        for key in ("title", "href", "byline", "author")
+    ).lower()
+    return any(hint in blob for hint in hints)
+
+
+def ranked_feed_items(
+    understanding: dict[str, Any] | None,
+    query: str = "",
+    *,
+    page_url: str = "",
+) -> list[dict[str, Any]]:
+    """Feed items newest-first, filtered to the query's section when possible."""
     if not isinstance(understanding, dict):
-        return None
-    best: dict[str, Any] | None = None
-    best_date: date | None = None
-    for raw in understanding.get("feed_items") or []:
+        return []
+    rows: list[tuple[date | None, int, dict[str, Any]]] = []
+    for index, raw in enumerate(understanding.get("feed_items") or []):
         if not isinstance(raw, dict):
             continue
         title = str(raw.get("title") or "").strip()
         if not title:
             continue
+        if query and not feed_item_matches_query(raw, query, page_url=page_url):
+            continue
         published = parse_content_date(
-            " ".join(
-                str(raw.get(key) or "")
-                for key in ("date", "byline", "title")
-            )
+            " ".join(str(raw.get(key) or "") for key in ("date", "byline", "title"))
         )
-        if best is None or (published and (best_date is None or published > best_date)):
+        rows.append((published, index, raw))
+    # Prefer dated items; among equals keep earlier feed index (usually newest-first DOM).
+    rows.sort(
+        key=lambda row: (
+            0 if row[0] is not None else 1,
+            -(row[0].toordinal() if row[0] is not None else 0),
+            row[1],
+        )
+    )
+    return [row[2] for row in rows]
+
+
+def newest_feed_item(
+    understanding: dict[str, Any] | None,
+    query: str = "",
+    *,
+    page_url: str = "",
+) -> dict[str, Any] | None:
+    ranked = ranked_feed_items(understanding, query, page_url=page_url)
+    return ranked[0] if ranked else None
+
+
+def suggest_section_hub_action(
+    snapshot: dict[str, Any],
+    query: str,
+) -> dict[str, Any] | None:
+    """On a site root/global feed, open the section hub that matches the query."""
+    hints = query_content_section_hints(query)
+    if not hints:
+        return None
+    best: dict[str, Any] | None = None
+    best_score = 0
+    for raw in snapshot.get("interactables") or []:
+        if not isinstance(raw, dict) or raw.get("disabled") or not raw.get("id"):
+            continue
+        kind = str(raw.get("kind") or "").lower()
+        if kind not in {"link", "button", "menuitem", "blz-button"}:
+            continue
+        href = str(raw.get("href") or "").strip()
+        if not href:
+            continue
+        path = urlsplit(href).path.lower()
+        label = " ".join(
+            str(raw.get(key) or "") for key in ("text", "title", "aria", "label")
+        ).lower()
+        blob = f"{path} {label}"
+        score = 0
+        for hint in hints:
+            if hint in path:
+                score += 25
+            if hint in label:
+                score += 10
+        if is_content_listing_url(href):
+            score += 20
+        if "/news" in path:
+            score += 12
+        # Prefer hubs over deep articles.
+        if is_deep_article_url(href):
+            score -= 30
+        if score > best_score:
+            best_score = score
             best = raw
-            best_date = published
-    return best
+    if best and best_score >= 30:
+        label = str(best.get("text") or best.get("title") or best.get("aria") or "")[:80]
+        return {
+            "action": "click",
+            "target_id": str(best["id"]),
+            "reason": (
+                f'Open the query-matching section hub "{label}" '
+                f"(hints: {', '.join(hints[:4])})."
+            ),
+            "from_page_map": True,
+            "section_hub": True,
+        }
+    return None
 
 
-def score_content_link(el: dict[str, Any], query: str, *, dom_index: int = 0) -> int:
+def score_content_link(
+    el: dict[str, Any],
+    query: str,
+    *,
+    dom_index: int = 0,
+    current_url: str = "",
+) -> int:
     href = str(el.get("href") or "").lower()
     label = " ".join(
         str(el.get(key) or "")
@@ -935,12 +1107,19 @@ def score_content_link(el: dict[str, Any], query: str, *, dom_index: int = 0) ->
     score = score_interactable(el, query)
     path = urlsplit(href).path
     score += sum(3 for hint in _CONTENT_PATH_HINTS if hint in path)
+    for hint in query_content_section_hints(query):
+        if hint in blob:
+            score += 18
     if re.search(r"\b(patch notes|changelog|release notes|updates?|what's new|whats new)\b", blob, re.I):
         score += 12
+    # Prefer element-local dates (text/href/dates[]). Contaminated sibling dates are
+    # handled upstream by preferring page_understanding.feed_items over this fallback.
     parsed_date = element_publication_date(el)
     if parsed_date:
         score += parsed_date.toordinal()
-    elif query_implies_recency(query):
+    elif query_implies_recency(query) and (
+        is_content_listing_url(current_url) or is_site_origin_url(current_url)
+    ):
         # Listing pages usually show newest items first when dates are absent.
         score += max(0, 24 - min(dom_index, 24))
     return score
@@ -957,30 +1136,39 @@ def suggest_content_link_action(
     if not (is_content_listing_url(url) or query_implies_recency(query)):
         return None
 
+    # Homepage / global feed: go to the matching section hub first, never a random story.
+    if is_site_origin_url(url) and (
+        query_implies_recency(query) or _wants_browse_discovery(query)
+    ):
+        hub = suggest_section_hub_action(snapshot, query)
+        if hub:
+            return hub
+        return None
+
     understanding = page_understanding_from_snapshot(snapshot)
-    feed = newest_feed_item(understanding)
-    if feed:
+    for feed in ranked_feed_items(understanding, query, page_url=url):
         matched = match_feed_item_interactable(feed, snapshot.get("interactables") or [])
-        if matched:
-            label = str(feed.get("title") or matched.get("text") or matched.get("aria") or "")[:80]
-            published = parse_content_date(
-                " ".join(str(feed.get(key) or "") for key in ("date", "byline", "title"))
-            )
-            date_note = f" dated {published.isoformat()}" if published else ""
-            shown = str(feed.get("date") or "").strip()
-            if shown:
-                date_note = f" ({shown})"
-            return {
-                "action": "click",
-                "target_id": str(matched["id"]),
-                "reason": (
-                    f'Open the newest mapped feed item "{label}"{date_note} '
-                    "(from page_understanding.feed_items)."
-                ),
-                "from_page_map": True,
-                "feed_title": label,
-                "feed_date": shown or None,
-            }
+        if not matched:
+            continue
+        label = str(feed.get("title") or matched.get("text") or matched.get("aria") or "")[:80]
+        published = parse_content_date(
+            " ".join(str(feed.get(key) or "") for key in ("date", "byline", "title"))
+        )
+        date_note = f" dated {published.isoformat()}" if published else ""
+        shown = str(feed.get("date") or "").strip()
+        if shown:
+            date_note = f" ({shown})"
+        return {
+            "action": "click",
+            "target_id": str(matched["id"]),
+            "reason": (
+                f'Open the newest mapped feed item "{label}"{date_note} '
+                "(from page_understanding.feed_items)."
+            ),
+            "from_page_map": True,
+            "feed_title": label,
+            "feed_date": shown or None,
+        }
 
     best: dict[str, Any] | None = None
     best_score = 0
@@ -999,7 +1187,13 @@ def suggest_content_link_action(
             continue
         if not any(hint in href_path for hint in _CONTENT_PATH_HINTS):
             continue
-        score = score_content_link(raw, query, dom_index=dom_index)
+        if query_content_section_hints(query) and not feed_item_matches_query(
+            {"title": raw.get("text") or raw.get("title"), "href": href},
+            query,
+            page_url=url,
+        ):
+            continue
+        score = score_content_link(raw, query, dom_index=dom_index, current_url=url)
         if score > best_score:
             best_score = score
             best = raw
@@ -1088,6 +1282,10 @@ def goal_is_satisfied(
     """True when collected text answers the goal from an acceptable source."""
     if not page_matches_query(text, query):
         return False
+    # Latest-news tasks need an article page, not the site root or news index.
+    if query_implies_recency(query) or _wants_browse_discovery(query):
+        if is_site_origin_url(source_url) or is_content_listing_url(source_url):
+            return False
     preferred = preferred_domains or parse_user_preferred_domains(query)
     if preferred and url_on_preferred_source(source_url, preferred):
         return page_has_substantive_content(text, query)

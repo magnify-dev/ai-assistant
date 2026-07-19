@@ -19,6 +19,43 @@ export function captureCanvasHeight(capture: WebCapture): number {
   return Math.max(1, capture.viewport.height);
 }
 
+/**
+ * True when the capture has a document-space scrollable map image ready to draw.
+ * Viewport-only shots must not be stretched into the overlay canvas.
+ */
+export function isCaptureMapReady(capture: WebCapture | null | undefined): boolean {
+  if (!capture?.scroll_map) return false;
+  const map = capture.scroll_map;
+  const documentReady =
+    Boolean(map.stitched) ||
+    map.mode === "full_page" ||
+    (map.coords === "document" && (map.canvas_height ?? 0) > 0);
+  if (!documentReady || !(map.canvas_height > 0)) return false;
+  const hasRootShot = Boolean(capture.screenshot || capture.screenshotUrl);
+  const hasSliceShot = Boolean(
+    map.slices?.some((slice) => Boolean(slice.screenshot || slice.screenshotUrl)),
+  );
+  return hasRootShot || hasSliceShot;
+}
+
+/** Prefer the saved full-page / stitch image over a live viewport JPEG. */
+export function captureMapScreenshotSrc(
+  capture: WebCapture | null | undefined,
+  resolveUrl?: (relOrUrl: string) => string,
+): string | undefined {
+  if (!capture || !isCaptureMapReady(capture)) return undefined;
+  const map = capture.scroll_map;
+  const sliceShot =
+    map?.slices?.find((slice) => slice.screenshotUrl || slice.screenshot)?.screenshotUrl ||
+    map?.slices?.find((slice) => slice.screenshot)?.screenshot;
+  const raw = capture.screenshotUrl || sliceShot || capture.screenshot;
+  if (!raw) return undefined;
+  if (raw.startsWith("http") || raw.startsWith("data:") || raw.startsWith("/api/")) {
+    return raw;
+  }
+  return resolveUrl ? resolveUrl(raw) : raw;
+}
+
 export function effectiveInteractive(element: WebCaptureElement): boolean | null {
   if (element.user_interactive != null) return element.user_interactive;
   if (element.ai_interactive != null) return element.ai_interactive;

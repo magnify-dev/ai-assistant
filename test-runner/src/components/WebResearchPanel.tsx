@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { NextActionCard } from "@/components/NextActionCard";
 import { OperationWaitBanner } from "@/components/OperationWaitBanner";
 import type {
@@ -169,25 +169,126 @@ function memoryLabel(entry: WebResearchMemoryEntry): string {
   return [text(entry.step_id), action, reason, status].filter(Boolean).join(" — ");
 }
 
-function LlmPromptTrace({ exchanges }: { exchanges?: WebResearchLlmExchange[] }) {
-  const items = [...(exchanges ?? [])].sort((a, b) => Number(a.seq ?? 0) - Number(b.seq ?? 0));
-  if (!items.length) {
-    return <p className="text-xs text-white/35">No model calls recorded yet.</p>;
-  }
+function PromptBlock({
+  label,
+  body,
+  tone = "neutral",
+}: {
+  label: string;
+  body: string;
+  tone?: "neutral" | "in" | "out" | "error";
+}) {
+  if (!body) return null;
+  const toneClass =
+    tone === "in"
+      ? "border-sky-400/25 bg-sky-500/5"
+      : tone === "out"
+        ? "border-emerald-400/25 bg-emerald-500/5"
+        : tone === "error"
+          ? "border-rose-400/30 bg-rose-500/10"
+          : "border-white/10 bg-black/30";
   return (
-    <ol className="max-h-56 space-y-1 overflow-y-auto text-xs text-white/70">
-      {items.slice(-8).reverse().map((exchange, index) => (
-        <li key={String(exchange.seq ?? index)} className="rounded bg-white/[0.03] px-2 py-1">
-          <span className="font-mono text-[10px] text-white/45">#{exchange.seq ?? index + 1}</span>{" "}
-          {text(exchange.label ?? exchange.prompt_key)}
-          {exchange.ok === false ? (
-            <span className="ml-2 text-rose-200">failed</span>
-          ) : (
-            <span className="ml-2 text-emerald-200/80">ok</span>
-          )}
-        </li>
-      ))}
-    </ol>
+    <div className={cn("rounded border px-2 py-1.5", toneClass)}>
+      <p className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-white/45">{label}</p>
+      <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-words font-mono text-[11px] leading-relaxed text-white/80">
+        {body}
+      </pre>
+    </div>
+  );
+}
+
+function LlmExchangeCard({ exchange, index }: { exchange: WebResearchLlmExchange; index: number }) {
+  const [expanded, setExpanded] = useState(true);
+  const seq = exchange.seq ?? index + 1;
+  const title = text(exchange.label ?? exchange.prompt_key) || "model call";
+  const meta = [
+    exchange.model ? `model ${exchange.model}` : "",
+    exchange.step_id ? String(exchange.step_id) : "",
+    exchange.url ? String(exchange.url) : "",
+  ].filter(Boolean);
+  const failed = exchange.ok === false;
+  return (
+    <li
+      className={cn(
+        "rounded border px-2 py-2",
+        failed ? "border-rose-400/30 bg-rose-500/10" : "border-white/10 bg-white/[0.03]",
+      )}
+    >
+      <button
+        type="button"
+        onClick={() => setExpanded((value) => !value)}
+        className="flex w-full cursor-pointer items-start justify-between gap-2 text-left"
+      >
+        <div className="min-w-0">
+          <p className="text-xs font-medium text-white/85">
+            <span className="font-mono text-[10px] text-white/45">#{seq}</span> {title}
+            {failed ? (
+              <span className="ml-2 text-rose-200">failed</span>
+            ) : (
+              <span className="ml-2 text-emerald-200/80">ok</span>
+            )}
+            {exchange.truncated ? (
+              <span className="ml-2 text-[10px] font-normal text-amber-100/70">truncated</span>
+            ) : null}
+          </p>
+          {meta.length ? (
+            <p className="mt-0.5 truncate text-[10px] text-white/45">{meta.join(" · ")}</p>
+          ) : null}
+        </div>
+        <span className="shrink-0 text-[10px] text-white/35">{expanded ? "▾" : "▸"}</span>
+      </button>
+      {expanded ? (
+        <div className="mt-2 space-y-2">
+          <PromptBlock label="System prompt" body={text(exchange.system_prompt)} tone="neutral" />
+          <PromptBlock label="Input to local AI" body={text(exchange.user_input)} tone="in" />
+          <PromptBlock label="Output from local AI" body={text(exchange.response)} tone="out" />
+          {failed && exchange.error ? (
+            <PromptBlock label="Error" body={text(exchange.error)} tone="error" />
+          ) : null}
+        </div>
+      ) : null}
+    </li>
+  );
+}
+
+function LlmPromptTrace({
+  exchanges,
+  followLatest = true,
+}: {
+  exchanges?: WebResearchLlmExchange[];
+  followLatest?: boolean;
+}) {
+  const items = [...(exchanges ?? [])].sort((a, b) => Number(a.seq ?? 0) - Number(b.seq ?? 0));
+  const listRef = useRef<HTMLOListElement | null>(null);
+  const lastSeq = items.length ? Number(items[items.length - 1]?.seq ?? items.length) : 0;
+
+  useEffect(() => {
+    if (!followLatest || !listRef.current) return;
+    listRef.current.scrollTop = listRef.current.scrollHeight;
+  }, [followLatest, lastSeq, items.length]);
+
+  if (!items.length) {
+    return <p className="text-xs text-white/35">Waiting for local AI prompts…</p>;
+  }
+
+  // Newest last so the live tail stays at the bottom while auto-scrolling.
+  const visible = items.slice(-40);
+  return (
+    <div className="space-y-2">
+      <p className="text-[10px] text-white/40">
+        Live prompt history for the local model — expands as each call finishes.
+        {items.length > visible.length ? ` Showing last ${visible.length} of ${items.length}.` : null}
+      </p>
+      <ol ref={listRef} className="max-h-[32rem] space-y-2 overflow-y-auto pr-1">
+        {visible.map((exchange, index) => (
+          <LlmExchangeCard
+            key={String(exchange.seq ?? `${exchange.prompt_key}-${index}`)}
+            exchange={exchange}
+            index={index}
+          />
+        ))}
+      </ol>
+    </div>
   );
 }
 
@@ -215,6 +316,14 @@ export function WebResearchPanel({ state, captureBuild, running = true }: Props)
       {wait ? <OperationWaitBanner wait={wait} /> : null}
 
       <NextActionCard state={state} />
+
+      <CollapsibleSection
+        title="Prompt history (local AI)"
+        count={state.llmExchanges?.length ?? 0}
+        defaultOpen={running || (state.llmExchanges?.length ?? 0) > 0}
+      >
+        <LlmPromptTrace exchanges={state.llmExchanges} followLatest={running} />
+      </CollapsibleSection>
 
       {blockers.length ? (
         <section className="rounded-md border border-amber-400/30 bg-amber-400/10 p-3">
@@ -306,9 +415,6 @@ export function WebResearchPanel({ state, captureBuild, running = true }: Props)
         )}
       </CollapsibleSection>
 
-      <CollapsibleSection title="Model calls" count={state.llmExchanges?.length ?? 0}>
-        <LlmPromptTrace exchanges={state.llmExchanges} />
-      </CollapsibleSection>
     </div>
   );
 }

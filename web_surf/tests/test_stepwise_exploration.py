@@ -10,7 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from ui_test.browser_state import _enrich_interactables, filter_blocking_overlays
-from ui_test.state_diff import diff_page_states
+from ui_test.state_diff import diagnose_action_stall, diff_page_states
 from web_surf import events
 from web_surf.form_values import (
     enforce_adult_verification_values,
@@ -21,6 +21,9 @@ from web_surf.form_values import (
     plan_form_values,
     report_is_negative,
     sanitize_form_values,
+    snapshot_needs_overlay_action,
+    stable_video_dismiss_label,
+    strip_video_blockers,
     suggest_overlay_action,
     build_overlay_map,
     _pick_adult_year,
@@ -30,6 +33,8 @@ from web_surf.browser_explore import (
     _content_collect_key,
     _content_collect_signature,
     _discover_official_outbound,
+    _locator_for,
+    _recover_stalled_action,
     validate_overlay_action,
     _json_object,
     _redact_form_values,
@@ -752,9 +757,115 @@ class DecisionTests(unittest.TestCase):
         overlays = [
             {"id": "div-1", "text": "Diablo 4: Lord of Hatred Launch Trailer WATCH NEXT Play Video 2:32"},
             {"id": "privacy-banner", "text": "We use cookies. Accept All Cookies or Reject All."},
+            {
+                "id": "keep-watching",
+                "text": "Keep Watching Launch Trailer",
+                "source": "pointer_block",
+                "tag": "div",
+            },
         ]
         filtered = filter_blocking_overlays(overlays)
-        self.assertEqual([item["id"] for item in filtered], ["privacy-banner"])
+        self.assertEqual([item["id"] for item in filtered], ["privacy-banner", "keep-watching"])
+
+    def test_embedded_keep_watching_does_not_force_overlay_mode(self) -> None:
+        """Homepage video chrome must not trap the run in overlay-dismiss forever."""
+        snapshot = {
+            "url": "https://www.wowhead.com/",
+            "blocking_overlays": [],
+            "interactables": [
+                {
+                    "id": "el-div-0-16-2-55-keep-watching",
+                    "kind": "div",
+                    "text": "0:16 / 2:55 Keep Watching Video Player",
+                },
+                {
+                    "id": "el-link-mists",
+                    "kind": "link",
+                    "text": "MISTS",
+                    "href": "https://www.wowhead.com/mop-classic",
+                },
+            ],
+        }
+        self.assertFalse(snapshot_needs_overlay_action(snapshot))
+        self.assertIsNone(suggest_overlay_action(snapshot, {}, {}))
+
+    def test_stable_video_dismiss_label_strips_timestamps(self) -> None:
+        self.assertEqual(
+            stable_video_dismiss_label("0:16 / 2:55 Keep Watching Video Player"),
+            "Keep Watching",
+        )
+        self.assertEqual(
+            stable_video_dismiss_label("1:48 / 2:55 Keep Watching"),
+            "Keep Watching",
+        )
+
+    def test_locator_uses_stable_keep_watching_not_ticking_timestamp(self) -> None:
+        calls: list[tuple[str, dict]] = []
+
+        class FakeRoot:
+            def get_by_text(self, value: str, exact: bool = True):
+                calls.append(("text", {"value": value, "exact": exact}))
+                return SimpleNamespace(first="loc")
+
+            def get_by_role(self, role: str, name: str = "", exact: bool = True):
+                calls.append(("role", {"role": role, "name": name, "exact": exact}))
+                return SimpleNamespace(first="loc")
+
+        page = SimpleNamespace()
+        with patch("web_surf.browser_explore._frame_root", return_value=FakeRoot()):
+            loc = _locator_for(
+                page,
+                {
+                    "id": "el-div-0-16-2-55-keep-watching",
+                    "kind": "div",
+                    "text": "0:16 / 2:55 Keep Watching Video Player",
+                },
+            )
+        self.assertEqual(loc, "loc")
+        self.assertEqual(calls[0][0], "text")
+        self.assertEqual(calls[0][1]["value"], "Keep Watching")
+        self.assertFalse(calls[0][1]["exact"])
+
+    def test_failed_video_dismiss_stops_retrying_and_strips_blocker(self) -> None:
+        snapshot = {
+            "url": "https://www.wowhead.com/mop-classic/news",
+            "blocking_overlays": [
+                {
+                    "id": "video-layer",
+                    "text": "0:42 / 2:55 Keep Watching Video Player",
+                    "source": "pointer_block",
+                    "tag": "div",
+                }
+            ],
+            "interactables": [
+                {
+                    "id": "el-div-0-42-2-55-keep-watching",
+                    "kind": "div",
+                    "text": "0:42 / 2:55 Keep Watching Video Player",
+                },
+            ],
+        }
+        self.assertTrue(snapshot_needs_overlay_action(snapshot))
+        history = [
+            {
+                "action": "click",
+                "target_id": "el-div-0-16-2-55-keep-watching",
+                "ok": False,
+                "reason": "Dismiss video/promo overlay (Keep Watching)",
+            },
+            {
+                "action": "click",
+                "target_id": "el-div-0-42-2-55-keep-watching",
+                "ok": False,
+                "reason": "Dismiss video/promo overlay (Keep Watching)",
+            },
+        ]
+        self.assertIsNone(
+            suggest_overlay_action(snapshot, {}, {}, recent_history=history)
+        )
+        stripped = strip_video_blockers(snapshot)
+        self.assertEqual(stripped["blocking_overlays"], [])
+        self.assertFalse(snapshot_needs_overlay_action(stripped))
 
     def test_needs_form_value_plan_false_for_video_overlay_and_game_fields(self) -> None:
         snapshot = {
@@ -971,6 +1082,9 @@ class PersistenceAndEventTests(unittest.TestCase):
             project = Path(tmp)
             save_run_state(project, "r1", {"status": "running"})
             save_session_state(project, "s1", {"history": []})
+            from web_surf.store import reset_session_visit_graph
+
+            reset_session_visit_graph()
             record_visit(project, url="https://example.com/")
             record_visit(
                 project,
@@ -981,6 +1095,8 @@ class PersistenceAndEventTests(unittest.TestCase):
             )
             self.assertTrue(run_state_path(project, "r1").is_file())
             self.assertTrue(session_state_path(project, "s1").is_file())
+            # Visit graph is run-local only — not written to visit-graph.yaml.
+            self.assertFalse((project / ".agent" / "web" / "visit-graph.yaml").is_file())
             graph = load_visit_graph(project)
             self.assertIn("https://example.com/docs", graph["nodes"])
             self.assertEqual(graph["edges"][0]["step_id"], "step_001")
@@ -1301,6 +1417,140 @@ class ClearOverlaysBeforeMapTests(unittest.TestCase):
         self.assertEqual(executed[0]["target_id"], "reject")
         self.assertTrue(snap_mock.called)
         self.assertFalse(snap_mock.call_args.kwargs.get("build_map", True))
+
+
+class RecoverStalledActionTests(unittest.TestCase):
+    def test_rescan_clears_popup_and_retries_original_click(self) -> None:
+        page = SimpleNamespace(url="https://example.test/news")
+        before = {
+            "url": page.url,
+            "title": "News",
+            "visible_text": "Hotfixes article",
+            "snapshot_id": "before",
+            "blocking_overlays": [],
+            "interactables": [
+                {
+                    "id": "el-link-hotfixes",
+                    "kind": "link",
+                    "text": "Hotfixes",
+                    "css_path": "a.hotfixes",
+                },
+            ],
+        }
+        stalled = {
+            "url": page.url,
+            "title": "News",
+            "visible_text": "Hotfixes article Subscribe",
+            "snapshot_id": "stalled",
+            "blocking_overlays": [
+                {
+                    "id": "promo",
+                    "role": "dialog",
+                    "text": "Subscribe to newsletter Close",
+                    "source": "pointer_block",
+                },
+            ],
+            "interactables": [
+                {
+                    "id": "el-link-hotfixes",
+                    "kind": "link",
+                    "text": "Hotfixes",
+                    "css_path": "a.hotfixes",
+                },
+                {
+                    "id": "el-btn-close",
+                    "kind": "button",
+                    "text": "Close",
+                    "role": "button",
+                    "css_path": "button.close",
+                },
+            ],
+        }
+        cleared = {
+            "url": page.url,
+            "title": "News",
+            "visible_text": "Hotfixes article",
+            "snapshot_id": "cleared",
+            "blocking_overlays": [],
+            "interactables": before["interactables"],
+        }
+        navigated = {
+            "url": "https://example.test/news/hotfixes",
+            "title": "Hotfixes",
+            "visible_text": "Patch notes",
+            "snapshot_id": "navigated",
+            "blocking_overlays": [],
+            "interactables": [],
+        }
+        snapshots = [stalled, cleared, navigated]
+        executed: list[dict] = []
+
+        def fake_snapshot(*_a: object, **_k: object) -> dict:
+            return snapshots.pop(0)
+
+        def fake_execute(_page: object, action: dict) -> None:
+            executed.append(dict(action))
+            if action.get("target_id") == "el-link-hotfixes":
+                page.url = navigated["url"]
+
+        item = {
+            "ok": False,
+            "progress": False,
+            "error": "Timeout 30000ms exceeded",
+            "action": "click",
+            "target_id": "el-link-hotfixes",
+        }
+        action = {"action": "click", "target_id": "el-link-hotfixes"}
+        delta = diff_page_states(before, stalled)
+
+        with (
+            patch("web_surf.browser_explore._snapshot", side_effect=fake_snapshot),
+            patch("web_surf.browser_explore._execute", side_effect=fake_execute),
+        ):
+            post, out_item, diagnosis, retried = _recover_stalled_action(
+                page,
+                before_snapshot=before,
+                post_snapshot=stalled,
+                action=action,
+                item=item,
+                session_id="s1",
+                step_id="step_003",
+                form_values={},
+                field_mapping={},
+                history=[],
+                delta=delta,
+            )
+
+        self.assertTrue(diagnosis["suspect_blocker"])
+        self.assertTrue(retried)
+        self.assertTrue(out_item["ok"])
+        self.assertEqual(post["url"], navigated["url"])
+        self.assertEqual([row["target_id"] for row in executed], ["el-btn-close", "el-link-hotfixes"])
+
+    def test_diagnose_prefers_blocker_when_dismiss_controls_appear(self) -> None:
+        before = {
+            "url": "https://example.test/news",
+            "visible_text": "Feed",
+            "interactables": [{"id": "el-a", "kind": "link", "text": "A"}],
+            "blocking_overlays": [],
+        }
+        after = {
+            "url": "https://example.test/news",
+            "visible_text": "Feed popup",
+            "interactables": [
+                {"id": "el-a", "kind": "link", "text": "A"},
+                {"id": "el-close", "kind": "button", "text": "No thanks"},
+            ],
+            "blocking_overlays": [],
+        }
+        diagnosis = diagnose_action_stall(
+            before,
+            after,
+            action={"action": "click", "target_id": "el-a"},
+            delta=diff_page_states(before, after),
+        )
+        self.assertTrue(diagnosis["suspect_blocker"])
+        self.assertEqual(diagnosis["recommended"], "clear_blocker")
 
 
 if __name__ == "__main__":

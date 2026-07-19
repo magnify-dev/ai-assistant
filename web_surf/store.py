@@ -83,7 +83,28 @@ def save_session_state(project: Path, session_id: str, state: dict[str, Any]) ->
     )
 
 
+# In-process visit graph for the active research run only (not persisted).
+_SESSION_VISIT_GRAPH: dict[str, Any] | None = None
+
+
+def reset_session_visit_graph() -> None:
+    """Clear the run-local visit graph. Call at the start of each research browse."""
+    global _SESSION_VISIT_GRAPH
+    _SESSION_VISIT_GRAPH = {
+        "version": WEB_STORE_VERSION,
+        "nodes": {},
+        "edges": [],
+    }
+
+
 def load_visit_graph(project: Path) -> dict[str, Any]:
+    # Prefer the active run's in-memory graph so prior runs cannot affect navigation.
+    if _SESSION_VISIT_GRAPH is not None:
+        return {
+            "version": _SESSION_VISIT_GRAPH.get("version", WEB_STORE_VERSION),
+            "nodes": dict(_SESSION_VISIT_GRAPH.get("nodes") or {}),
+            "edges": list(_SESSION_VISIT_GRAPH.get("edges") or []),
+        }
     data = _load_yaml(visit_graph_path(project)) or {}
     nodes = data.get("nodes")
     edges = data.get("edges")
@@ -103,7 +124,15 @@ def record_visit(
     action: str = "navigate",
     step_id: str = "",
 ) -> dict[str, Any]:
-    graph = load_visit_graph(project)
+    """Track visits for the current run only — do not persist across runs."""
+    global _SESSION_VISIT_GRAPH
+    if _SESSION_VISIT_GRAPH is None:
+        reset_session_visit_graph()
+    graph = {
+        "version": _SESSION_VISIT_GRAPH.get("version", WEB_STORE_VERSION),
+        "nodes": dict(_SESSION_VISIT_GRAPH.get("nodes") or {}),
+        "edges": list(_SESSION_VISIT_GRAPH.get("edges") or []),
+    }
     normalized = normalize_url(url)
     nodes = dict(graph["nodes"])
     existing = nodes.get(normalized) if isinstance(nodes.get(normalized), dict) else {}
@@ -129,7 +158,7 @@ def record_visit(
         if source and edge not in edges:
             edges.append(edge)
     updated = {**graph, "nodes": nodes, "edges": edges[-1000:]}
-    _save_yaml(visit_graph_path(project), {**updated, "updated_at": _now_iso()})
+    _SESSION_VISIT_GRAPH = updated
     return updated
 
 

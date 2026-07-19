@@ -82,19 +82,21 @@ export function MapOverlayView({
   const tall = canvasHeight > capture.viewport.height * 1.05;
   const fullPage = scrollMap?.mode === "full_page" || documentCoords || tall;
   const liveScreenshot = Boolean(screenshotSrc?.startsWith("data:image/"));
+  // full_page mode stores one tall slice — draw that (or multi-slice stitch).
+  // Never use a live viewport JPEG on a document-tall canvas (squeezes the page).
   const useScrollSlices = Boolean(
     scrollMap?.slices?.length &&
       documentCoords &&
-      (scrollMap.slice_count ?? 0) > 1 &&
-      scrollMap.slices.some((slice) => slice.screenshot || slice.screenshotUrl),
+      (scrollMap.mode === "full_page" || (scrollMap.slice_count ?? 0) > 1) &&
+      scrollMap.slices.some((slice) => slice.screenshot || slice.screenshotUrl) &&
+      !liveScreenshot,
   );
   const hasImage = Boolean(
     useScrollSlices ||
-      screenshotSrc ||
-      scrollMap?.slices?.some((slice) => slice.screenshot || slice.screenshotUrl),
+      (!liveScreenshot && screenshotSrc) ||
+      (!liveScreenshot &&
+        scrollMap?.slices?.some((slice) => slice.screenshot || slice.screenshotUrl)),
   );
-  // Live viewport JPEG must not stretch over a tall document canvas.
-  const pinLiveViewport = Boolean(documentCoords && tall && liveScreenshot && !useScrollSlices);
 
   return (
     <div className={cn("rounded-lg border border-white/15 bg-neutral-900 p-2", className)}>
@@ -159,22 +161,13 @@ export function MapOverlayView({
                 </div>
               );
             })
-          ) : hasImage && screenshotSrc ? (
+          ) : hasImage && screenshotSrc && !liveScreenshot ? (
             <img
               key={screenshotSrc.slice(0, 80)}
               src={screenshotSrc}
               alt=""
               aria-hidden
-              className={
-                pinLiveViewport
-                  ? "pointer-events-none absolute left-0 top-0 w-full object-fill object-top"
-                  : "pointer-events-none absolute inset-0 h-full w-full object-fill object-top"
-              }
-              style={
-                pinLiveViewport
-                  ? { height: `${(capture.viewport.height / canvasHeight) * 100}%` }
-                  : undefined
-              }
+              className="pointer-events-none absolute inset-0 h-full w-full object-fill object-top"
               draggable={false}
             />
           ) : null}

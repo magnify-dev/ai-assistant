@@ -125,6 +125,9 @@ exploration:
       cookie consent, privacy notices, terms-of-use, age gates, newsletter popups, or
       "before you continue" dialogs. If one blocks the page, click its visible accept /
       agree / OK / close control first, then re-read the next snapshot before continuing.
+    - If a click/nav fails or helper_guidance reports stall_diagnosis / blocking_overlay,
+      assume a popup is covering the target. Clear Close/Accept/No thanks first; do not
+      keep retrying the same covered control.
     - Navigate ONLY to paths seen in navigation routes or interactables href fields.
     - click target MUST match an interactable on the current page.
     - Do NOT use structured task scope URLs — they are not reliable.

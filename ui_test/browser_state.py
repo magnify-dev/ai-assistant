@@ -627,10 +627,13 @@ _BLOCKING_OVERLAYS_JS = """() => {
   function visible(el) {
     const rect = el.getBoundingClientRect();
     const style = getComputedStyle(el);
-    return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
+    return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none" && parseFloat(style.opacity || "1") > 0;
   }
   function clean(value, limit = 300) {
     return String(value || "").trim().replace(/\\s+/g, " ").slice(0, limit);
+  }
+  function isChrome(el) {
+    return Boolean(el.closest("header, nav, footer, [role='banner'], [role='navigation'], [role='contentinfo']"));
   }
   function isBlockingOverlay(el) {
     const style = getComputedStyle(el);
@@ -641,7 +644,7 @@ _BLOCKING_OVERLAYS_JS = """() => {
     const text = clean(el.innerText || el.textContent, 400).toLowerCase();
     const label = clean(el.getAttribute("aria-label") || el.getAttribute("aria-labelledby"), 200).toLowerCase();
     const blob = `${text} ${label}`.trim();
-    const gateText = /\\b(age|cookie|consent|privacy|verify|gdpr|ccpa|before you continue|date of birth|too young)\\b/.test(blob);
+    const gateText = /\\b(age|cookie|consent|privacy|verify|gdpr|ccpa|before you continue|date of birth|too young|newsletter|subscribe|sign up|close|dismiss|no thanks)\\b/.test(blob);
     const falsePositive = /\\b(launch trailer|watch next|play video|leaderboard|permadeath|difficulty|mini.?game)\\b/.test(blob);
     if (falsePositive && !gateText) return false;
     if (role === "dialog" || ariaModal || (tag === "dialog" && el.open)) return true;
@@ -651,29 +654,37 @@ _BLOCKING_OVERLAYS_JS = """() => {
       if (fixed || coversViewport || gateText) return true;
     }
     const className = String(el.className || "").toLowerCase();
-    if (/\\b(modal|gate|consent)\\b/.test(className) && gateText) return true;
+    if (/\\b(modal|gate|consent|popup|popover)\\b/.test(className) && (gateText || ariaModal)) return true;
     return false;
+  }
+  function pushOverlay(el, root, overlays, source) {
+    if (!el || !visible(el) || isChrome(el)) return;
+    const text = clean(el.innerText || el.textContent);
+    const label = clean(el.getAttribute("aria-label") || el.getAttribute("aria-labelledby"));
+    const tag = el.tagName.toLowerCase();
+    const isCustomHost = tag.includes("-") && el.shadowRoot;
+    if (!text && !label && !isCustomHost && source !== "pointer_block") return;
+    const key = `${tag}|${label}|${text.slice(0, 80)}`;
+    if (overlays.some((row) => row._key === key)) return;
+    overlays.push({
+      _key: key,
+      id: el.id || `${tag}-${overlays.length + 1}`,
+      tag,
+      role: el.getAttribute("role") || null,
+      label: label || null,
+      text: text || null,
+      source: source || "selector",
+      shadow_host: root instanceof ShadowRoot ? root.host.tagName.toLowerCase() : null,
+    });
   }
   const roots = [document];
   const seenRoots = new Set(roots);
   const overlays = [];
   for (let rootIndex = 0; rootIndex < roots.length; rootIndex++) {
     const root = roots[rootIndex];
-    for (const el of root.querySelectorAll("[role='dialog'], [aria-modal='true'], dialog[open], [class*='modal'], [class*='overlay'], [class*='gate'], [class*='consent']")) {
-      if (!visible(el) || !isBlockingOverlay(el)) continue;
-      const text = clean(el.innerText || el.textContent);
-      const label = clean(el.getAttribute("aria-label") || el.getAttribute("aria-labelledby"));
-      const tag = el.tagName.toLowerCase();
-      const isCustomHost = tag.includes("-") && el.shadowRoot;
-      if (!text && !label && !isCustomHost) continue;
-      overlays.push({
-        id: el.id || `${tag}-${overlays.length + 1}`,
-        tag,
-        role: el.getAttribute("role") || null,
-        label: label || null,
-        text: text || null,
-        shadow_host: root instanceof ShadowRoot ? root.host.tagName.toLowerCase() : null,
-      });
+    for (const el of root.querySelectorAll("[role='dialog'], [aria-modal='true'], dialog[open], [class*='modal' i], [class*='overlay' i], [class*='gate' i], [class*='consent' i], [class*='popup' i]")) {
+      if (!isBlockingOverlay(el)) continue;
+      pushOverlay(el, root, overlays, "selector");
     }
     for (const host of root.querySelectorAll("*")) {
       if (host.shadowRoot && !seenRoots.has(host.shadowRoot)) {
@@ -682,7 +693,31 @@ _BLOCKING_OVERLAYS_JS = """() => {
       }
     }
   }
-  return overlays.slice(0, 20);
+  // What sits under the viewport center often blocks the intended click target.
+  try {
+    const cx = Math.floor(window.innerWidth / 2);
+    const cy = Math.floor(window.innerHeight / 2);
+    let node = document.elementFromPoint(cx, cy);
+    while (node && node !== document.body && node !== document.documentElement) {
+      const style = getComputedStyle(node);
+      const rect = node.getBoundingClientRect();
+      const role = node.getAttribute("role") || "";
+      const ariaModal = node.getAttribute("aria-modal") === "true";
+      const fixed = style.position === "fixed" || style.position === "sticky";
+      const covers = rect.width > window.innerWidth * 0.4 && rect.height > window.innerHeight * 0.25;
+      const z = parseInt(style.zIndex || "0", 10);
+      if (
+        !isChrome(node)
+        && (role === "dialog" || ariaModal || (fixed && covers && (Number.isFinite(z) ? z >= 5 : true)))
+        && (isBlockingOverlay(node) || role === "dialog" || ariaModal || covers)
+      ) {
+        pushOverlay(node, document, overlays, "pointer_block");
+        break;
+      }
+      node = node.parentElement;
+    }
+  } catch (err) {}
+  return overlays.slice(0, 20).map(({ _key, ...rest }) => rest);
 }"""
 
 
@@ -713,17 +748,22 @@ def filter_blocking_overlays(overlays: list[Any]) -> list[dict[str, Any]]:
         if not isinstance(raw, dict):
             continue
         blob = _overlay_text_blob(raw)
-        if not blob.strip():
+        role = str(raw.get("role") or "").lower()
+        tag = str(raw.get("tag") or "").lower()
+        source = str(raw.get("source") or "").lower()
+        # Pointer-block layers from a failed click are real blockers even when the
+        # copy looks like a video trailer ("Keep Watching" / "Watch Next").
+        if source == "pointer_block" and (blob.strip() or role or tag):
+            filtered.append(raw)
             continue
         if _OVERLAY_FALSE_POSITIVE_RE.search(blob) and not _OVERLAY_GATE_KEYWORDS_RE.search(blob):
             continue
-        role = str(raw.get("role") or "").lower()
-        tag = str(raw.get("tag") or "").lower()
-        if role == "dialog" or tag == "dialog":
+        if role == "dialog" or tag == "dialog" or raw.get("aria-modal"):
             filtered.append(raw)
             continue
         if _OVERLAY_GATE_KEYWORDS_RE.search(blob):
             filtered.append(raw)
+            continue
     return filtered
 
 _SEMANTIC_JS = """() => {
@@ -1792,7 +1832,36 @@ def attach_web_capture(
             summarize_map_layers,
         )
         from web_capture.screenshots import attach_screenshot_to_capture, persist_screenshot
+        from web_capture.url_cache import load_capture_for_url, save_capture_for_url
         from web_capture.visual import collect_visual_tiles, resolve_visual_map
+
+        project = get_active_project()
+        # Cross-run reuse: if we already mapped this URL, publish the stored map
+        # and skip the expensive full rebuild. Live interactables stay on `state`.
+        disk_cached = load_capture_for_url(project, url)
+        if disk_cached is not None:
+            capture = dict(disk_cached)
+            capture["map_reuse"] = {"source": "url_cache", "url": url}
+            understanding = capture.get("page_understanding")
+            feed = (
+                understanding.get("feed_items")
+                if isinstance(understanding, dict)
+                else None
+            )
+            if not isinstance(understanding, dict) or not isinstance(feed, list) or not feed:
+                # Cached geometry without AI page read — refresh understanding only.
+                try:
+                    understand_page_capture(capture, state)
+                    save_capture_for_url(project, capture)
+                except Exception:
+                    pass
+            if isinstance(capture.get("page_understanding"), dict):
+                state["page_understanding"] = capture["page_understanding"]
+                state["semantic_snapshot"] = build_semantic_snapshot(state)
+            state["web_capture"] = capture
+            remember_web_capture(capture)
+            _progress("complete", capture=capture)
+            return state
 
         previous = previous_web_capture_for_url(url)
         _progress("geometry")
@@ -1879,7 +1948,6 @@ def attach_web_capture(
                     apply_content_defaults(capture)
         else:
             apply_content_defaults(capture)
-        project = get_active_project()
         apply_site_map(capture, project)
         _progress("visual")
         fresh_tiles = collect_visual_tiles(page)
@@ -1918,6 +1986,10 @@ def attach_web_capture(
                 capture["page_understanding"] = understanding
         state["web_capture"] = capture
         remember_web_capture(capture)
+        try:
+            save_capture_for_url(project, capture)
+        except Exception:
+            pass
         _progress("complete", capture=capture)
     except Exception as exc:
         state["web_capture_error"] = str(exc)[:300]

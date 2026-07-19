@@ -813,9 +813,17 @@ function loadCapturesFromDirs(
 /** Rebuild the per-URL map catalog from every persisted capture in the run. */
 export function readCapturesByUrl(projectPath: string, runId = "current") {
   const root = runRoot(projectPath, runId);
+  // Canonical cross-run store first (maps are the only artifact reused between runs).
+  const byUrlStore = path.join(projectPath, ".agent", "web-capture", "by-url");
+  let byUrl: Record<string, Record<string, unknown>> = {};
+  if (runId === "current" && fs.existsSync(byUrlStore)) {
+    byUrl = loadCapturesFromDirs(projectPath, runId, [byUrlStore]);
+  }
   const runDirs = [path.join(root, "web-capture", "raw"), path.join(root, "web-capture")];
-  let byUrl = loadCapturesFromDirs(projectPath, runId, runDirs);
-  // Only fall back to project-level captures for the live "current" run.
+  const fromRun = loadCapturesFromDirs(projectPath, runId, runDirs);
+  // Prefer fresher run-local captures when both exist.
+  byUrl = { ...byUrl, ...fromRun };
+  // Fall back to legacy project raw/ if nothing else (older projects).
   if (Object.keys(byUrl).length === 0 && runId === "current") {
     byUrl = loadCapturesFromDirs(projectPath, runId, [
       path.join(projectPath, ".agent", "web-capture", "raw"),
